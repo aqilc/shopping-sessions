@@ -119,33 +119,49 @@ static int list_csv(const char *dir, char ***out) {
 }
 
 // ---------- SIMD masks over 64 bytes ----------
+// Bit i of nl/cm/q is set when p[i] is '\n' / ',' / '"'.
 #if defined(__AVX2__)
-typedef struct { __m256i a, b; } Blk64;
-INL Blk64 blk_load(const char *p) { Blk64 x = {_mm256_loadu_si256((const __m256i *)p), _mm256_loadu_si256((const __m256i *)(p + 32))}; return x; }
-INL uint64_t blk_eq(Blk64 x, char c) {
+INL uint64_t eq64(__m256i a, __m256i b, char c) {
   __m256i v = _mm256_set1_epi8(c);
-  uint32_t lo = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x.a, v));
-  uint32_t hi = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x.b, v));
+  uint32_t lo = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, v));
+  uint32_t hi = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, v));
   return (uint64_t)lo | ((uint64_t)hi << 32);
 }
-#elif defined(__aarch64__)
-typedef struct { uint8x16_t v[4]; } Blk64;
-INL Blk64 blk_load(const char *p) { Blk64 x; for (int i = 0; i < 4; i++) x.v[i] = vld1q_u8((const uint8_t *)p + 16 * i); return x; }
-INL uint64_t nmask(uint8x16_t m) { // 16 lanes of 0xFF/0 -> 16 bits
-  static const uint8_t bits[16] = {1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
-  uint8x16_t b = vandq_u8(m, vld1q_u8(bits));
-  uint8x8_t lo = vget_low_u8(b), hi = vget_high_u8(b);
-  return (uint64_t)vaddv_u8(lo) | ((uint64_t)vaddv_u8(hi) << 8);
+INL void blk_masks(const char *p, uint64_t *nl, uint64_t *cm, uint64_t *q) {
+  __m256i a = _mm256_loadu_si256((const __m256i *)p), b = _mm256_loadu_si256((const __m256i *)(p + 32));
+  *nl = eq64(a, b, '\n');
+  *cm = eq64(a, b, ',');
+  *q = eq64(a, b, '"');
 }
-INL uint64_t blk_eq(Blk64 x, char c) {
-  uint8x16_t v = vdupq_n_u8((uint8_t)c);
-  return nmask(vceqq_u8(x.v[0], v)) | (nmask(vceqq_u8(x.v[1], v)) << 16) | (nmask(vceqq_u8(x.v[2], v)) << 32) |
-         (nmask(vceqq_u8(x.v[3], v)) << 48);
+#elif defined(__aarch64__)
+// Compare lanes ANDed with their bit; two pairwise-add rounds fold 64 lanes into 8 mask bytes (doubled),
+// a third round packs two masks into one vector's 64-bit lanes.
+INL uint8x16_t fold2(const uint8x16_t *v, uint8x16_t c, uint8x16_t bits) {
+  uint8x16_t t0 = vandq_u8(vceqq_u8(v[0], c), bits), t1 = vandq_u8(vceqq_u8(v[1], c), bits);
+  uint8x16_t t2 = vandq_u8(vceqq_u8(v[2], c), bits), t3 = vandq_u8(vceqq_u8(v[3], c), bits);
+  return vpaddq_u8(vpaddq_u8(t0, t1), vpaddq_u8(t2, t3));
+}
+INL void blk_masks(const char *p, uint64_t *nl, uint64_t *cm, uint64_t *q) {
+  static const uint8_t bitv[16] = {1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
+  uint8x16_t bits = vld1q_u8(bitv);
+  uint8x16_t v[4];
+  for (int i = 0; i < 4; i++) v[i] = vld1q_u8((const uint8_t *)p + 16 * i);
+  uint8x16_t n = fold2(v, vdupq_n_u8('\n'), bits), c = fold2(v, vdupq_n_u8(','), bits), d = fold2(v, vdupq_n_u8('"'), bits);
+  uint64x2_t nc = vreinterpretq_u64_u8(vpaddq_u8(n, c));
+  *nl = vgetq_lane_u64(nc, 0);
+  *cm = vgetq_lane_u64(nc, 1);
+  *q = vgetq_lane_u64(vreinterpretq_u64_u8(vpaddq_u8(d, d)), 0);
 }
 #else
-typedef struct { const char *p; } Blk64;
-INL Blk64 blk_load(const char *p) { Blk64 x = {p}; return x; }
-INL uint64_t blk_eq(Blk64 x, char c) { uint64_t m = 0; for (int i = 0; i < 64; i++) m |= (uint64_t)(x.p[i] == c) << i; return m; }
+INL void blk_masks(const char *p, uint64_t *nl, uint64_t *cm, uint64_t *q) {
+  uint64_t a = 0, b = 0, c = 0;
+  for (int i = 0; i < 64; i++) {
+    a |= (uint64_t)(p[i] == '\n') << i;
+    b |= (uint64_t)(p[i] == ',') << i;
+    c |= (uint64_t)(p[i] == '"') << i;
+  }
+  *nl = a; *cm = b; *q = c;
+}
 #endif
 
 // ---------- timestamps ----------
@@ -455,42 +471,51 @@ static const char *chunk_begin(const Chunk *c) {
 
 // Tokenizer: calls LINE(ls, sep, nsep, nq) for each line starting in [begin, cend).
 // sep[k] = position of the k-th separator (',' or the line end), nq = quotes in the line.
+// Bytes past the file end are zero (map_file's PAD), so blocks need no end mask.
+// Commas go to sep_ SEPW at a time, unconditionally: slots past min(ns, MAXF) are scratch, so no per-field branch.
+// SEPW >= MAXF, so commas past the first SEPW of a block can only land past MAXF and need no store.
 #define MAXF 8
+#define SEPW 8
+INL int tk_commas(const char **sep, int ns, const char *blk, uint64_t m) {
+  int n = __builtin_popcountll(m);
+  const char **d = sep + (ns < MAXF ? ns : MAXF);
+  for (int j = 0; j < SEPW; j++) {
+    d[j] = blk + __builtin_ctzll(m | (1ull << 63));
+    m &= m - 1;
+  }
+  return ns + n;
+}
 #define TOKENIZE(c, LINE)                                                                         \
   do {                                                                                            \
     const char *fend_ = (c)->base + (c)->fsize;                                                   \
     const char *cend_ = (c)->base + (c)->end;                                                     \
     const char *ls_ = chunk_begin(c);                                                             \
     if (ls_ >= cend_) break;                                                                      \
-    const char *sep_[MAXF + 1]; int ns_ = 0; uint32_t qacc_ = 0;                                  \
+    const char *sep_[MAXF + SEPW]; int ns_ = 0; uint32_t qacc_ = 0;                               \
     const char *blk_ = ls_;                                                                       \
     int done_ = 0;                                                                                \
     while (!done_) {                                                                              \
-      Blk64 x_ = blk_load(blk_);                                                                  \
-      uint64_t nl_ = blk_eq(x_, '\n'), cm_ = blk_eq(x_, ','), q_ = blk_eq(x_, '"');               \
-      uint64_t lim_ = (blk_ + 64 <= fend_) ? ~0ull : ((fend_ - blk_) > 0 ? (~0ull >> (64 - (fend_ - blk_))) : 0); \
-      uint64_t st_ = (nl_ | cm_) & lim_;                                                          \
-      q_ &= lim_;                                                                                 \
-      while (st_) {                                                                               \
-        int i_ = __builtin_ctzll(st_);                                                            \
-        uint64_t bit_ = 1ull << i_;                                                               \
-        st_ &= st_ - 1;                                                                           \
-        if (ns_ < MAXF) sep_[ns_] = blk_ + i_;                                                    \
+      uint64_t nl_, cm_, q_;                                                                      \
+      blk_masks(blk_, &nl_, &cm_, &q_);                                                           \
+      while (nl_) {                                                                               \
+        int i_ = __builtin_ctzll(nl_);                                                            \
+        uint64_t below_ = nl_ ^ (nl_ - 1);                                                        \
+        nl_ &= nl_ - 1;                                                                           \
+        ns_ = tk_commas(sep_, ns_, blk_, cm_ & below_);                                           \
+        sep_[ns_ < MAXF ? ns_ : MAXF] = blk_ + i_;                                                \
         ns_++;                                                                                    \
-        if (nl_ & bit_) {                                                                         \
-          uint64_t below_ = bit_ | (bit_ - 1);                                                    \
-          uint32_t nq_ = qacc_ + (uint32_t)__builtin_popcountll(q_ & below_);                     \
-          q_ &= ~below_; qacc_ = 0;                                                               \
-          LINE(ls_, sep_, ns_, nq_);                                                              \
-          ls_ = blk_ + i_ + 1; ns_ = 0;                                                           \
-          if (ls_ >= cend_) { done_ = 1; break; }                                                 \
-        }                                                                                         \
+        uint32_t nq_ = qacc_ + (uint32_t)__builtin_popcountll(q_ & below_);                       \
+        cm_ &= ~below_; q_ &= ~below_; qacc_ = 0;                                                 \
+        LINE(ls_, sep_, ns_, nq_);                                                                \
+        ls_ = blk_ + i_ + 1; ns_ = 0;                                                             \
+        if (ls_ >= cend_) { done_ = 1; break; }                                                   \
       }                                                                                           \
       if (done_) break;                                                                           \
+      if (cm_) ns_ = tk_commas(sep_, ns_, blk_, cm_);                                             \
       qacc_ += (uint32_t)__builtin_popcountll(q_);                                                \
       blk_ += 64;                                                                                 \
       if (blk_ >= fend_) {                                                                        \
-        if (ls_ < fend_) { if (ns_ < MAXF) sep_[ns_] = fend_; ns_++; LINE(ls_, sep_, ns_, qacc_); } \
+        if (ls_ < fend_) { sep_[ns_ < MAXF ? ns_ : MAXF] = fend_; ns_++; LINE(ls_, sep_, ns_, qacc_); } \
         break;                                                                                    \
       }                                                                                           \
     }                                                                                             \
