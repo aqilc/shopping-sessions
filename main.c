@@ -912,14 +912,15 @@ static void sess_task(int tid, long q, void *ctx) {
     for (Blk *k = cb[(size_t)t * NQART + q].head; k; k = k->next) nc += k->n;
   }
   if (!ne) return;
-  // one pass over the records: person index + (ts << 32 | x) into linear arrays
+  // one pass over the records: per person counts, (ts << 32 | slot) and (person << 32 | x) per slot
   uint32_t pcap = 256; while (pcap < ne) pcap <<= 1;
   uint32_t *tab = aalloc(S, (size_t)pcap * 4); memset(tab, 0, (size_t)pcap * 4);
   uint32_t pmask = pcap - 1, np = 0;
   uint64_t *pkeys = aalloc(S, ne * 8);
   uint64_t *names = aalloc(S, ne * 8);
-  uint32_t *pid = aalloc(S, ne * 4);
-  uint32_t *xs = aalloc(S, ne * 4);
+  uint32_t *eoff = aalloc(S, (ne + 1) * 4);
+  eoff[0] = 0;
+  uint64_t *px = aalloc(S, ne * 8);
   uint64_t *tx = aalloc(S, ne * 8); // ts << 32 | record slot
   size_t k = 0;
   for (int t = 0; t < NT; t++) {
@@ -940,17 +941,16 @@ static void sess_task(int tid, long q, void *ctx) {
           pkeys[np] = pk;
           names[np] = pk & LINKED ? lname[(uint32_t)pk] : r[j].uref;
           *s = ++np;
+          eoff[np] = 0;
         }
-        pid[k] = *s - 1;
-        xs[k] = x;
+        eoff[*s]++;
+        px[k] = ((uint64_t)(*s - 1) << 32) | x;
         tx[k] = ((uint64_t)r[j].ts << 32) | k;
         k++;
       }
     }
   }
   size_t nalive = k;
-  uint32_t *eoff = aalloc(S, ((size_t)np + 1) * 4); memset(eoff, 0, ((size_t)np + 1) * 4);
-  for (size_t i = 0; i < nalive; i++) eoff[pid[i] + 1]++;
   for (uint32_t i = 0; i < np; i++) eoff[i + 1] += eoff[i];
   uint32_t *pos = aalloc(S, ((size_t)np + 1) * 4); memcpy(pos, eoff, ((size_t)np + 1) * 4);
   uint64_t *ev = aalloc(S, nalive * 8 + 8);
@@ -958,8 +958,8 @@ static void sess_task(int tid, long q, void *ctx) {
   // sort the partition by ts once; the stable scatter by person leaves each run sorted
   sort_u64(tx, tmp, (uint32_t)nalive);
   for (size_t i = 0; i < nalive; i++) {
-    uint32_t z = (uint32_t)tx[i];
-    ev[pos[pid[z]]++] = (tx[i] & 0xFFFFFFFF00000000ull) | xs[z];
+    uint64_t v = px[(uint32_t)tx[i]];
+    ev[pos[v >> 32]++] = (tx[i] & 0xFFFFFFFF00000000ull) | (uint32_t)v;
   }
   // clicks: per person runs of (ts << 32 | click slot); ts ties are settled by click_id at credit time
   uint32_t *cpid = aalloc(S, (nc + 1) * 4);
