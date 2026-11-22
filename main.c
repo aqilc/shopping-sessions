@@ -950,6 +950,20 @@ static CAgg *cagg; // [NT][(ncamp+1)*NDAYS]
 static uint32_t *cassist; // [NT][(ncamp+1)*NDAYS] assisted sessions
 static uint32_t **stamp; static uint32_t *stampv;
 
+typedef uint32_t Hist[3][2048]; // 11-bit digit counts of the high 32 bits
+INL void hist_add(Hist c, uint32_t k) { c[0][k & 2047]++; c[1][(k >> 11) & 2047]++; c[2][k >> 22]++; }
+// LSD radix on bits 32..63, 3 passes of 11 bits, from the digit counts of the n keys (consumed).
+static uint64_t *radix3(uint64_t *a, uint64_t *tmp, uint32_t n, Hist c) {
+  uint64_t *src = a, *dst = tmp;
+  for (int p = 0; p < 3; p++) {
+    uint32_t s = 0;
+    for (int b = 0; b < 2048; b++) { uint32_t v = c[p][b]; c[p][b] = s; s += v; }
+    int sh = 32 + 11 * p;
+    for (uint32_t i = 0; i < n; i++) { uint32_t k = (uint32_t)(src[i] >> sh) & 2047; dst[c[p][k]++] = src[i]; }
+    uint64_t *t = src; src = dst; dst = t;
+  }
+  return src;
+}
 // Sorts n keys by their high 32 bits, using tmp as the other buffer; returns whichever of a and tmp holds the result.
 static uint64_t *sort_u64(uint64_t *a, uint64_t *tmp, uint32_t n) {
   if (n < 2) return a;
@@ -971,19 +985,10 @@ static uint64_t *sort_u64(uint64_t *a, uint64_t *tmp, uint32_t n) {
     }
     return src;
   }
-  // LSD radix on bits 32..63 (ts), 3 passes of 11 bits
-  uint32_t c[3][2048];
+  Hist c;
   memset(c, 0, sizeof c);
-  for (uint32_t i = 0; i < n; i++) { uint32_t k = (uint32_t)(a[i] >> 32); c[0][k & 2047]++; c[1][(k >> 11) & 2047]++; c[2][k >> 22]++; }
-  uint64_t *src = a, *dst = tmp;
-  for (int p = 0; p < 3; p++) {
-    uint32_t s = 0;
-    for (int b = 0; b < 2048; b++) { uint32_t v = c[p][b]; c[p][b] = s; s += v; }
-    int sh = 32 + 11 * p;
-    for (uint32_t i = 0; i < n; i++) { uint32_t k = (uint32_t)(src[i] >> sh) & 2047; dst[c[p][k]++] = src[i]; }
-    uint64_t *t = src; src = dst; dst = t;
-  }
-  return src;
+  for (uint32_t i = 0; i < n; i++) hist_add(c, (uint32_t)(a[i] >> 32));
+  return radix3(a, tmp, n, c);
 }
 static void flush_row(UVec *ur, URow *row, int64_t *catsum, uint32_t touched) {
   int best = -1; int64_t bv = 0;
@@ -1025,6 +1030,10 @@ static void sess_task(int tid, long q, void *ctx) {
   eoff[0] = 0;
   uint64_t *px = aalloc(S, ne * 8);
   uint64_t *tx = aalloc(S, ne * 8); // ts << 32 | record slot
+  // a big partition gets its sort digits counted here, saving the sort a pass over tx
+  int big = ne > 8192;
+  Hist *eh = aalloc(S, sizeof(Hist));
+  if (big) memset(eh, 0, sizeof(Hist));
   size_t k = 0;
   for (int t = 0; t < NT; t++) {
     for (Blk *bk = pb[(size_t)t * NQART + q].head; bk; bk = bk->next) {
@@ -1049,6 +1058,7 @@ static void sess_task(int tid, long q, void *ctx) {
         eoff[*s]++;
         px[k] = ((uint64_t)(*s - 1) << 32) | x;
         tx[k] = ((uint64_t)r[j].ts << 32) | k;
+        if (big) hist_add(*eh, r[j].ts);
         k++;
       }
     }
@@ -1060,7 +1070,7 @@ static void sess_task(int tid, long q, void *ctx) {
   uint64_t *ev = aalloc(S, nalive * 8 + 8);
   uint64_t *tmp = aalloc(S, (nalive > nc ? nalive : nc) * 8 + 8);
   // sort the partition by ts once; the stable scatter by person leaves each run sorted
-  const uint64_t *esorted = sort_u64(tx, tmp, (uint32_t)nalive);
+  const uint64_t *esorted = big ? radix3(tx, tmp, (uint32_t)nalive, *eh) : sort_u64(tx, tmp, (uint32_t)nalive);
   for (size_t i = 0; i < nalive; i++) {
     uint64_t v = px[(uint32_t)esorted[i]];
     ev[pos[v >> 32]++] = (esorted[i] & 0xFFFFFFFF00000000ull) | (uint32_t)v;
