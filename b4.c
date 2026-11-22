@@ -46,7 +46,7 @@ INL uint64_t ticks(void) {
   return (uint64_t)(now_s() * 1e9);
 #endif
 }
-enum { SP_GATHER, SP_SORT, SP_CLICKS, SP_WALK, SP_ASSIST, SP_N };
+enum { SP_DSPLIT, SP_DPROBE, SP_GATHER, SP_SORT, SP_CLICKS, SP_WALK, SP_ASSIST, SP_N };
 static uint64_t sprof[16][8]; // [thread][SP_*], one cache line per thread
 #define SP_ADD(tid, k, t0) do { if (PROF) { uint64_t t1_ = ticks(); sprof[tid][k] += t1_ - (t0); (t0) = t1_; } } while (0)
 // Prints sub-phases k0..k1-1 as PH-style lines: max over threads, then the sum.
@@ -639,9 +639,11 @@ static void run_par_o(long ntask, const long *order, task_fn fn, void *ctx) { ru
 static void run_par(long ntask, task_fn fn, void *ctx) { run_par_o(ntask, NULL, fn, ctx); }
 
 // ---------- per-thread arenas ----------
-#define ARENA_SZ (2ull << 30) // record refs are 28-bit units of 8 bytes
+#define ARENA_SZ (2ull << 30)
+#define PARENA_SZ (1ull << 30) // payload locs are 28-bit units of 4 bytes
 typedef struct { char *base, *cur, *end; char pad[40]; } Arena;
-static Arena *arenas; // [NT] record storage (addressable by ref)
+static Arena *arenas; // [NT] KRec storage
+static Arena *parena; // [NT] PRec (addressable by loc) and CRec storage
 static Arena *scratch; // [NT] per-task scratch, reset per task
 static void arena_init(Arena *a, size_t sz) {
   char *m = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
@@ -669,7 +671,7 @@ INL void *aalloc(Arena *a, size_t n) {
 }
 
 // Bucket: chain of blocks of fixed-size records.
-typedef struct Blk { struct Blk *next; uint32_t n, cap; } Blk; // records follow (16-byte header)
+typedef struct Blk { struct Blk *next; uint32_t n, cap; char pad[48]; } Blk; // records follow (a cache-line header)
 typedef struct { char *cur, *end; Blk *head, *tail; } Bkt;
 static __attribute__((noinline)) void bkt_grow(Arena *a, Bkt *b, uint32_t rs, uint32_t cap) {
   if (b->tail) b->tail->n = (uint32_t)((b->cur - (char *)(b->tail + 1)) / rs);
@@ -689,7 +691,7 @@ static int64_t DAY0; static int32_t NDAYS;
 static int unknown_cat;
 static int ncat; static const char **catp; static uint32_t *catn;
 static int ncamp; static const char **camp_id; static uint32_t *camp_idn; static const char **chan; static uint32_t *chann;
-static uint32_t QB; static uint32_t NQART; // person partitions 2^QB
+static uint32_t PB, QB; static uint32_t NPART, NQART; // eid partitions 2^PB, person partitions 2^QB
 
 // ---------- linked IDs ----------
 // Link ID table, open addressing on the ID hash in 2^LRB-slot regions (a region per hash partition, probes wrap
@@ -720,30 +722,41 @@ INL uint64_t person_of(uint64_t uh) {
 }
 
 // ---------- records ----------
-// Event, per person partition. ingest (seconds) and hlo (the low half of the event_id hash) are there for dedup.
-typedef struct { uint64_t pkey; uint64_t uref; uint32_t ts; uint32_t x; uint32_t ingest; uint32_t hlo; } PRec;
+typedef struct { uint64_t h; uint32_t ingest; uint32_t loc; } KRec;     // dedup key, per eid partition
+typedef struct { uint32_t lo, hi; uint32_t ts; } PRec; // event payload, per person partition: pkey in lo/hi
 typedef struct { uint64_t pkey; uint64_t cref; uint32_t ts; uint32_t camp; } CRec; // click, per person partition
-// PRec.x: price (24 bits) | cat (5 bits) << 24 | purchase << 29 | dead << 31
+// An event's x: price (24 bits) | cat (5 bits) << 24 | purchase << 29; 0 for a view or cart.
+// A PRec keeps flags in the 3 low partition bits of its pkey (bits 40-42: the same for the whole bucket, sess puts
+// them back). A purchase is followed in its bucket by a slot with x in lo, then an event with P_NAME by a name
+// slot: the user ID's string ref in lo/hi.
 #define X_PURCH (1u << 29)
-#define X_DEAD (1u << 31)
+#define P_DEAD (1ull << 40)
+#define P_PURCH (1ull << 41)
+#define P_NAME (1ull << 42)
+#define P_FLAGS (7ull << 40)
+#define LOC_NONE 0x0FFFFFFFu
 
+static Bkt *kb; // [NT][NPART]
 static Bkt *pb; // [NT][NQART]
 static Bkt *cb; // [NT][NQART]
-static uint32_t pcap0, ccap0, xcap0;
+static uint32_t kcap0, pcap0, ccap0;
 
 // x86: records reach their bucket through a staging run per (thread, bucket), so the scattered stores land in a
 // small hot buffer and the bucket gets whole runs as streaming stores (measured faster on the Xeon, slower on arm64).
 // A run starts at a block start or right after a full run, so it never spans blocks, and a record's stage slot is
-// its offset in the block mod the run size. Blocks start at a 64 B-aligned aalloc plus the 16 B Blk header, and a
-// run is a multiple of 16 B, so every run is 16 B-aligned for _mm_stream_si128.
+// its offset in the block mod the run size. Blocks start at a 64 B-aligned aalloc plus the 64 B Blk header, and a
+// run is whole cache lines, so each line of a bucket is written once, by one run of streaming stores.
 #if defined(__AVX2__)
 #define STAGE 1
 #else
 #define STAGE 0
 #endif
-#define ST 8 // records per run
-_Static_assert(sizeof(Blk) == 16 && ST * sizeof(PRec) % 16 == 0 && ST * sizeof(CRec) % 16 == 0, "stage runs must stay 16 B-aligned");
+#define PRUN 192 // bytes per run: 16 PRec
+#define KRUN 128 // 8 KRec
+#define CRUN 192 // 8 CRec
+_Static_assert(sizeof(Blk) == 64 && PRUN % sizeof(PRec) == 0 && KRUN % sizeof(KRec) == 0 && CRUN % sizeof(CRec) == 0, "stage runs are whole records and whole cache lines");
 static char *pst; // [NT][NQART] PRec runs
+static char *kst; // [NT][NPART] KRec runs
 static char *cst; // [NT][NQART] CRec runs
 INL void run_stream(char *d, const char *s, size_t n) {
 #if defined(__AVX2__)
@@ -753,15 +766,15 @@ INL void run_stream(char *d, const char *s, size_t n) {
 #endif
 }
 // Copies the partial run staged at st to the slots it was assigned: the records since the last run boundary.
-static void stage_flush(Bkt *b, const char *st, uint32_t rs) {
+static void stage_flush(Bkt *b, const char *st, uint32_t run) {
   if (!b->tail) return;
-  size_t k = (size_t)(b->cur - (char *)(b->tail + 1)) % (ST * rs);
+  size_t k = (size_t)(b->cur - (char *)(b->tail + 1)) % run;
   memcpy(b->cur - k, st, k);
 }
-// Appends the rs-byte record at src to bucket b (stage run st) and returns its final address.
-INL char *rec_put(Arena *a, Bkt *b, char *st, const void *src, uint32_t rs, uint32_t cap0) {
+// Appends the rs-byte record at src to bucket b (stage run st of run bytes) and returns its final address.
+INL char *rec_put(Arena *a, Bkt *b, char *st, const void *src, uint32_t rs, uint32_t cap0, uint32_t run) {
   if (UNLIKELY(b->cur == b->end)) {
-    if (STAGE) stage_flush(b, st, rs);
+    if (STAGE) stage_flush(b, st, run);
     bkt_grow(a, b, rs, b->tail ? b->tail->cap : cap0);
   }
   char *d = b->cur;
@@ -770,9 +783,9 @@ INL char *rec_put(Arena *a, Bkt *b, char *st, const void *src, uint32_t rs, uint
     memcpy(d, src, rs);
     return d;
   }
-  size_t off = (size_t)(d - (char *)(b->tail + 1)) % (ST * rs);
+  size_t off = (size_t)(d - (char *)(b->tail + 1)) % run;
   memcpy(st + off, src, rs);
-  if (off + rs == ST * rs) run_stream(b->cur - ST * rs, st, ST * rs);
+  if (off + rs == run) run_stream(b->cur - run, st, run);
   return d;
 }
 
@@ -945,58 +958,48 @@ INL uint64_t keep_str(int tid, uint64_t r) {
   a->cur = d + n;
   return mkref(d, n);
 }
-// Event-id table, shared by the parse threads: open addressing, slot = the high half of the event_id hash << 32 |
-// the record's ref (thread << 28 | arena offset / 8, never 0 since a block header comes first). The first copy of
-// an ID claims a slot; every later record whose high half matches a slot on its probe path stops there and goes
-// to a dup list as (slot ref << 32 | own ref). Slots never change once set, so all the copies of an ID stop at
-// one slot, and dup_task settles each slot's group on the records (which hold the hash's low half).
-static _Atomic uint64_t *etab; static uint64_t emask;
-#define ESPAN (1u << 18) // slots per 2 MB
-// Per thread: the bucket of events that failed validation (dedup still needs them; sess never reads it) and the
-// dup lists, one per thread owning the slot's record, so each owner's groups are settled by one task.
-typedef struct { uint64_t *v; size_t n, cap; } DVec;
-typedef struct { Bkt xb; char xst[ST * sizeof(PRec)]; DVec dup[16]; char pad[32]; } EThr;
-_Static_assert(sizeof(EThr) % 64 == 0, "one thread's lines");
-static EThr *ethr; // [NT]
-static __attribute__((noinline)) void dup_grow(DVec *v) {
-  v->cap = v->cap ? v->cap * 2 : 1024;
-  v->v = xrealloc(v->v, v->cap * 8);
-}
-INL void eid_put(int tid, uint64_t eh, const char *d) {
-  uint32_t ref = (uint32_t)tid << 28 | (uint32_t)((d - arenas[tid].base) >> 3);
-  uint64_t w = (eh & 0xFFFFFFFF00000000ull) | ref;
-  uint64_t i = (eh >> 1) & emask; // hstr sets bit 0
-  for (uint64_t n = 0;; n++) {
-    uint64_t s = atomic_load_explicit(&etab[i], memory_order_relaxed);
-    if (!s && atomic_compare_exchange_strong_explicit(&etab[i], &s, w, memory_order_relaxed, memory_order_relaxed)) return;
-    if ((s ^ w) >> 32 == 0) { // s is the slot's value here, also after a lost exchange
-      DVec *v = &ethr[tid].dup[(uint32_t)s >> 28];
-      if (UNLIKELY(v->n == v->cap)) dup_grow(v);
-      v->v[v->n++] = (s << 32) | ref;
-      return;
-    }
-    if (UNLIKELY(n == emask)) die("event-id table full");
-    i = (i + 1) & emask;
-  }
+// Unlinked persons whose name some thread has stored (or is about to): 8-slot sets, a cache line each, shared by
+// all threads without locks. A lost or evicted entry only stores the name once more, so sess finds every unlinked
+// person's name in its partition while most events carry none (fewer fresh bytes for the kernel to zero).
+static _Atomic uint64_t *seen; static uint64_t seen_mask;
+INL _Atomic uint64_t *seen_set(uint64_t pk) { return seen + ((pk >> 8) & seen_mask) * 8; }
+INL int seen_add(uint64_t pk) {
+  _Atomic uint64_t *s = seen_set(pk);
+  uint64_t v[8];
+  for (int k = 0; k < 8; k++) v[k] = atomic_load_explicit(&s[k], memory_order_relaxed);
+  int hit = 0;
+  for (int k = 0; k < 8; k++) hit |= v[k] == pk;
+  if (LIKELY(hit && pk)) return 1;
+  int at = (int)(pk & 7);
+  for (int k = 7; k >= 0; k--) if (!v[k]) at = k;
+  atomic_store_explicit(&s[at], pk, memory_order_relaxed);
+  return 0;
 }
 INL void ev_emit(int tid, const EPend *p) {
-  char *d;
-  if (UNLIKELY(p->x & X_DEAD)) {
-    PRec r = {0, 0, 0, X_DEAD, p->ingest, (uint32_t)p->eh};
-    d = rec_put(&arenas[tid], &ethr[tid].xb, ethr[tid].xst, &r, sizeof(PRec), xcap0);
-  } else {
-    uint64_t pk = person_of(p->uh);
-    size_t bi = (size_t)tid * NQART + qpart(pk);
-    PRec r = {pk, pk & LINKED ? 0 : keep_str(tid, p->uref), p->ts, p->x, p->ingest, (uint32_t)p->eh}; // a linked person's name is its root's lref
-    d = rec_put(&arenas[tid], &pb[bi], pst + bi * (ST * sizeof(PRec)), &r, sizeof(PRec), pcap0);
+  uint64_t pk = person_of(p->uh);
+  size_t bi = (size_t)tid * NQART + qpart(pk);
+  int name = !(pk & LINKED) && !seen_add(pk); // a linked person's name is its root's lref
+  uint64_t w = (pk & ~P_FLAGS) | (p->x ? P_PURCH : 0) | (name ? P_NAME : 0);
+  PRec r = {(uint32_t)w, (uint32_t)(w >> 32), p->ts};
+  char *d = rec_put(&parena[tid], &pb[bi], pst + bi * PRUN, &r, sizeof(PRec), pcap0, PRUN);
+  if (p->x) {
+    PRec xr = {p->x, 0, 0};
+    rec_put(&parena[tid], &pb[bi], pst + bi * PRUN, &xr, sizeof(PRec), pcap0, PRUN);
   }
-  eid_put(tid, p->eh, d);
+  if (name) {
+    uint64_t ref = keep_str(tid, p->uref);
+    PRec nr = {(uint32_t)ref, (uint32_t)(ref >> 32), 0};
+    rec_put(&parena[tid], &pb[bi], pst + bi * PRUN, &nr, sizeof(PRec), pcap0, PRUN);
+  }
+  KRec k = {p->eh, p->ingest, (uint32_t)((d - parena[tid].base) >> 2)};
+  size_t ki = (size_t)tid * NPART + (p->eh >> (64 - PB));
+  rec_put(&arenas[tid], &kb[ki], kst + ki * KRUN, &k, sizeof(KRec), kcap0, KRUN);
 }
 INL void cl_emit(int tid, const CPend *p) {
   uint64_t pk = person_of(p->uh);
   size_t bi = (size_t)tid * NQART + qpart(pk);
   CRec r = {pk, keep_str(tid, p->cref), p->ts, p->camp};
-  rec_put(&arenas[tid], &cb[bi], cst + bi * (ST * sizeof(CRec)), &r, sizeof(CRec), ccap0);
+  rec_put(&parena[tid], &cb[bi], cst + bi * CRUN, &r, sizeof(CRec), ccap0, CRUN);
 }
 static void pend_flush(int tid) {
   Pend *P = &pend[tid];
@@ -1016,8 +1019,8 @@ static inline void ev_line(int tid, const char *ob, const uint32_t *ix, uint32_t
   if (fl[1]) {
     uh = hstr(f[1], fl[1]);
     if (have_links) { __builtin_prefetch(&lkey[lhome(uh)]); __builtin_prefetch(&lval[lhome(uh)]); }
+    __builtin_prefetch(seen_set(uh & ~LINKED));
   }
-  __builtin_prefetch(&etab[(eh >> 1) & emask], 1);
   int64_t is, ing;
   if (LIKELY(fl[3] == 20)) {
     is = ingest_w(f[3], &mw_ev);
@@ -1046,8 +1049,14 @@ static inline void ev_line(int tid, const char *ob, const uint32_t *ix, uint32_t
   if (ok && ing != BADTS && ing - ts > 86400000LL) ok = 0;
   if (is < 0) is = 0;
   if (is > 0xFFFFFFFFll) is = 0xFFFFFFFFll;
-  // An event that failed validation still takes part in dedup: ev_emit writes it as a dead record.
-  if (!ok) x = X_DEAD;
+  // A valid event's KRec is written by ev_emit once its payload loc is known; dedup does not depend on KRec order
+  // (it keeps the smallest ingest, and copies with equal ingest_ts are identical).
+  if (!ok) {
+    size_t ki = (size_t)tid * NPART + (eh >> (64 - PB));
+    KRec k = {eh, (uint32_t)is, LOC_NONE};
+    rec_put(&arenas[tid], &kb[ki], kst + ki * KRUN, &k, sizeof(KRec), kcap0, KRUN);
+    return;
+  }
   Pend *P = &pend[tid];
   EPend *e = &P->e[P->ne % RING];
   if (P->ne >= RING) ev_emit(tid, e);
@@ -1293,58 +1302,72 @@ static void load_links(const char *dd) {
 }
 
 // ---------- dedup ----------
-INL PRec *eref(uint32_t ref) { return (PRec *)(arenas[ref >> 28].base + ((size_t)(ref & 0x0FFFFFFFu) << 3)); }
-static void etab_touch_task(int tid, long t, void *ctx) {
-  (void)tid; (void)ctx;
-  atomic_store_explicit(&etab[(uint64_t)t * ESPAN], 0, memory_order_relaxed); // a store, so the kernel maps a whole huge page
+#define DSUB 1024 // most entries per dedup sub-table, so its 2^11-2^12 slots (16-32 KB) stay in L1 (Mac: 1024 beat 512, 2048, 4096)
+INL void kill_loc(uint32_t tl) {
+  uint32_t l = tl & 0x0FFFFFFFu;
+  if (l == LOC_NONE) return;
+  PRec *r = (PRec *)(parena[tl >> 28].base + ((size_t)l << 2));
+  r->hi |= (uint32_t)(P_DEAD >> 32);
 }
-static uint64_t *sort_u64(uint64_t *a, uint64_t *tmp, uint32_t n);
-// Task t settles the slots whose record thread t wrote. Its dup entries sorted by slot ref: a run of equal slot
-// refs is one group, the slot's record plus every record that stopped at it. A group is one event_id unless two
-// IDs share the hash's high half, so its records are classed by the low half; each class keeps its smallest
-// ingest (copies with equal ingest_ts are identical) and the rest are marked dead.
-static void dup_task(int tid, long t, void *ctx) {
+static void dedup_task(int tid, long q, void *ctx) {
   (void)ctx;
-  size_t n = 0;
-  for (int s = 0; s < NT; s++) n += ethr[s].dup[t].n;
-  if (!n) return;
-  if (n > 0xFFFFFFFFu) die("dedup: too many copies");
-  uint64_t *a = xmalloc(n * 8), *tmp = xmalloc(n * 8);
-  size_t k = 0;
-  for (int s = 0; s < NT; s++) {
-    memcpy(a + k, ethr[s].dup[t].v, ethr[s].dup[t].n * 8);
-    k += ethr[s].dup[t].n;
-  }
-  const uint64_t *e = sort_u64(a, tmp, (uint32_t)n);
-  uint32_t *win = (uint32_t *)scratch[tid].base; // the group's kept record per class
-  size_t wcap = (size_t)(scratch[tid].end - scratch[tid].base) / 4;
-  for (size_t i = 0; i < n;) {
-    uint32_t nw = 1;
-    win[0] = (uint32_t)(e[i] >> 32);
-    size_t j = i;
-    for (; j < n && (e[j] >> 32) == (e[i] >> 32); j++) {
-      if (j + 8 < n) {
-        __builtin_prefetch(&eref((uint32_t)e[j + 8])->ts, 1);
-        __builtin_prefetch(&eref((uint32_t)(e[j + 8] >> 32))->ts, 1);
+  size_t cnt = 0;
+  for (int t = 0; t < NT; t++) for (Blk *k = kb[(size_t)t * NPART + q].head; k; k = k->next) cnt += k->n;
+  if (!cnt) return;
+  Arena *s = &scratch[tid]; s->cur = s->base;
+  uint64_t t0 = PROF ? ticks() : 0;
+  // 8-byte entry: 32 hash bits as a fingerprint << 32 | the record's ref (thread << 28 | arena offset / 16, never 0
+  // since a block header comes first); a fingerprint match is confirmed on the records.
+  // The entries go to sub-tables by low hash bits first, each small enough to probe in L1.
+  uint32_t nsub = 1;
+  while (cnt / nsub > DSUB) nsub <<= 1;
+  uint64_t *ent = aalloc(s, (size_t)nsub * cnt * 8); // sub-table i fills from ent + i * cnt
+  uint32_t *fill = aalloc(s, (size_t)nsub * 4); memset(fill, 0, (size_t)nsub * 4);
+  for (int t = 0; t < NT; t++) {
+    const char *ab = arenas[t].base;
+    for (Blk *k = kb[(size_t)t * NPART + q].head; k; k = k->next) {
+      KRec *r = (KRec *)(k + 1);
+      uint64_t ref0 = ((uint64_t)t << 28) | (uint64_t)(((const char *)r - ab) >> 4);
+      for (uint32_t j = 0; j < k->n; j++) {
+        uint64_t h = r[j].h;
+        uint32_t b = (uint32_t)(h >> 1) & (nsub - 1); // hstr sets bit 0
+        ent[(size_t)b * cnt + fill[b]++] = ((h >> 24) << 32) | (ref0 + j);
       }
-      PRec *r = eref((uint32_t)e[j]);
-      uint32_t c = 0;
-      while (c < nw && eref(win[c])->hlo != r->hlo) c++;
-      if (UNLIKELY(c == nw)) {
-        if (nw == wcap) die("dedup: scratch full");
-        win[nw++] = (uint32_t)e[j];
-        continue;
-      }
-      PRec *w = eref(win[c]);
-      if (r->ingest < w->ingest) {
-        w->x |= X_DEAD;
-        win[c] = (uint32_t)e[j];
-      } else r->x |= X_DEAD;
     }
-    i = j;
   }
-  free(a);
-  free(tmp);
+  uint32_t most = 0;
+  for (uint32_t b = 0; b < nsub; b++) most = fill[b] > most ? fill[b] : most;
+  uint32_t cap = 64; while (cap < most * 2) cap <<= 1;
+  uint64_t *tab = aalloc(s, (size_t)cap * 8);
+  SP_ADD(tid, SP_DSPLIT, t0);
+  for (uint32_t b = 0; b < nsub; b++) {
+    const uint64_t *e = ent + (size_t)b * cnt;
+    uint32_t n = fill[b];
+    cap = 64; while (cap < n * 2) cap <<= 1;
+    uint32_t mask = cap - 1;
+    memset(tab, 0, (size_t)cap * 8);
+    for (uint32_t j = 0; j < n; j++) {
+      uint64_t v = e[j];
+      uint64_t fp = v & 0xFFFFFFFF00000000ull;
+      uint32_t i = (uint32_t)(v >> 32) & mask;
+      for (;;) {
+        uint64_t d = tab[i];
+        if (!d) { tab[i] = v; break; }
+        if ((d & 0xFFFFFFFF00000000ull) == fp) {
+          uint32_t dr = (uint32_t)d, vr = (uint32_t)v;
+          KRec *o = (KRec *)(arenas[dr >> 28].base + ((size_t)(dr & 0x0FFFFFFFu) << 4));
+          KRec *r = (KRec *)(arenas[vr >> 28].base + ((size_t)(vr & 0x0FFFFFFFu) << 4));
+          if (o->h == r->h) {
+            if (r->ingest < o->ingest) { kill_loc((dr & 0xF0000000u) | o->loc); tab[i] = v; }
+            else kill_loc((vr & 0xF0000000u) | r->loc);
+            break;
+          }
+        }
+        i = (i + 1) & mask;
+      }
+    }
+  }
+  SP_ADD(tid, SP_DPROBE, t0);
 }
 
 // ---------- sessionize ----------
@@ -1475,6 +1498,22 @@ INL uint32_t pt_find(const PTab *t, uint64_t pk) {
   return i;
 }
 
+#define PT_HELD 0x80000000u // pt.id flag: the person has a name but no live event yet
+// Doubles the table (entries move with their ids) and returns the new capacity.
+static uint32_t pt_grow(Arena *S, PTab *t) {
+  PTab o = *t;
+  uint32_t cap = (o.mask + 1) * 2;
+  t->key = aalloc(S, (size_t)cap * 8); memset(t->key, 0, (size_t)cap * 8);
+  t->id = aalloc(S, (size_t)cap * 4);
+  t->mask = cap - 1;
+  for (uint32_t z = 0; z <= o.mask; z++) {
+    if (!o.key[z]) continue;
+    uint32_t g = pt_find(t, o.key[z]);
+    t->key[g] = o.key[z]; t->id[g] = o.id[z];
+  }
+  return cap;
+}
+
 // A person's events go to buckets of 2^BSH ms, shorter than the 30 min gap, so a session never breaks inside a
 // bucket, and between consecutive non-empty buckets it breaks when the later's first ts is over 30 min past the
 // earlier's last: sessions come from per-bucket min/max with no sort by ts.
@@ -1498,43 +1537,70 @@ static void sess_task(int tid, long q, void *ctx) {
   pt.key = aalloc(S, (size_t)pcap * 8); memset(pt.key, 0, (size_t)pcap * 8);
   pt.id = aalloc(S, (size_t)pcap * 4);
   pt.mask = pcap - 1;
+  uint64_t qbits = (uint64_t)(q & 7) << 40;
   uint32_t np = 0;
+  uint32_t nheld = 0; // names met before any live event of their person: pt.id is PT_HELD | index into held
   uint64_t *pkeys = aalloc(S, ne * 8);
-  uint64_t *names = aalloc(S, ne * 8);
+  uint64_t *names = aalloc(S, ne * 8); // 0 until the person's name slot is met
+  uint64_t *held = aalloc(S, ne * 8);
   uint32_t *eoff = aalloc(S, (ne + 1) * 4);
   eoff[0] = 0;
   uint64_t *tx = aalloc(S, ne * 8); // ts << 32 | x
   uint32_t *pid = aalloc(S, ne * 4);
   size_t k = 0;
   for (int t = 0; t < NT; t++) {
+    uint32_t follow = 0; // slots the last event is followed by: its flags (P_FLAGS >> 40) until they are read
+    uint64_t name_pk = 0;
     for (Blk *bk = pb[(size_t)t * NQART + q].head; bk; bk = bk->next) {
       PRec *r = (PRec *)(bk + 1);
       for (uint32_t j = 0; j < bk->n; j++) {
-        uint32_t x = r[j].x;
-        if (x & X_DEAD) continue;
-        uint64_t pk = r[j].pkey;
+        if (UNLIKELY(follow)) {
+          if (follow & 2) {
+            if (!(follow & 1)) tx[k - 1] |= r[j].lo;
+            follow &= 4;
+            continue;
+          }
+          follow = 0;
+          uint64_t ref = r[j].lo | (uint64_t)r[j].hi << 32;
+          uint32_t i = pt_find(&pt, name_pk);
+          if (pt.key[i]) {
+            if (!(pt.id[i] & PT_HELD)) names[pt.id[i]] = ref;
+            continue;
+          }
+          if (UNLIKELY((np + nheld + 1) * 2 > pcap)) {
+            pcap = pt_grow(S, &pt);
+            i = pt_find(&pt, name_pk);
+          }
+          pt.key[i] = name_pk; pt.id[i] = PT_HELD | nheld;
+          held[nheld++] = ref;
+          continue;
+        }
+        uint64_t w = r[j].lo | (uint64_t)r[j].hi << 32;
+        uint64_t pk = (w & ~P_FLAGS) | qbits;
+        uint32_t fl = (uint32_t)(w >> 40) & 7;
+        if (fl & 6) { follow = fl; name_pk = pk; }
+        if (fl & 1) continue;
         uint32_t i = pt_find(&pt, pk);
         if (!pt.key[i]) {
-          if (UNLIKELY((np + 1) * 2 > pcap)) { // grow
-            pcap *= 2;
-            pt.key = aalloc(S, (size_t)pcap * 8); memset(pt.key, 0, (size_t)pcap * 8);
-            pt.id = aalloc(S, (size_t)pcap * 4);
-            pt.mask = pcap - 1;
-            for (uint32_t z = 0; z < np; z++) {
-              uint32_t g = pt_find(&pt, pkeys[z]);
-              pt.key[g] = pkeys[z]; pt.id[g] = z;
-            }
+          if (UNLIKELY((np + nheld + 1) * 2 > pcap)) {
+            pcap = pt_grow(S, &pt);
             i = pt_find(&pt, pk);
           }
           pt.key[i] = pk; pt.id[i] = np;
           pkeys[np] = pk;
-          names[np] = pk & LINKED ? lref[(uint32_t)pk] : r[j].uref;
+          names[np] = pk & LINKED ? lref[(uint32_t)pk] : 0;
+          np++;
+          eoff[np] = 0;
+        } else if (UNLIKELY(pt.id[i] & PT_HELD)) {
+          pkeys[np] = pk;
+          names[np] = held[pt.id[i] & ~PT_HELD];
+          pt.id[i] = np;
           np++;
           eoff[np] = 0;
         }
         uint32_t id = pt.id[i];
         eoff[id + 1]++;
-        tx[k] = ((uint64_t)r[j].ts << 32) | x;
+        tx[k] = (uint64_t)r[j].ts << 32;
         pid[k] = id;
         k++;
       }
@@ -1566,7 +1632,7 @@ static void sess_task(int tid, long q, void *ctx) {
       CRec *r = (CRec *)(bk + 1);
       for (uint32_t j = 0; j < bk->n; j++) {
         uint32_t i = pt_find(&pt, r[j].pkey);
-        if (!pt.key[i]) continue;
+        if (!pt.key[i] || (pt.id[i] & PT_HELD)) continue;
         uint32_t id = pt.id[i];
         cpid[k] = id;
         cref[k] = r[j].cref;
@@ -2133,12 +2199,6 @@ static void load_campaigns(const char *dd) {
   }
 }
 
-static void *small_main(void *dd) {
-  load_products(dd);
-  load_campaigns(dd);
-  return NULL;
-}
-
 static uint64_t *qsize;
 static int cmp_q(const void *a, const void *b) {
   uint64_t x = qsize[*(const long *)a], y = qsize[*(const long *)b];
@@ -2147,12 +2207,15 @@ static int cmp_q(const void *a, const void *b) {
 
 static void close_task(int tid, long t, void *ctx) {
   (void)tid; (void)ctx;
-  if (STAGE) stage_flush(&ethr[t].xb, ethr[t].xst, sizeof(PRec));
-  bkt_close(&ethr[t].xb, sizeof(PRec));
+  for (uint32_t i = 0; i < NPART; i++) {
+    size_t bi = (size_t)t * NPART + i;
+    if (STAGE) stage_flush(&kb[bi], kst + bi * KRUN, KRUN);
+    bkt_close(&kb[bi], sizeof(KRec));
+  }
   for (uint32_t i = 0; i < NQART; i++) {
     size_t bi = (size_t)t * NQART + i;
-    if (STAGE) stage_flush(&pb[bi], pst + bi * (ST * sizeof(PRec)), sizeof(PRec));
-    if (STAGE) stage_flush(&cb[bi], cst + bi * (ST * sizeof(CRec)), sizeof(CRec));
+    if (STAGE) stage_flush(&pb[bi], pst + bi * PRUN, PRUN);
+    if (STAGE) stage_flush(&cb[bi], cst + bi * CRUN, CRUN);
     bkt_close(&pb[bi], sizeof(PRec));
     bkt_close(&cb[bi], sizeof(CRec));
   }
@@ -2166,10 +2229,9 @@ static void close_task(int tid, long t, void *ctx) {
 static void release_task(int tid, long t, void *ctx) {
   (void)tid; (void)ctx;
   madvise(arenas[t].base, (size_t)(arenas[t].cur - arenas[t].base), MADV_DONTNEED);
+  madvise(parena[t].base, (size_t)(parena[t].cur - parena[t].base), MADV_DONTNEED);
   madvise(strs[t].base, (size_t)(strs[t].cur - strs[t].base), MADV_DONTNEED);
   madvise(scratch[t].base, 1ull << 30, MADV_DONTNEED);
-  size_t es = ((emask + 1) * 8 / NT) & ~(size_t)((2u << 20) - 1);
-  if (es) madvise((char *)etab + (size_t)t * es, es, MADV_DONTNEED);
 }
 
 int main(void) {
@@ -2190,11 +2252,10 @@ int main(void) {
   mowin_init(&mw_cl, CWS);
   DAY0 = WS / 86400000LL; if (WS < 0 && WS % 86400000LL) DAY0--;
   NDAYS = (int32_t)((WE - 1) / 86400000LL - DAY0 + 1);
-  // The two small files load beside the links: they share no state with load_links.
-  pthread_t small;
-  if (pthread_create(&small, NULL, small_main, (void *)dd)) die("pthread_create");
+  load_products(dd);
+  load_campaigns(dd);
+  PH("small");
   load_links(dd);
-  pthread_join(small, NULL);
   PH("links");
 
   char dir[4096];
@@ -2211,16 +2272,17 @@ int main(void) {
   uint64_t eest = ebytes / 60 + 1024, cest = cbytes / 45 + 1024;
   // eest runs ~1.4x the real event count, so 48000 here is ~30-35K events per partition: 2^10 at 20M, 2^11 at
   // 40-64M. Board, 64M-event replica: PB=QB 11 2975 ms, 10 3020, 12 3172, 13 3490 (diag a2e7094).
+  PB = 6; while (PB < 14 && (eest >> PB) > 48000) PB++;
   QB = 6; while (QB < 13 && (eest >> QB) > 48000) QB++;
-  NQART = 1u << QB;
+  NPART = 1u << PB; NQART = 1u << QB;
   uint64_t per_t = eest / NT;
   // Blocks of an eighth of a bucket's expected share: a bucket's last block is the only unused memory (and the
   // kernel zeroes all of it), so this wastes ~6% where one block of the whole share wasted ~75% (eest runs high).
-  xcap0 = (uint32_t)(per_t / 64 + 32);
+  kcap0 = (uint32_t)(per_t / NPART / 8 + 32);
   pcap0 = (uint32_t)(per_t / NQART / 8 + 32);
   ccap0 = (uint32_t)(cest / NT / NQART / 16 + 32);
-  arenas = xcalloc(NT, sizeof(Arena)); scratch = xcalloc(NT, sizeof(Arena));
-  for (int t = 0; t < NT; t++) { arena_init(&arenas[t], ARENA_SZ); arena_init(&scratch[t], 1ull << 30); }
+  arenas = xcalloc(NT, sizeof(Arena)); parena = xcalloc(NT, sizeof(Arena)); scratch = xcalloc(NT, sizeof(Arena));
+  for (int t = 0; t < NT; t++) { arena_init(&arenas[t], ARENA_SZ); arena_init(&parena[t], PARENA_SZ); arena_init(&scratch[t], 1ull << 30); }
   strs = xcalloc(NT, sizeof(Arena)); rbufs = xcalloc(NT, sizeof(RBuf));
   for (int t = 0; t < NT; t++) {
     arena_init(&strs[t], ebytes + cbytes + 64); // a copied ID is shorter than its line
@@ -2228,23 +2290,20 @@ int main(void) {
     if (!rbufs[t].buf) die("oom");
   }
   pend = xcalloc(NT, sizeof(Pend));
-  ethr = aligned_alloc(64, (size_t)NT * sizeof(EThr));
-  if (!ethr) die("oom");
-  memset(ethr, 0, (size_t)NT * sizeof(EThr));
-  // eest runs ~1.4x the real event count, so the table ends 35-70% full
-  uint64_t eslots = ESPAN; while (eslots < eest) eslots <<= 1;
-  etab = hcalloc(eslots * 8); emask = eslots - 1;
-  run_par((long)(eslots / ESPAN), etab_touch_task, NULL);
+  kb = xcalloc((size_t)NT * NPART, sizeof(Bkt));
   pb = xcalloc((size_t)NT * NQART, sizeof(Bkt));
   cb = xcalloc((size_t)NT * NQART, sizeof(Bkt));
-  if (STAGE) pst = hcalloc((size_t)NT * NQART * ST * sizeof(PRec));
-  if (STAGE) cst = hcalloc((size_t)NT * NQART * ST * sizeof(CRec));
+  if (STAGE) pst = hcalloc((size_t)NT * NQART * PRUN);
+  uint64_t nseen = 1024; while (nseen < eest / 128) nseen <<= 1; // 8-slot sets: a slot per ~16 estimated events
+  seen = hcalloc(nseen * 64); seen_mask = nseen - 1;
+  if (STAGE) kst = hcalloc((size_t)NT * NPART * KRUN);
+  if (STAGE) cst = hcalloc((size_t)NT * NQART * CRUN);
   PH("map");
   run_par(nchunks, parse_task, NULL);
   run_par(NT, close_task, NULL);
   PH("parse");
   double pt0 = now_s(); uint64_t pk0 = ticks();
-  run_par(NT, dup_task, NULL);
+  run_par(NPART, dedup_task, NULL);
   PH("dedup");
   ucol = xcalloc(NT, sizeof(UCol));
   DBW = 1; while ((1u << DBW) < (uint32_t)NDAYS) DBW++;
@@ -2267,8 +2326,8 @@ int main(void) {
   run_par_f(NQART, order, sess_task, write_user_task, NULL);
   PH("sess");
   {
-    static const char *const sn[] = {" s.gather", " s.sort", " s.clicks", " s.walk", " s.assist"};
-    sp_print(SP_GATHER, SP_N, sn, PROF ? (now_s() - pt0) * 1e3 / (double)(ticks() - pk0) : 0);
+    static const char *const sn[] = {" d.split", " d.probe", " s.gather", " s.sort", " s.clicks", " s.walk", " s.assist"};
+    sp_print(SP_DSPLIT, SP_N, sn, PROF ? (now_s() - pt0) * 1e3 / (double)(ticks() - pk0) : 0);
   }
   write_campaign();
   PH("write");
