@@ -448,61 +448,33 @@ INL uint32_t parse_price(const char *p, uint32_t n) {
 }
 
 // ---------- small string maps (products, campaigns) ----------
-// 8 B slots: the hash's top 32 bits << 32 | entry + 1 (0 = empty), confirmed on the entry's string. Sized by the
-// entries, not the file: the 2,000 campaigns probe 32 KB instead of 512 KB, the 50,000 products 1 MB instead of 8 MB.
-typedef struct { const char *p; uint32_t n; int32_t v; } SEnt;
-typedef struct { uint64_t *s; SEnt *e; uint32_t n, ecap; uint64_t mask; } SMap;
-#define SFP 0xFFFFFFFF00000000ull
-static void smap_init(SMap *m) {
-  m->mask = 63;
-  m->s = xcalloc(64, 8);
-  m->n = 0;
-  m->ecap = 32;
-  m->e = xmalloc(m->ecap * sizeof(SEnt));
+typedef struct { uint64_t h; const char *p; uint32_t n; int32_t v; } SSlot;
+typedef struct { SSlot *s; uint64_t mask; } SMap;
+static void smap_init(SMap *m, size_t want) {
+  size_t cap = 16;
+  while (cap < want * 2) cap <<= 1;
+  m->s = xcalloc(cap, sizeof(SSlot));
+  m->mask = cap - 1;
 }
-// Both strings have 16 readable bytes from their start (padded buffers), so a short key is two masked word compares.
-INL int key_eq(const char *a, const char *b, uint32_t n) {
-  if (n > 16) return memcmp(a, b, n) == 0;
-  uint64_t m0 = n >= 8 ? ~0ull : (1ull << (8 * n)) - 1;
-  uint64_t m1 = n >= 16 ? ~0ull : n <= 8 ? 0 : (1ull << (8 * (n - 8))) - 1;
-  return !(((ld8(a) ^ ld8(b)) & m0) | ((ld8(a + 8) ^ ld8(b + 8)) & m1));
-}
-// The slot holding the key, or the empty slot ending its probe run.
-INL uint64_t smap_slot(const SMap *m, uint64_t h, const char *p, uint32_t n) {
-  uint64_t i = (h >> 1) & m->mask; // hstr sets bit 0
+static SSlot *smap_put(SMap *m, const char *p, uint32_t n, int32_t v, int *created) {
+  uint64_t h = hstr(p, n);
+  uint64_t i = h & m->mask;
   for (;;) {
-    uint64_t v = m->s[i];
-    if (!v) return i;
-    if ((v & SFP) == (h & SFP)) {
-      const SEnt *e = &m->e[(uint32_t)v - 1];
-      if (e->n == n && key_eq(e->p, p, n)) return i;
-    }
+    SSlot *s = &m->s[i];
+    if (!s->p) { s->h = h; s->p = p; s->n = n; s->v = v; *created = 1; return s; }
+    if (s->h == h && str_eq(s->p, s->n, p, n)) { *created = 0; return s; }
     i = (i + 1) & m->mask;
   }
 }
-// The key's entry, added with value v when new (*created says which).
-static uint32_t smap_put(SMap *m, const char *p, uint32_t n, int32_t v, int *created) {
-  if ((m->n + 1) * 2 > m->mask + 1) {
-    free(m->s);
-    m->mask = m->mask * 2 + 1;
-    m->s = xcalloc(m->mask + 1, 8);
-    for (uint32_t j = 0; j < m->n; j++) {
-      uint64_t h = hstr(m->e[j].p, m->e[j].n);
-      m->s[smap_slot(m, h, m->e[j].p, m->e[j].n)] = (h & SFP) | (j + 1);
-    }
-  }
-  uint64_t h = hstr(p, n);
-  uint64_t i = smap_slot(m, h, p, n);
-  *created = !m->s[i];
-  if (!*created) return (uint32_t)m->s[i] - 1;
-  if (m->n == m->ecap) { m->ecap *= 2; m->e = xrealloc(m->e, m->ecap * sizeof(SEnt)); }
-  m->e[m->n].p = p; m->e[m->n].n = n; m->e[m->n].v = v;
-  m->s[i] = (h & SFP) | (m->n + 1);
-  return m->n++;
-}
 INL int32_t smap_get(const SMap *m, const char *p, uint32_t n) {
-  uint64_t v = m->s[smap_slot(m, hstr(p, n), p, n)];
-  return v ? m->e[(uint32_t)v - 1].v : -1;
+  uint64_t h = hstr(p, n);
+  uint64_t i = h & m->mask;
+  for (;;) {
+    const SSlot *s = &m->s[i];
+    if (!s->p) return -1;
+    if (s->h == h && str_eq(s->p, s->n, p, n)) return s->v;
+    i = (i + 1) & m->mask;
+  }
 }
 
 // ---------- thread pool ----------
@@ -564,8 +536,7 @@ INL void *aalloc(Arena *a, size_t n) {
 }
 
 // Bucket: chain of blocks of fixed-size records.
-// Records follow the 64 B header, so a block's records start on a cache line (stage runs are whole lines).
-typedef struct Blk { struct Blk *next; uint32_t n, cap; char pad[48]; } Blk;
+typedef struct Blk { struct Blk *next; uint32_t n, cap; } Blk; // records follow (16-byte header)
 typedef struct { char *cur, *end; Blk *head, *tail; } Bkt;
 static __attribute__((noinline)) void bkt_grow(Arena *a, Bkt *b, uint32_t rs, uint32_t cap) {
   if (b->tail) b->tail->n = (uint32_t)((b->cur - (char *)(b->tail + 1)) / rs);
@@ -590,27 +561,28 @@ static int ncamp; static const char **camp_id; static uint32_t *camp_idn; static
 static uint32_t PB, QB; static uint32_t NPART, NQART; // eid partitions 2^PB, person partitions 2^QB
 
 // ---------- linked IDs ----------
-// build table: key hash, string ref, union-find parent, best (name) slot
-static _Atomic uint32_t *lpar; static _Atomic uint32_t *lbest;
-static uint64_t lcap, lmask_b;
-// lookup table: id hash -> person key
-// Link ID table, open addressing on the ID hash: val is the ID's string ref while links load, its person key after.
-typedef struct { _Atomic uint64_t key; uint64_t val; } LEnt;
-static LEnt *ltab; static uint64_t *lname; // lname[root slot] = name ref
+// Link ID table, open addressing on the ID hash in 2^LRB-slot regions (a region per hash partition, probes wrap
+// inside it): lkey[slot] = hash, lval[slot] = the ID's dense id (from 1) while links load, its root's after.
+// The dense arrays (by id): string ref, its first 8 bytes as a big-endian number, and union-find parent. A root is its set's smallest ID, the person's name.
+static uint64_t *lkey; static uint32_t *lval;
+static uint64_t *lref, *lpre; static _Atomic uint32_t *lpar;
+static uint64_t lcap; static uint32_t lshift, lrmask;
 static int have_links;
 
 #define LINKED (1ull << 63)
 INL uint32_t qpart(uint64_t pkey) { return (uint32_t)((pkey >> 40) & (NQART - 1)); }
+INL uint64_t linked_key(uint32_t r) { return LINKED | (((uint64_t)r * 0x9E3779B97F4A7C15ull) & 0x7FFFFFFF00000000ull) | r; }
+INL uint64_t lhome(uint64_t h) { return h >> lshift; }
+INL uint64_t lnext_slot(uint64_t i) { return (i & ~(uint64_t)lrmask) | ((i + 1) & lrmask); }
 
 INL uint64_t person_of(uint64_t uh) {
   if (have_links) {
-    uint64_t i = uh & lmask_b;
+    uint64_t i = lhome(uh);
     for (;;) {
-      const LEnt *e = &ltab[i];
-      uint64_t k = atomic_load_explicit(&e->key, memory_order_relaxed);
-      if (k == uh) return e->val;
+      uint64_t k = lkey[i];
+      if (k == uh) return linked_key(lval[i]);
       if (!k) break;
-      i = (i + 1) & lmask_b;
+      i = lnext_slot(i);
     }
   }
   return uh & ~LINKED;
@@ -633,20 +605,15 @@ static uint32_t kcap0, pcap0, ccap0;
 // x86: records reach their bucket through a staging run per (thread, bucket), so the scattered stores land in a
 // small hot buffer and the bucket gets whole runs as streaming stores (measured faster on the Xeon, slower on arm64).
 // A run starts at a block start or right after a full run, so it never spans blocks, and a record's stage slot is
-// its offset in the block mod the run size. Blocks start at a 64 B-aligned aalloc plus the 64 B Blk header, and a
-// run is a multiple of 64 B, so every streamed run fills whole cache lines: a partly written line costs the Xeon a
-// read-modify-write of the line in memory.
-#ifndef STAGE // -DSTAGE=1 tests the x86 path elsewhere
+// its offset in the block mod the run size. Blocks start at a 64 B-aligned aalloc plus the 16 B Blk header, and a
+// run is a multiple of 16 B, so every run is 16 B-aligned for _mm_stream_si128.
 #if defined(__AVX2__)
 #define STAGE 1
 #else
 #define STAGE 0
 #endif
-#endif
-// Run bytes for rs-byte records: the fewest whole cache lines that hold whole records (KRec 64, PRec and CRec 192),
-// so a thread's stage runs stay small enough to share the L2 with its hyperthread sibling.
-#define RUN(rs) ((rs) * (64 / ((rs) & -(rs))))
-_Static_assert(sizeof(Blk) == 64 && (sizeof(PRec) & -sizeof(PRec)) <= 64 && (sizeof(KRec) & -sizeof(KRec)) <= 64 && (sizeof(CRec) & -sizeof(CRec)) <= 64, "stage runs must be whole cache lines");
+#define ST 8 // records per run
+_Static_assert(sizeof(Blk) == 16 && ST * sizeof(PRec) % 16 == 0 && ST * sizeof(KRec) % 16 == 0 && ST * sizeof(CRec) % 16 == 0, "stage runs must stay 16 B-aligned");
 static char *pst; // [NT][NQART] PRec runs
 static char *kst; // [NT][NPART] KRec runs
 static char *cst; // [NT][NQART] CRec runs
@@ -660,7 +627,7 @@ INL void run_stream(char *d, const char *s, size_t n) {
 // Copies the partial run staged at st to the slots it was assigned: the records since the last run boundary.
 static void stage_flush(Bkt *b, const char *st, uint32_t rs) {
   if (!b->tail) return;
-  size_t k = (size_t)(b->cur - (char *)(b->tail + 1)) % (RUN(rs));
+  size_t k = (size_t)(b->cur - (char *)(b->tail + 1)) % (ST * rs);
   memcpy(b->cur - k, st, k);
 }
 // Appends the rs-byte record at src to bucket b (stage run st) and returns its final address.
@@ -675,9 +642,9 @@ INL char *rec_put(Arena *a, Bkt *b, char *st, const void *src, uint32_t rs, uint
     memcpy(d, src, rs);
     return d;
   }
-  size_t off = (size_t)(d - (char *)(b->tail + 1)) % (RUN(rs));
+  size_t off = (size_t)(d - (char *)(b->tail + 1)) % (ST * rs);
   memcpy(st + off, src, rs);
-  if (off + rs == RUN(rs)) run_stream(b->cur - RUN(rs), st, RUN(rs));
+  if (off + rs == ST * rs) run_stream(b->cur - ST * rs, st, ST * rs);
   return d;
 }
 
@@ -753,19 +720,16 @@ INL int tk_commas(const char **sep, int ns, const char *blk, uint64_t m) {
     }                                                                                             \
   } while (0)
 
-// Field k of a line: [fs, fe), quotes stripped; nqf counts the quotes used, and the result is nonzero when a quote
-// is misplaced. Branch-free: a fifth of fields are quoted at random, so a quote branch mispredicts on most lines.
-// An empty field's first byte is its separator, and e[-1] is readable since a line never starts a buffer.
-INL uint32_t field(const char *ls, const char *const *sep, int k, const char **fp, uint32_t *fl, uint32_t *nqf) {
+// Field k of a line: [fs, fe). Strips quotes; returns 0 if a quote is misplaced. nqf counts quotes used.
+INL int field(const char *ls, const char *const *sep, int k, const char **fp, uint32_t *fl, uint32_t *nqf, uint32_t nq) {
   const char *s = k ? sep[k - 1] + 1 : ls;
   const char *e = sep[k];
-  uint32_t q = *s == '"';
-  uint32_t bad = q & ((e - s < 2) | (e[-1] != '"'));
-  s += q;
-  e -= q;
-  *nqf += 2 * q;
+  if (nq && e > s && *s == '"') {
+    if (e - s < 2 || e[-1] != '"') return 0;
+    s++; e--; *nqf += 2;
+  }
   *fp = s; *fl = (uint32_t)(e - s);
-  return bad;
+  return 1;
 }
 
 // Delay line: person lookups miss cache, so each is resolved RING lines after its prefetch.
@@ -789,17 +753,17 @@ INL uint64_t keep_str(int tid, uint64_t r) {
 INL void ev_emit(int tid, const EPend *p) {
   uint64_t pk = person_of(p->uh);
   size_t bi = (size_t)tid * NQART + qpart(pk);
-  PRec r = {pk, pk & LINKED ? 0 : keep_str(tid, p->uref), p->ts, p->x}; // a linked person's name is lname's
-  char *d = rec_put(&arenas[tid], &pb[bi], pst + bi * RUN(sizeof(PRec)), &r, sizeof(PRec), pcap0);
+  PRec r = {pk, pk & LINKED ? 0 : keep_str(tid, p->uref), p->ts, p->x}; // a linked person's name is its root's lref
+  char *d = rec_put(&arenas[tid], &pb[bi], pst + bi * (ST * sizeof(PRec)), &r, sizeof(PRec), pcap0);
   KRec k = {p->eh, p->ingest, (uint32_t)((d - arenas[tid].base) >> 3)};
   size_t ki = (size_t)tid * NPART + (p->eh >> (64 - PB));
-  rec_put(&arenas[tid], &kb[ki], kst + ki * RUN(sizeof(KRec)), &k, sizeof(KRec), kcap0);
+  rec_put(&arenas[tid], &kb[ki], kst + ki * (ST * sizeof(KRec)), &k, sizeof(KRec), kcap0);
 }
 INL void cl_emit(int tid, const CPend *p) {
   uint64_t pk = person_of(p->uh);
   size_t bi = (size_t)tid * NQART + qpart(pk);
   CRec r = {pk, keep_str(tid, p->cref), p->ts, p->camp};
-  rec_put(&arenas[tid], &cb[bi], cst + bi * RUN(sizeof(CRec)), &r, sizeof(CRec), ccap0);
+  rec_put(&arenas[tid], &cb[bi], cst + bi * (ST * sizeof(CRec)), &r, sizeof(CRec), ccap0);
 }
 static void pend_flush(int tid) {
   Pend *P = &pend[tid];
@@ -812,15 +776,15 @@ static void pend_flush(int tid) {
 
 static inline void ev_line(int tid, const char *ls, const char *const *sep, int ns, uint32_t nq) {
   if (ns != 7) return;
-  const char *f[7]; uint32_t fl[7]; uint32_t nqf = 0, bad = 0;
-  for (int k = 0; k < 7; k++) bad |= field(ls, sep, k, &f[k], &fl[k], &nqf);
-  if (bad | (nqf != nq)) return;
+  const char *f[7]; uint32_t fl[7]; uint32_t nqf = 0;
+  for (int k = 0; k < 7; k++) if (!field(ls, sep, k, &f[k], &fl[k], &nqf, nq)) return;
+  if (nqf != nq) return;
   if (fl[0] == 0) return;
   uint64_t eh = hstr(f[0], fl[0]);
   uint64_t uh = 0;
   if (fl[1]) {
     uh = hstr(f[1], fl[1]);
-    if (have_links) __builtin_prefetch(&ltab[uh & lmask_b]);
+    if (have_links) { __builtin_prefetch(&lkey[lhome(uh)]); __builtin_prefetch(&lval[lhome(uh)]); }
   }
   int64_t is, ing;
   if (LIKELY(fl[3] == 20)) {
@@ -853,7 +817,7 @@ static inline void ev_line(int tid, const char *ls, const char *const *sep, int 
   if (!ok) {
     size_t ki = (size_t)tid * NPART + (eh >> (64 - PB));
     KRec k = {eh, (uint32_t)is, LOC_NONE};
-    rec_put(&arenas[tid], &kb[ki], kst + ki * RUN(sizeof(KRec)), &k, sizeof(KRec), kcap0);
+    rec_put(&arenas[tid], &kb[ki], kst + ki * (ST * sizeof(KRec)), &k, sizeof(KRec), kcap0);
     return;
   }
   Pend *P = &pend[tid];
@@ -865,12 +829,12 @@ static inline void ev_line(int tid, const char *ls, const char *const *sep, int 
 
 static inline void cl_line(int tid, const char *ls, const char *const *sep, int ns, uint32_t nq) {
   if (ns != 4) return;
-  const char *f[4]; uint32_t fl[4]; uint32_t nqf = 0, bad = 0;
-  for (int k = 0; k < 4; k++) bad |= field(ls, sep, k, &f[k], &fl[k], &nqf);
-  if (bad | (nqf != nq)) return;
+  const char *f[4]; uint32_t fl[4]; uint32_t nqf = 0;
+  for (int k = 0; k < 4; k++) if (!field(ls, sep, k, &f[k], &fl[k], &nqf, nq)) return;
+  if (nqf != nq) return;
   if (fl[0] == 0 || fl[1] == 0) return;
   uint64_t uh = hstr(f[1], fl[1]);
-  if (have_links) __builtin_prefetch(&ltab[uh & lmask_b]);
+  if (have_links) { __builtin_prefetch(&lkey[lhome(uh)]); __builtin_prefetch(&lval[lhome(uh)]); }
   int64_t ts = parse_ts(f[3], fl[3]);
   if (ts == BADTS || ts < CWS || ts >= WE) return;
   int32_t c = smap_get(&campmap, f[2], fl[2]);
@@ -885,14 +849,12 @@ static inline void cl_line(int tid, const char *ls, const char *const *sep, int 
 #define EVL(ls, sep, ns, nq) ev_line(tid, ls, sep, ns, nq)
 #define CLL(ls, sep, ns, nq) cl_line(tid, ls, sep, ns, nq)
 // Input is read, not mapped: no file page faults or teardown, and each task's span stays in the thread's L2.
-// 64 KB: the Xeon's 1 MB L2 serves two hyperthreads, each also streaming ~512 KB of stage runs.
 #ifndef IN_CHUNK
-#define IN_CHUNK (64u << 10)
+#define IN_CHUNK (256u << 10)
 #endif
 #ifndef IN_MARGIN
-#define IN_MARGIN 1024u // read past the span for the line crossing its end (a longer line is read again, further)
+#define IN_MARGIN 4096u // read past the span for the line crossing its end
 #endif
-#define IN_ZERO 256u // zeroed past the read end: the tokenizer's last block and the field readers stay inside it
 typedef struct { char *buf; int fd; const char *path; char pad[40]; } RBuf;
 static RBuf *rbufs; // [NT]
 static void read_at(int fd, char *d, size_t n, size_t off) {
@@ -931,7 +893,7 @@ static void parse_task(int tid, long t, void *ctx) {
     c.base = b = big;
     c.fsize = n;
   }
-  memset(b + c.fsize, 0, IN_ZERO); // past the read end: zeros like map_file's PAD, so the end of file ends the last line
+  memset(b + c.fsize, 0, PAD); // past the read end: zeros like map_file's PAD, so the end of file ends the last line
   if (c.kind == 0) { TOKENIZE((&c), EVL); }
   else { TOKENIZE((&c), CLL); }
   pend_flush(tid);
@@ -947,53 +909,78 @@ typedef struct { Edge *e; size_t n, cap; } EVec;
 static EVec *ledges; // [NT]
 static Chunk *lchunks; static long nlchunks;
 
-INL uint32_t lt_insert(uint64_t h, const char *p, uint32_t n) {
-  uint64_t i = h & lmask_b;
-  for (;;) {
-    uint64_t k = atomic_load_explicit(&ltab[i].key, memory_order_acquire);
-    if (k == h) return (uint32_t)i;
-    if (k == 0) {
-      uint64_t z = 0;
-      if (atomic_compare_exchange_strong(&ltab[i].key, &z, h)) { ltab[i].val = mkref(p, n); return (uint32_t)i; }
-      if (z == h) return (uint32_t)i;
-    }
-    i = (i + 1) & lmask_b;
+// The parse writes each ID occurrence to a bucket by the top LPB hash bits; a task per bucket then inserts its IDs
+// into its own table region (L2-sized, no atomics) and writes the dense ids into the edges.
+typedef struct { uint64_t h, ref, pre; uint32_t tid, pos; } LRec; // pos: edge index * 2 + side
+#define LBLK 256
+typedef struct LBlk { struct LBlk *next; uint32_t n; char pad[52]; LRec r[LBLK]; } LBlk; // a cache-line header
+typedef struct { LBlk *head; uint32_t n; } LBkt;
+static LBkt *lbkt; // [NT][LP]
+static uint32_t LPB, LP;
+static uint32_t *lbase; // [LP] first dense id of each bucket
+static LBlk *lpool; static _Atomic uint64_t lpool_n; static uint64_t lpool_cap; // bucket blocks, one huge-page mapping
+INL void lrec_put(int tid, uint64_t h, const char *p, uint32_t n, uint32_t pos) {
+  LBkt *b = &lbkt[(size_t)tid * LP + (LPB ? h >> (64 - LPB) : 0)];
+  LBlk *k = b->head;
+  if (UNLIKELY(!k || k->n == LBLK)) {
+    uint64_t q = atomic_fetch_add_explicit(&lpool_n, 1, memory_order_relaxed);
+    if (UNLIKELY(q >= lpool_cap)) die("links: block pool full");
+    k = &lpool[q];
+    k->next = b->head; k->n = 0;
+    b->head = k;
   }
-}
-// Link lines go through a delay line too: prefetch both slots, insert LRING lines later.
-#define LRING 16
-typedef struct { uint64_t ha, hb; const char *pa, *pb; uint32_t na, nb; } LPend;
-typedef struct { LPend e[LRING]; uint32_t n; char pad[60]; } LRing;
-static LRing *lring; // [NT]
-INL void lk_emit(int tid, const LPend *p) {
-  uint32_t a = lt_insert(p->ha, p->pa, p->na);
-  uint32_t b = lt_insert(p->hb, p->pb, p->nb);
-  if (a == b) return;
-  EVec *v = &ledges[tid];
-  if (v->n == v->cap) { v->cap = v->cap ? v->cap * 2 : 4096; v->e = xrealloc(v->e, v->cap * sizeof(Edge)); }
-  v->e[v->n].a = a; v->e[v->n].b = b; v->n++;
+  LRec *r = &k->r[k->n++];
+  uint64_t w;
+  memcpy(&w, p, 8); // the read buffer has PAD readable bytes past every line
+  if (n < 8) w &= (1ull << (8 * n)) - 1;
+  r->h = h; r->ref = mkref(p, n); r->pre = __builtin_bswap64(w); r->tid = (uint32_t)tid; r->pos = pos;
+  b->n++;
 }
 static inline void lk_line(int tid, const char *ls, const char *const *sep, int ns, uint32_t nq) {
   if (ns != 2) return;
-  const char *f[2]; uint32_t fl[2]; uint32_t nqf = 0, bad = 0;
-  for (int k = 0; k < 2; k++) bad |= field(ls, sep, k, &f[k], &fl[k], &nqf);
-  if (bad | (nqf != nq)) return;
+  const char *f[2]; uint32_t fl[2]; uint32_t nqf = 0;
+  for (int k = 0; k < 2; k++) if (!field(ls, sep, k, &f[k], &fl[k], &nqf, nq)) return;
+  if (nqf != nq) return;
   if (fl[0] == 0 || fl[1] == 0) return;
-  uint64_t ha = hstr(f[0], fl[0]), hb = hstr(f[1], fl[1]);
-  __builtin_prefetch(&ltab[ha & lmask_b], 1); __builtin_prefetch(&ltab[hb & lmask_b], 1);
-  LRing *R = &lring[tid];
-  LPend *e = &R->e[R->n % LRING];
-  if (R->n >= LRING) lk_emit(tid, e);
-  e->ha = ha; e->hb = hb; e->pa = f[0]; e->pb = f[1]; e->na = fl[0]; e->nb = fl[1];
-  R->n++;
-}
-static void lring_flush(int tid) {
-  LRing *R = &lring[tid];
-  for (uint32_t i = R->n > LRING ? R->n - LRING : 0; i < R->n; i++) lk_emit(tid, &R->e[i % LRING]);
-  R->n = 0;
+  EVec *v = &ledges[tid];
+  if (v->n == v->cap) { v->cap = v->cap ? v->cap * 2 : 4096; v->e = xrealloc(v->e, v->cap * sizeof(Edge)); }
+  uint32_t pos = (uint32_t)v->n++ * 2;
+  lrec_put(tid, hstr(f[0], fl[0]), f[0], fl[0], pos);
+  lrec_put(tid, hstr(f[1], fl[1]), f[1], fl[1], pos + 1);
 }
 #define LKL(ls, sep, ns, nq) lk_line(tid, ls, sep, ns, nq)
-static void link_parse_task(int tid, long t, void *ctx) { (void)ctx; const Chunk *c = &lchunks[t]; TOKENIZE(c, LKL); lring_flush(tid); }
+static void link_parse_task(int tid, long t, void *ctx) { (void)ctx; const Chunk *c = &lchunks[t]; TOKENIZE(c, LKL); }
+static void link_insert_task(int tid, long p, void *ctx) {
+  (void)tid; (void)ctx;
+  uint64_t lo = (uint64_t)p * (lrmask + 1ull);
+  lkey[lo] = 0; // a store first: lands on a real huge page, not the zero page a load would map
+  lval[lo] = 0;
+  uint32_t id = lbase[p];
+  for (int t = 0; t < NT; t++) {
+    for (LBlk *k = lbkt[(size_t)t * LP + p].head; k; k = k->next) {
+      for (uint32_t j = 0; j < k->n; j++) {
+        const LRec *r = &k->r[j];
+        uint64_t i = lhome(r->h);
+        uint32_t d;
+        for (;;) {
+          uint64_t key = lkey[i];
+          if (key == r->h) { d = lval[i]; break; }
+          if (!key) {
+            d = id++;
+            lkey[i] = r->h; lval[i] = d;
+            lref[d] = r->ref;
+            lpre[d] = r->pre;
+            atomic_store_explicit(&lpar[d], d, memory_order_relaxed);
+            break;
+          }
+          i = lnext_slot(i);
+        }
+        Edge *e = &ledges[r->tid].e[r->pos >> 1];
+        if (r->pos & 1) e->b = d; else e->a = d;
+      }
+    }
+  }
+}
 
 INL uint32_t uf_find(uint32_t x) {
   for (;;) {
@@ -1008,67 +995,32 @@ static void uf_task(int tid, long t, void *ctx) {
   (void)tid; (void)ctx;
   EVec *v = &ledges[t];
   for (size_t i = 0; i < v->n; i++) {
+    if (i + 16 < v->n) {
+      __builtin_prefetch(&lpar[v->e[i + 16].a]); __builtin_prefetch(&lpar[v->e[i + 16].b]);
+      __builtin_prefetch(&lpre[v->e[i + 16].a]); __builtin_prefetch(&lpre[v->e[i + 16].b]);
+    }
     uint32_t a = v->e[i].a, b = v->e[i].b;
     for (;;) {
       a = uf_find(a); b = uf_find(b);
       if (a == b) break;
-      if (a < b) { uint32_t s = a; a = b; b = s; } // link larger root under smaller
+      // link the root with the larger string under the smaller (ids break ties: equal hashes are one id)
+      uint64_t pa = lpre[a], pb = lpre[b];
+      int c = pa != pb ? (pa < pb ? -1 : 1) : str_cmp(refp(lref[a]), refn(lref[a]), refp(lref[b]), refn(lref[b]));
+      if (c < 0 || (c == 0 && a < b)) { uint32_t s = a; a = b; b = s; }
       uint32_t exp = a;
       if (atomic_compare_exchange_strong(&lpar[a], &exp, b)) break;
     }
   }
 }
 #define LSPAN 65536
-static void init_task(int tid, long t, void *ctx) {
-  (void)tid; (void)ctx;
-  uint64_t lo = (uint64_t)t * LSPAN, hi = lo + LSPAN; if (hi > lcap) hi = lcap;
-  for (uint64_t i = lo; i < hi; i++) { atomic_store_explicit(&lpar[i], (uint32_t)i, memory_order_relaxed); atomic_store_explicit(&lbest[i], UINT32_MAX, memory_order_relaxed); }
-  // A span of ltab is 1 MB, so this writes every 2 MB page first: lt_insert's first touch is a load, which maps the
-  // huge zero page, and the store after it splits that into 4 KB pages (a fault per page, a TLB miss per lookup).
-  atomic_store_explicit(&ltab[lo].key, 0, memory_order_relaxed);
-}
-static void best_task(int tid, long t, void *ctx) {
+static void pkey_task(int tid, long t, void *ctx) { // lval: id -> root id
   (void)tid; (void)ctx;
   uint64_t lo = (uint64_t)t * LSPAN, hi = lo + LSPAN; if (hi > lcap) hi = lcap;
   for (uint64_t i = lo; i < hi; i++) {
-    if (!atomic_load_explicit(&ltab[i].key, memory_order_relaxed)) continue;
-    uint32_t r = uf_find((uint32_t)i);
-    uint64_t me = ltab[i].val;
-    uint32_t cur = atomic_load(&lbest[r]);
-    for (;;) {
-      if (cur != UINT32_MAX) {
-        uint64_t o = ltab[cur].val;
-        if (str_cmp(refp(me), refn(me), refp(o), refn(o)) >= 0) break;
-      }
-      if (atomic_compare_exchange_weak(&lbest[r], &cur, (uint32_t)i)) break;
-    }
+    if (!lkey[i]) continue;
+    lval[i] = uf_find(lval[i]);
   }
 }
-INL uint64_t mix64(uint64_t x) { x ^= x >> 33; x *= 0xff51afd7ed558ccdull; x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ull; x ^= x >> 33; return x; }
-static void name_task(int tid, long t, void *ctx) { // lname[root] = smallest ID's ref
-  (void)tid; (void)ctx;
-  uint64_t lo = (uint64_t)t * LSPAN, hi = lo + LSPAN; if (hi > lcap) hi = lcap;
-  for (uint64_t i = lo; i < hi; i++)
-    if (atomic_load_explicit(&ltab[i].key, memory_order_relaxed) && atomic_load_explicit(&lpar[i], memory_order_relaxed) == (uint32_t)i)
-      lname[i] = ltab[atomic_load(&lbest[i])].val;
-}
-static void pkey_task(int tid, long t, void *ctx) { // val: string ref -> person key
-  (void)tid; (void)ctx;
-  uint64_t lo = (uint64_t)t * LSPAN, hi = lo + LSPAN; if (hi > lcap) hi = lcap;
-  for (uint64_t i = lo; i < hi; i++) {
-    if (!atomic_load_explicit(&ltab[i].key, memory_order_relaxed)) continue;
-    uint32_t r = uf_find((uint32_t)i);
-    ltab[i].val = LINKED | (mix64(r) & 0x7FFFFFFF00000000ull) | r;
-  }
-}
-static _Atomic uint64_t nl_count;
-static void nl_task(int tid, long t, void *ctx) {
-  (void)tid; (void)ctx;
-  const Chunk *c = &lchunks[t]; const char *p = c->base + c->start, *e = c->base + c->end; uint64_t n = 0;
-  while ((p = memchr(p, '\n', (size_t)(e - p)))) { n++; p++; }
-  atomic_fetch_add(&nl_count, n);
-}
-
 static void load_links(const char *dd) {
   char dir[4096]; snprintf(dir, sizeof dir, "%s/links", dd);
   char **paths; int nf = list_csv(dir, &paths);
@@ -1076,35 +1028,43 @@ static void load_links(const char *dd) {
   MFile *fs = xmalloc(sizeof(MFile) * (nf ? nf : 1));
   for (int i = 0; i < nf; i++) { fs[i] = map_file(paths[i]); bytes += fs[i].n; }
   if (bytes == 0) return;
-  // chunks
   Chunk *save = chunks; long sn = nchunks, sc = chcap;
   chunks = NULL; nchunks = 0; chcap = 0;
   for (int i = 0; i < nf; i++) add_chunks(fs[i].p, paths[i], fs[i].n, 2, 1 << 18);
   lchunks = chunks; nlchunks = nchunks;
   chunks = save; nchunks = sn; chcap = sc;
-  run_par(nlchunks, nl_task, NULL);
-  PH(" l.count");
-  uint64_t lines = nf + nl_count;
-  uint64_t est = 2 * lines + lines / 2 + 1024; // distinct IDs <= 2 * lines
-  lcap = 1024; while (lcap < est) lcap <<= 1;
-  lmask_b = lcap - 1;
-  ltab = hcalloc(lcap * sizeof(LEnt));
-  lpar = hcalloc(lcap * 4); lbest = hcalloc(lcap * 4);
+  // ~2^13 ID occurrences per bucket at ~16 bytes of file per occurrence
+  LPB = 0; while (LPB < 20 && (bytes >> (17 + LPB))) LPB++;
+  LP = 1u << LPB;
+  lbkt = xcalloc((size_t)NT * LP, sizeof(LBkt));
+  // a line is >= 4 bytes ("a,b\n") with two IDs, plus a part-full block per bucket
+  lpool_cap = bytes / 2 / LBLK + 1 + (uint64_t)NT * LP;
+  lpool = hcalloc(lpool_cap * sizeof(LBlk)); // NORESERVE: only the blocks used are mapped
   ledges = xcalloc(NT, sizeof(EVec));
-  lring = xcalloc(NT, sizeof(LRing));
-  long nspan = (long)((lcap + LSPAN - 1) / LSPAN);
-  run_par(nspan, init_task, NULL);
-  PH(" l.init");
   run_par(nlchunks, link_parse_task, NULL);
   PH(" l.parse");
+  // region = 2^LRB slots >= 1.1 x the largest bucket's occurrences (its distinct IDs, at most)
+  lbase = xmalloc(LP * sizeof(uint32_t));
+  uint64_t most = 0, nid = 1;
+  for (uint32_t p = 0; p < LP; p++) {
+    uint64_t n = 0;
+    for (int t = 0; t < NT; t++) n += lbkt[(size_t)t * LP + p].n;
+    lbase[p] = (uint32_t)nid;
+    nid += n;
+    if (n > most) most = n;
+  }
+  if (nid >= (1ull << 31)) die("links: too many IDs");
+  uint32_t lrb = 4; while ((1ull << lrb) < most + most / 10 + 1) lrb++;
+  lrmask = (1u << lrb) - 1;
+  lcap = (uint64_t)LP << lrb;
+  lshift = 64 - LPB - lrb;
+  lkey = hcalloc(lcap * 8); lval = hcalloc(lcap * 4);
+  lref = hcalloc(nid * 8); lpre = hcalloc(nid * 8); lpar = hcalloc(nid * 4);
+  run_par(LP, link_insert_task, NULL);
+  PH(" l.insert");
   run_par(NT, uf_task, NULL);
   PH(" l.uf");
-  run_par(nspan, best_task, NULL);
-  PH(" l.best");
-  lname = hcalloc(lcap * 8);
-  run_par(nspan, name_task, NULL);
-  PH(" l.name");
-  run_par(nspan, pkey_task, NULL);
+  run_par((long)((lcap + LSPAN - 1) / LSPAN), pkey_task, NULL);
   have_links = 1;
 }
 
@@ -1358,7 +1318,7 @@ static void sess_task(int tid, long q, void *ctx) {
           }
           pt.key[i] = pk; pt.id[i] = np;
           pkeys[np] = pk;
-          names[np] = pk & LINKED ? lname[(uint32_t)pk] : r[j].uref;
+          names[np] = pk & LINKED ? lref[(uint32_t)pk] : r[j].uref;
           np++;
           eoff[np] = 0;
         }
@@ -1899,9 +1859,9 @@ static void load_products(const char *dd) {
   char path[4096]; snprintf(path, sizeof path, "%s/products.csv", dd);
   MFile f = map_file(path);
   Str *cats = xmalloc(sizeof(Str) * 64); int nc = 0, ccap = 64;
-  SMap cm; smap_init(&cm);
+  SMap cm; smap_init(&cm, 1024);
   size_t lines = f.n / 8 + 16;
-  smap_init(&prodmap);
+  smap_init(&prodmap, lines);
   const char *p = f.p, *end = f.p + f.n;
   const char *nl = memchr(p, '\n', f.n); p = nl ? nl + 1 : end;
   Str *prods = xmalloc(sizeof(Str) * lines), *pcat = xmalloc(sizeof(Str) * lines); size_t npd = 0;
@@ -1918,16 +1878,15 @@ static void load_products(const char *dd) {
     p = le + 1;
   }
   int cr;
-  static const char unk[16] = "unknown"; // 16 readable bytes for key_eq
-  smap_put(&cm, unk, 7, 0, &cr);
-  if (cr) { if (nc == ccap) { ccap *= 2; cats = xrealloc(cats, sizeof(Str) * ccap); } cats[nc].p = unk; cats[nc].n = 7; nc++; }
+  smap_put(&cm, "unknown", 7, 0, &cr);
+  if (cr) { if (nc == ccap) { ccap *= 2; cats = xrealloc(cats, sizeof(Str) * ccap); } cats[nc].p = "unknown"; cats[nc].n = 7; nc++; }
   qsort(cats, nc, sizeof(Str), cmp_str);
   ncat = nc;
   if (ncat > 31) die("too many categories");
   catp = xmalloc(sizeof(char *) * ncat); catn = xmalloc(sizeof(uint32_t) * ncat);
   for (int i = 0; i < ncat; i++) {
     catp[i] = cats[i].p; catn[i] = cats[i].n;
-    cm.e[smap_put(&cm, cats[i].p, cats[i].n, 0, &cr)].v = i;
+    SSlot *s = smap_put(&cm, cats[i].p, cats[i].n, 0, &cr); s->v = i;
     if (str_eq(cats[i].p, cats[i].n, "unknown", 7)) unknown_cat = i;
   }
   for (size_t i = 0; i < npd; i++) {
@@ -1940,7 +1899,7 @@ static void load_campaigns(const char *dd) {
   char path[4096]; snprintf(path, sizeof path, "%s/campaigns.csv", dd);
   MFile f = map_file(path);
   size_t lines = f.n / 4 + 16;
-  smap_init(&campmap);
+  smap_init(&campmap, lines);
   camp_id = xmalloc(sizeof(char *) * lines); camp_idn = xmalloc(4 * lines);
   chan = xmalloc(sizeof(char *) * lines); chann = xmalloc(4 * lines);
   const char *p = f.p, *end = f.p + f.n;
@@ -1968,13 +1927,13 @@ static void close_task(int tid, long t, void *ctx) {
   (void)tid; (void)ctx;
   for (uint32_t i = 0; i < NPART; i++) {
     size_t bi = (size_t)t * NPART + i;
-    if (STAGE) stage_flush(&kb[bi], kst + bi * RUN(sizeof(KRec)), sizeof(KRec));
+    if (STAGE) stage_flush(&kb[bi], kst + bi * (ST * sizeof(KRec)), sizeof(KRec));
     bkt_close(&kb[bi], sizeof(KRec));
   }
   for (uint32_t i = 0; i < NQART; i++) {
     size_t bi = (size_t)t * NQART + i;
-    if (STAGE) stage_flush(&pb[bi], pst + bi * RUN(sizeof(PRec)), sizeof(PRec));
-    if (STAGE) stage_flush(&cb[bi], cst + bi * RUN(sizeof(CRec)), sizeof(CRec));
+    if (STAGE) stage_flush(&pb[bi], pst + bi * (ST * sizeof(PRec)), sizeof(PRec));
+    if (STAGE) stage_flush(&cb[bi], cst + bi * (ST * sizeof(CRec)), sizeof(CRec));
     bkt_close(&pb[bi], sizeof(PRec));
     bkt_close(&cb[bi], sizeof(CRec));
   }
@@ -2049,9 +2008,9 @@ int main(void) {
   kb = xcalloc((size_t)NT * NPART, sizeof(Bkt));
   pb = xcalloc((size_t)NT * NQART, sizeof(Bkt));
   cb = xcalloc((size_t)NT * NQART, sizeof(Bkt));
-  if (STAGE) pst = hcalloc((size_t)NT * NQART * RUN(sizeof(PRec)));
-  if (STAGE) kst = hcalloc((size_t)NT * NPART * RUN(sizeof(KRec)));
-  if (STAGE) cst = hcalloc((size_t)NT * NQART * RUN(sizeof(CRec)));
+  if (STAGE) pst = hcalloc((size_t)NT * NQART * ST * sizeof(PRec));
+  if (STAGE) kst = hcalloc((size_t)NT * NPART * ST * sizeof(KRec));
+  if (STAGE) cst = hcalloc((size_t)NT * NQART * ST * sizeof(CRec));
   PH("map");
   run_par(nchunks, parse_task, NULL);
   run_par(NT, close_task, NULL);

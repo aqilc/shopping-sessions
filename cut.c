@@ -46,7 +46,7 @@ INL uint64_t ticks(void) {
   return (uint64_t)(now_s() * 1e9);
 #endif
 }
-enum { SP_DSPLIT, SP_DPROBE, SP_GATHER, SP_SORT, SP_CLICKS, SP_WALK, SP_N };
+enum { SP_DSPLIT, SP_DPROBE, SP_GATHER, SP_SORT, SP_CLICKS, SP_WALK, SP_ASSIST, SP_N };
 static uint64_t sprof[16][8]; // [thread][SP_*], one cache line per thread
 #define SP_ADD(tid, k, t0) do { if (PROF) { uint64_t t1_ = ticks(); sprof[tid][k] += t1_ - (t0); (t0) = t1_; } } while (0)
 // Prints sub-phases k0..k1-1 as PH-style lines: max over threads, then the sum.
@@ -749,19 +749,32 @@ INL uint64_t keep_str(int tid, uint64_t r) {
   a->cur = d + n;
   return mkref(d, n);
 }
+// Profiling cuts (-DCUT=n): the per-line work stops after stage n, cumulative, and main exits after parse.
+// 1 tokenize, 2 fields, 3 ID hashes, 4 timestamps, 5 validation, 6 record writes without person_of and keep_str,
+// 7 with person_of, 8 full parse without links.
+#ifdef CUT
+static struct { uint64_t v; char pad[56]; } csink[16];
+#define CUT_AT(n, val) if (CUT == (n)) { csink[tid].v ^= (uint64_t)(val); return; }
+#define CUT_PK(uh) (CUT == 6 ? (uh) & ~LINKED : person_of(uh))
+#define CUT_KEEP(tid, r) (CUT <= 7 ? (r) : keep_str(tid, r))
+#else
+#define CUT_AT(n, val)
+#define CUT_PK(uh) person_of(uh)
+#define CUT_KEEP(tid, r) keep_str(tid, r)
+#endif
 INL void ev_emit(int tid, const EPend *p) {
-  uint64_t pk = person_of(p->uh);
+  uint64_t pk = CUT_PK(p->uh);
   size_t bi = (size_t)tid * NQART + qpart(pk);
-  PRec r = {pk, pk & LINKED ? 0 : keep_str(tid, p->uref), p->ts, p->x}; // a linked person's name is lname's
+  PRec r = {pk, pk & LINKED ? 0 : CUT_KEEP(tid, p->uref), p->ts, p->x}; // a linked person's name is lname's
   char *d = rec_put(&arenas[tid], &pb[bi], pst + bi * (ST * sizeof(PRec)), &r, sizeof(PRec), pcap0);
   KRec k = {p->eh, p->ingest, (uint32_t)((d - arenas[tid].base) >> 3)};
   size_t ki = (size_t)tid * NPART + (p->eh >> (64 - PB));
   rec_put(&arenas[tid], &kb[ki], kst + ki * (ST * sizeof(KRec)), &k, sizeof(KRec), kcap0);
 }
 INL void cl_emit(int tid, const CPend *p) {
-  uint64_t pk = person_of(p->uh);
+  uint64_t pk = CUT_PK(p->uh);
   size_t bi = (size_t)tid * NQART + qpart(pk);
-  CRec r = {pk, keep_str(tid, p->cref), p->ts, p->camp};
+  CRec r = {pk, CUT_KEEP(tid, p->cref), p->ts, p->camp};
   rec_put(&arenas[tid], &cb[bi], cst + bi * (ST * sizeof(CRec)), &r, sizeof(CRec), ccap0);
 }
 static void pend_flush(int tid) {
@@ -774,17 +787,20 @@ static void pend_flush(int tid) {
 }
 
 static inline void ev_line(int tid, const char *ls, const char *const *sep, int ns, uint32_t nq) {
+  CUT_AT(1, (uintptr_t)ls ^ ns ^ nq);
   if (ns != 7) return;
   const char *f[7]; uint32_t fl[7]; uint32_t nqf = 0;
   for (int k = 0; k < 7; k++) if (!field(ls, sep, k, &f[k], &fl[k], &nqf, nq)) return;
   if (nqf != nq) return;
   if (fl[0] == 0) return;
+  CUT_AT(2, (uintptr_t)f[1] ^ fl[0] ^ fl[1] ^ fl[3] ^ fl[6]);
   uint64_t eh = hstr(f[0], fl[0]);
   uint64_t uh = 0;
   if (fl[1]) {
     uh = hstr(f[1], fl[1]);
     if (have_links) __builtin_prefetch(&ltab[uh & lmask_b]);
   }
+  CUT_AT(3, eh ^ uh);
   int64_t is, ing;
   if (LIKELY(fl[3] == 20)) {
     is = ingest_s(f[3]);
@@ -794,6 +810,7 @@ static inline void ev_line(int tid, const char *ls, const char *const *sep, int 
     is = ing == BADTS ? 0xFFFFFFFFll : ing / 1000;
   }
   int64_t ts = parse_ts(f[2], fl[2]);
+  CUT_AT(4, eh ^ uh ^ (uint64_t)is ^ (uint64_t)ts);
   uint32_t x = 0;
   int ok = fl[1] > 0 && ts != BADTS && ts >= WS && ts < WE && fl[5] > 0;
   if (ok) {
@@ -811,6 +828,7 @@ static inline void ev_line(int tid, const char *ls, const char *const *sep, int 
   if (ok && ing != BADTS && ing - ts > 86400000LL) ok = 0;
   if (is < 0) is = 0;
   if (is > 0xFFFFFFFFll) is = 0xFFFFFFFFll;
+  CUT_AT(5, eh ^ uh ^ (uint64_t)is ^ (uint64_t)ts ^ x ^ (uint64_t)ok);
   // A valid event's KRec is written by ev_emit once its payload loc is known; dedup does not depend on KRec order
   // (it keeps the smallest ingest, and copies with equal ingest_ts are identical).
   if (!ok) {
@@ -827,17 +845,22 @@ static inline void ev_line(int tid, const char *ls, const char *const *sep, int 
 }
 
 static inline void cl_line(int tid, const char *ls, const char *const *sep, int ns, uint32_t nq) {
+  CUT_AT(1, (uintptr_t)ls ^ ns ^ nq);
   if (ns != 4) return;
   const char *f[4]; uint32_t fl[4]; uint32_t nqf = 0;
   for (int k = 0; k < 4; k++) if (!field(ls, sep, k, &f[k], &fl[k], &nqf, nq)) return;
   if (nqf != nq) return;
   if (fl[0] == 0 || fl[1] == 0) return;
+  CUT_AT(2, (uintptr_t)f[1] ^ fl[0] ^ fl[1] ^ fl[3]);
   uint64_t uh = hstr(f[1], fl[1]);
   if (have_links) __builtin_prefetch(&ltab[uh & lmask_b]);
+  CUT_AT(3, uh);
   int64_t ts = parse_ts(f[3], fl[3]);
+  CUT_AT(4, uh ^ (uint64_t)ts);
   if (ts == BADTS || ts < CWS || ts >= WE) return;
   int32_t c = smap_get(&campmap, f[2], fl[2]);
   if (c < 0) return;
+  CUT_AT(5, uh ^ (uint64_t)ts ^ (uint64_t)c);
   Pend *P = &pend[tid];
   CPend *e = &P->c[P->nc % RING];
   if (P->nc >= RING) cl_emit(tid, e);
@@ -1270,7 +1293,7 @@ INL uint32_t pt_find(const PTab *t, uint64_t pk) {
 // bucket, and between consecutive non-empty buckets it breaks when the later's first ts is over 30 min past the
 // earlier's last: sessions come from per-bucket min/max with no sort by ts.
 #define BSH 20
-typedef struct { uint32_t mn, mx, cnt, sess; } TBkt; // sess: index of the person's session, set by the walk
+typedef struct { uint32_t mn, mx, cnt, day; uint64_t rev; } TBkt; // day: index of the session's day, set by the walk
 
 static void sess_task(int tid, long q, void *ctx) {
   (void)ctx;
@@ -1282,8 +1305,7 @@ static void sess_task(int tid, long q, void *ctx) {
   }
   if (!ne) return;
   uint64_t t0 = PROF ? ticks() : 0;
-  // one pass over the records: dense person id, per person counts, (id << 32 | ts) per event, and the purchases
-  // apart (~3% of events), so the per-event arrays hold no price
+  // one pass over the records: dense person id, per person counts, (ts << 32 | x) and the id per event
   // sized for ~16 events per person (the mean is ~30); it doubles past half full
   PTab pt;
   uint32_t pcap = 256; while (pcap < ne / 8) pcap <<= 1;
@@ -1295,10 +1317,9 @@ static void sess_task(int tid, long q, void *ctx) {
   uint64_t *names = aalloc(S, ne * 8);
   uint32_t *eoff = aalloc(S, (ne + 1) * 4);
   eoff[0] = 0;
-  uint64_t *g = aalloc(S, ne * 8); // id << 32 | ts
-  uint64_t *ptx = aalloc(S, ne * 8); // purchases: ts << 32 | x
-  uint32_t *ppid = aalloc(S, ne * 4);
-  size_t k = 0, npu = 0;
+  uint64_t *tx = aalloc(S, ne * 8); // ts << 32 | x
+  uint32_t *pid = aalloc(S, ne * 4);
+  size_t k = 0;
   for (int t = 0; t < NT; t++) {
     for (Blk *bk = pb[(size_t)t * NQART + q].head; bk; bk = bk->next) {
       PRec *r = (PRec *)(bk + 1);
@@ -1314,8 +1335,8 @@ static void sess_task(int tid, long q, void *ctx) {
             pt.id = aalloc(S, (size_t)pcap * 4);
             pt.mask = pcap - 1;
             for (uint32_t z = 0; z < np; z++) {
-              uint32_t gi = pt_find(&pt, pkeys[z]);
-              pt.key[gi] = pkeys[z]; pt.id[gi] = z;
+              uint32_t g = pt_find(&pt, pkeys[z]);
+              pt.key[g] = pkeys[z]; pt.id[g] = z;
             }
             i = pt_find(&pt, pk);
           }
@@ -1327,13 +1348,9 @@ static void sess_task(int tid, long q, void *ctx) {
         }
         uint32_t id = pt.id[i];
         eoff[id + 1]++;
-        g[k] = ((uint64_t)id << 32) | r[j].ts;
+        tx[k] = ((uint64_t)r[j].ts << 32) | x;
+        pid[k] = id;
         k++;
-        if (x & X_PURCH) {
-          ptx[npu] = ((uint64_t)r[j].ts << 32) | x;
-          ppid[npu] = id;
-          npu++;
-        }
       }
     }
   }
@@ -1341,14 +1358,8 @@ static void sess_task(int tid, long q, void *ctx) {
   SP_ADD(tid, SP_GATHER, t0);
   for (uint32_t i = 0; i < np; i++) eoff[i + 1] += eoff[i];
   uint32_t *pos = aalloc(S, ((size_t)np + 1) * 4); memcpy(pos, eoff, ((size_t)np + 1) * 4);
-  uint32_t *ev = aalloc(S, nalive * 4);
-  for (size_t i = 0; i < nalive; i++) ev[pos[g[i] >> 32]++] = (uint32_t)g[i];
-  uint32_t *poff = aalloc(S, ((size_t)np + 1) * 4); memset(poff, 0, ((size_t)np + 1) * 4);
-  for (size_t i = 0; i < npu; i++) poff[ppid[i] + 1]++;
-  for (uint32_t i = 0; i < np; i++) poff[i + 1] += poff[i];
-  memcpy(pos, poff, ((size_t)np + 1) * 4);
-  uint64_t *pur = aalloc(S, npu * 8 + 8); // per person runs of ts << 32 | x
-  for (size_t i = 0; i < npu; i++) pur[pos[ppid[i]]++] = ptx[i];
+  uint64_t *ev = aalloc(S, nalive * 8 + 8);
+  for (size_t i = 0; i < nalive; i++) ev[pos[pid[i]]++] = tx[i];
   SP_ADD(tid, SP_SORT, t0);
   // clicks: per person runs of (ts << 32 | click slot); ts ties are settled by click_id at credit time
   uint32_t *cpid = aalloc(S, (nc + 1) * 4);
@@ -1399,36 +1410,35 @@ static void sess_task(int tid, long q, void *ctx) {
   uint32_t ebase = (uint32_t)(WS - CWS);
   uint32_t nb = (uint32_t)((WE - 1 - WS) >> BSH) + 1;
   TBkt *tb = aalloc(S, (size_t)nb * sizeof(TBkt));
-  for (uint32_t b = 0; b < nb; b++) { tb[b].mn = UINT32_MAX; tb[b].mx = 0; tb[b].cnt = 0; }
+  for (uint32_t b = 0; b < nb; b++) { tb[b].mn = UINT32_MAX; tb[b].mx = 0; tb[b].cnt = 0; tb[b].rev = 0; }
   uint64_t *bits = aalloc(S, ((size_t)nb / 64 + 1) * 8); memset(bits, 0, ((size_t)nb / 64 + 1) * 8);
   int64_t *catd = aalloc(S, (size_t)NDAYS * 32 * 8); memset(catd, 0, (size_t)NDAYS * 32 * 8);
   uint32_t *dmask = aalloc(S, (size_t)NDAYS * 4); memset(dmask, 0, (size_t)NDAYS * 4);
-  // the person's sessions: start ts, day index, events, revenue, and the end of its day's run
-  uint32_t *sst = aalloc(S, nalive * 4);
-  uint32_t *sdi = aalloc(S, nalive * 4);
+  uint64_t *pur = aalloc(S, nalive * 8); // the person's purchases, ts << 32 | x
+  // sessions, person after person from soff[p]: start ts, day index, events, revenue
+  uint32_t *soff = aalloc(S, ((size_t)np + 1) * 4);
+  uint32_t *sst0 = aalloc(S, nalive * 4);
+  uint32_t *sdi0 = aalloc(S, nalive * 4);
   uint32_t *scnt = aalloc(S, nalive * 4);
   int64_t *srev = aalloc(S, nalive * 8);
-  uint32_t *drun = aalloc(S, nalive * 4);
-  uint32_t *scr = aalloc(S, nalive * 4); // the campaign each session is credited to, ncamp for organic
-  uint32_t *jprev = aalloc(S, ((size_t)ncamp + 1) * 4); // valid where st[] carries this person's stamp
+  uint32_t so = 0;
   for (uint32_t p = 0; p < np; p++) {
-    const uint32_t *e = ev + eoff[p];
+    const uint64_t *e = ev + eoff[p];
     uint32_t n = eoff[p + 1] - eoff[p];
-    const uint64_t *pu = pur + poff[p];
-    uint32_t npur = poff[p + 1] - poff[p];
     uint64_t *c = cl + coff[p];
     uint32_t m = coff[p + 1] - coff[p];
+    uint32_t *sst = sst0 + so, *sdi = sdi0 + so;
+    soff[p] = so;
     uint32_t rows0 = U->day.n;
-    // a name is one cache miss into the strings parse wrote (a third of the walk on arm64): fetch it 16 persons ahead
-    __builtin_prefetch(refp(names[p + 16 < np ? p + 16 : p]));
     uint32_t nn = refn(names[p]);
     bres(&U->names, 4 + nn);
     memcpy(U->names.b + U->names.n, &nn, 4);
     memcpy(U->names.b + U->names.n + 4, refp(names[p]), nn);
     U->names.n += 4 + nn;
-    uint32_t blo = nb, bhi = 0;
+    uint32_t blo = nb, bhi = 0, npur = 0;
     for (uint32_t i = 0; i < n; i++) {
-      uint32_t t = e[i];
+      uint32_t t = (uint32_t)(e[i] >> 32);
+      uint32_t x = (uint32_t)e[i];
       uint32_t b = (t - ebase) >> BSH;
       TBkt *B = &tb[b];
       B->mn = t < B->mn ? t : B->mn;
@@ -1437,6 +1447,7 @@ static void sess_task(int tid, long q, void *ctx) {
       bits[b >> 6] |= 1ull << (b & 63);
       blo = b < blo ? b : blo;
       bhi = b > bhi ? b : bhi;
+      if (x & X_PURCH) { B->rev += x & 0xFFFFFF; pur[npur++] = e[i]; }
     }
     // buckets in ts order -> sessions
     uint32_t ns = 0, last = 0;
@@ -1448,77 +1459,31 @@ static void sess_task(int tid, long q, void *ctx) {
         if (!ns || B->mn - last > 1800000u) {
           sst[ns] = B->mn;
           sdi[ns] = (uint32_t)((CWS + (int64_t)B->mn) / 86400000LL - DAY0);
-          scnt[ns] = 0;
-          srev[ns] = 0;
+          scnt[so + ns] = 0;
+          srev[so + ns] = 0;
           ns++;
         }
         last = B->mx;
-        scnt[ns - 1] += B->cnt;
-        B->sess = ns - 1;
-        B->mn = UINT32_MAX; B->mx = 0; B->cnt = 0;
+        scnt[so + ns - 1] += B->cnt;
+        srev[so + ns - 1] += (int64_t)B->rev;
+        B->day = sdi[ns - 1];
+        B->mn = UINT32_MAX; B->mx = 0; B->cnt = 0; B->rev = 0;
       }
     }
-    // purchases count for their session's revenue and the category of its day
+    // purchases count for the category of their session's day
     for (uint32_t i = 0; i < npur; i++) {
-      uint32_t t = (uint32_t)(pu[i] >> 32);
-      uint32_t x = (uint32_t)pu[i];
-      uint32_t z = tb[(t - ebase) >> BSH].sess;
-      uint32_t d = sdi[z];
+      uint32_t t = (uint32_t)(pur[i] >> 32);
+      uint32_t x = (uint32_t)pur[i];
+      uint32_t d = tb[(t - ebase) >> BSH].day;
       uint32_t cat = (x >> 24) & 31;
-      srev[z] += x & 0xFFFFFF;
       catd[(size_t)d * 32 + cat] += x & 0xFFFFFF;
       dmask[d] |= 1u << cat;
     }
-    // One merge walk over the clicks in ts order. Credit: when a click comes past a session's start, the clicks
-    // before it are all at or before that start, so the latest of them is the session's click if it is within
-    // 7 days (among equal ts the smallest click_id, settled once per run of equal ts when a session asks).
-    // Assists: a click at t assists the sessions starting in [t, t + 7 days]; per campaign only the sessions past
-    // the previous click's range count, so each (session, campaign) pair counts once.
-    uint32_t ip = 0;
-    if (m) {
-      drun[ns - 1] = ns;
-      for (uint32_t z = ns - 1; z-- > 0;) drun[z] = sdi[z] == sdi[z + 1] ? drun[z + 1] : z + 1;
-      uint32_t sv = ++stampv[tid];
-      uint32_t jp = 0, g0 = 0, gbest = UINT32_MAX; // g0: first click of the equal-ts run ending at the last click
-      for (uint32_t z = 0; z <= m; z++) {
-        uint32_t t = z < m ? (uint32_t)(c[z] >> 32) : UINT32_MAX;
-        for (; ip < ns && (z == m || sst[ip] < t); ip++) {
-          if (!z) { scr[ip] = (uint32_t)ncamp; continue; }
-          uint32_t ct = (uint32_t)(c[z - 1] >> 32);
-          uint32_t best = (uint32_t)c[z - 1];
-          if (UNLIKELY(g0 != z - 1)) {
-            if (gbest == UINT32_MAX) {
-              gbest = best;
-              for (uint32_t y = g0; y < z - 1; y++) {
-                uint32_t o = (uint32_t)c[y];
-                if (str_cmp(refp(cref[o]), refn(cref[o]), refp(cref[gbest]), refn(cref[gbest])) < 0) gbest = o;
-              }
-            }
-            best = gbest;
-          }
-          scr[ip] = (int64_t)ct >= (int64_t)sst[ip] - 604800000LL ? ccamp[best] : (uint32_t)ncamp;
-        }
-        if (z == m) break;
-        if (z && t != (uint32_t)(c[z - 1] >> 32)) { g0 = z; gbest = UINT32_MAX; }
-        uint32_t cc = ccamp[(uint32_t)c[z]];
-        while (jp < ns && sst[jp] <= (int64_t)t + 604800000LL) jp++;
-        uint32_t from = ip;
-        if (st[cc] != sv) st[cc] = sv;
-        else if (jprev[cc] > from) from = jprev[cc];
-        jprev[cc] = jp;
-        while (from < jp) {
-          uint32_t to = drun[from] < jp ? drun[from] : jp;
-          hot[(size_t)cc * NDAYS + sdi[from]].assisted += to - from;
-          from = to;
-        }
-      }
-    }
-    for (; ip < ns; ip++) scr[ip] = (uint32_t)ncamp;
-    // sessions -> campaign aggregates, one row per day
-    uint32_t rses = 0, revs = 0;
+    // sessions -> credited click, campaign aggregates, one row per day
+    uint32_t hi = 0, rses = 0, revs = 0;
     int64_t rrev = 0;
     for (uint32_t z = 0; z < ns; z++) {
-      uint32_t di = sdi[z];
+      uint32_t s0 = sst[z], di = sdi[z];
       if (z && di != sdi[z - 1]) {
         uint32_t pd = sdi[z - 1];
         emit_row(U, pd, rses, revs, rrev, catd + (size_t)pd * 32, dmask[pd]);
@@ -1528,19 +1493,66 @@ static void sess_task(int tid, long q, void *ctx) {
         rrev = 0;
       }
       rses++;
-      revs += scnt[z];
-      rrev += srev[z];
-      size_t ci = (size_t)scr[z] * NDAYS + di;
+      revs += scnt[so + z];
+      rrev += srev[so + z];
+      while (hi < m && (uint32_t)(c[hi] >> 32) <= s0) hi++;
+      // latest ts wins; among equal ts the smallest click_id. Branch-free but for ties: whether a session has a
+      // qualifying click is a coin flip. c[0] is readable even for m == 0 (the click run is allocated one longer).
+      uint32_t y = hi - (hi != 0);
+      uint32_t ct = (uint32_t)(c[y] >> 32), best = (uint32_t)c[y];
+      int ok = hi != 0 && (int64_t)ct >= (int64_t)s0 - 604800000LL;
+      if (UNLIKELY(ok && y > 0 && (uint32_t)(c[y - 1] >> 32) == ct)) {
+        for (; y > 0 && (uint32_t)(c[y - 1] >> 32) == ct; y--) {
+          uint32_t o = (uint32_t)c[y - 1];
+          if (str_cmp(refp(cref[o]), refn(cref[o]), refp(cref[best]), refn(cref[best])) < 0) best = o;
+        }
+      }
+      uint32_t cbest = ccamp[best];
+      uint32_t credited = ok ? cbest : (uint32_t)ncamp;
+      size_t ci = (size_t)credited * NDAYS + di;
       hot[ci].sessions++;
-      if (srev[z]) { cy[ci].purch++; cy[ci].revenue += srev[z]; }
+      if (srev[so + z]) { cy[ci].purch++; cy[ci].revenue += srev[so + z]; }
     }
     uint32_t ld = sdi[ns - 1];
     emit_row(U, ld, rses, revs, rrev, catd + (size_t)ld * 32, dmask[ld]);
     dmask[ld] = 0;
     bvar(&U->uidx, (uint64_t)(U->day.n - rows0) << 1);
     bu32(&U->uidx, U->np++);
+    so += ns;
   }
+  soff[np] = so;
   SP_ADD(tid, SP_WALK, t0);
+  uint32_t *drun = aalloc(S, (size_t)so * 4);
+  uint32_t *jprev = aalloc(S, ((size_t)ncamp + 1) * 4); // valid where st[] carries this person's stamp
+  for (uint32_t p = 0; p < np; p++) {
+    const uint64_t *c = cl + coff[p];
+    uint32_t m = coff[p + 1] - coff[p];
+    if (!m) continue;
+    const uint32_t *sst = sst0 + soff[p], *sdi = sdi0 + soff[p];
+    uint32_t ns = soff[p + 1] - soff[p];
+    // assists: a click at t assists the sessions starting in [t, t + 7 days]; per campaign only the
+    // sessions past the previous click's range count, so each (session, campaign) pair counts once
+    drun[ns - 1] = ns;
+    for (uint32_t z = ns - 1; z-- > 0;) drun[z] = sdi[z] == sdi[z + 1] ? drun[z + 1] : z + 1;
+    uint32_t sv = ++stampv[tid];
+    uint32_t ip = 0, jp = 0;
+    for (uint32_t z = 0; z < m; z++) {
+      int64_t t = (int64_t)(c[z] >> 32);
+      uint32_t cc = ccamp[(uint32_t)c[z]];
+      while (ip < ns && sst[ip] < t) ip++;
+      while (jp < ns && sst[jp] <= t + 604800000LL) jp++;
+      uint32_t from = ip;
+      if (st[cc] != sv) st[cc] = sv;
+      else if (jprev[cc] > from) from = jprev[cc];
+      jprev[cc] = jp;
+      while (from < jp) {
+        uint32_t to = drun[from] < jp ? drun[from] : jp;
+        hot[(size_t)cc * NDAYS + sdi[from]].assisted += to - from;
+        from = to;
+      }
+    }
+  }
+  SP_ADD(tid, SP_ASSIST, t0);
 }
 
 // ---------- parquet writer ----------
@@ -1982,7 +1994,9 @@ int main(void) {
   load_products(dd);
   load_campaigns(dd);
   PH("small");
+#if !defined(CUT) || CUT != 8
   load_links(dd);
+#endif
   PH("links");
 
   char dir[4096];
@@ -2027,6 +2041,10 @@ int main(void) {
   run_par(nchunks, parse_task, NULL);
   run_par(NT, close_task, NULL);
   PH("parse");
+#ifdef CUT
+  fprintf(stderr, "cut %d sink %llx\n", CUT, (unsigned long long)csink[0].v);
+  _exit(0);
+#endif
   double pt0 = now_s(); uint64_t pk0 = ticks();
   run_par(NPART, dedup_task, NULL);
   PH("dedup");
@@ -2051,7 +2069,7 @@ int main(void) {
   run_par_f(NQART, order, sess_task, write_user_task, NULL);
   PH("sess");
   {
-    static const char *const sn[] = {" d.split", " d.probe", " s.gather", " s.sort", " s.clicks", " s.walk"};
+    static const char *const sn[] = {" d.split", " d.probe", " s.gather", " s.sort", " s.clicks", " s.walk", " s.assist"};
     sp_print(SP_DSPLIT, SP_N, sn, PROF ? (now_s() - pt0) * 1e3 / (double)(ticks() - pk0) : 0);
   }
   write_campaign();
