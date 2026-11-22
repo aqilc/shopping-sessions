@@ -223,6 +223,21 @@ INL int64_t ts_cal(const char *p, unsigned ss, uint64_t bad) {
   return days * 86400000LL + (int64_t)(hh * 3600 + mi * 60 + ss) * 1000;
 }
 
+// ingest_ts is always valid F1 (rules.md), so it needs no checks: "YYYY-MM-DDTHH:MM:SSZ" -> epoch seconds.
+INL int64_t ingest_s(const char *p) {
+  uint64_t q0 = ts_pairs(ld8(p) ^ 0x2D30302D30303030ULL), q1 = ts_pairs(ld8(p + 8) ^ 0x30303A3030543030ULL);
+  unsigned y = LANE(q0, 0) * 100 + LANE(q0, 2), mo = LANE(q0, 5);
+  unsigned da = LANE(q1, 0), hh = LANE(q1, 3), mi = LANE(q1, 6);
+  unsigned ss = (unsigned)(p[17] - '0') * 10 + (unsigned)(p[18] - '0');
+  unsigned yi = y - TS_Y0;
+  int64_t days;
+  if (LIKELY(yi < TS_NY)) {
+    unsigned leap = (unsigned)(ts_ystart[yi + 1] - ts_ystart[yi]) - 365;
+    days = ts_ystart[yi] + ts_moff[leap][mo] + (int64_t)da - 1;
+  } else days = days_from_civil(y, mo, da);
+  return days * 86400 + hh * 3600 + mi * 60 + ss;
+}
+
 // Lemire: 8 ASCII digits (first digit in the low byte) -> value. Zero bytes count as '0'.
 INL uint64_t ts_parse8(uint64_t w) {
   w = ((w & 0x0F0F0F0F0F0F0F0FULL) * 2561) >> 8;
@@ -575,7 +590,7 @@ static inline void ev_line(int tid, const char *ls, const char *const *sep, int 
     uh = hstr(f[1], fl[1]);
     if (have_links) __builtin_prefetch(&ltab[uh & lmask_b]);
   }
-  int64_t ing = parse_ts(f[3], fl[3]);
+  int64_t ing = LIKELY(fl[3] == 20) ? ingest_s(f[3]) * 1000 : parse_ts(f[3], fl[3]);
   int64_t ts = parse_ts(f[2], fl[2]);
   uint32_t x = 0;
   int ok = fl[1] > 0 && ts != BADTS && ts >= WS && ts < WE && fl[5] > 0;
