@@ -49,14 +49,20 @@ INL uint64_t ticks(void) {
 enum { SP_DSPLIT, SP_DPROBE, SP_GATHER, SP_SORT, SP_CLICKS, SP_WALK, SP_ASSIST, SP_N };
 static uint64_t sprof[16][8]; // [thread][SP_*], one cache line per thread
 #define SP_ADD(tid, k, t0) do { if (PROF) { uint64_t t1_ = ticks(); sprof[tid][k] += t1_ - (t0); (t0) = t1_; } } while (0)
-// Prints sub-phases k0..k1-1 as PH-style lines: max over threads, then the sum.
+// Prints sub-phases k0..k1-1 as PH-style lines: max over threads, then the sum. The sums again as one "X:" line,
+// which the board diag copies into its summary (it skips the sub-timer lines).
 static void sp_print(int k0, int k1, const char *const *names, double ms_per_tick) {
   if (!PROF) return;
+  double sums[SP_N];
   for (int k = k0; k < k1; k++) {
     uint64_t mx = 0, sum = 0;
     for (int t = 0; t < 16; t++) { sum += sprof[t][k]; if (sprof[t][k] > mx) mx = sprof[t][k]; }
-    fprintf(stderr, "%-10s %7.1f ms max/thread, %.1f ms sum\n", names[k - k0], mx * ms_per_tick, sum * ms_per_tick);
+    sums[k] = sum * ms_per_tick;
+    fprintf(stderr, "%-10s %7.1f ms max/thread, %.1f ms sum\n", names[k - k0], mx * ms_per_tick, sums[k]);
   }
+  fprintf(stderr, "X: thread sums ms");
+  for (int k = k0; k < k1; k++) fprintf(stderr, "%s %.0f", names[k - k0], sums[k]);
+  fprintf(stderr, "\n");
 }
 
 // ---------- hashing / strings ----------
@@ -2303,6 +2309,7 @@ int main(void) {
   double pt0 = now_s(); uint64_t pk0 = ticks();
   run_par(NPART, dedup_task, NULL);
   PH("dedup");
+  double setup0 = now_s();
   ucol = xcalloc(NT, sizeof(UCol));
   DBW = 1; while ((1u << DBW) < (uint32_t)NDAYS) DBW++;
   CBW = 1; while ((1u << CBW) < (uint32_t)ncat) CBW++;
@@ -2318,6 +2325,7 @@ int main(void) {
   for (uint32_t q = 0; q < NQART; q++) order[q] = q;
   qsort(order, NQART, sizeof(long), cmp_q);
   PH(" s.setup");
+  double setup1 = now_s();
   snprintf(dir, sizeof dir, "%s/user_daily", od); if (mkdir(dir, 0777) && errno != EEXIST) die(dir);
   snprintf(dir, sizeof dir, "%s/campaign_daily", od); if (mkdir(dir, 0777) && errno != EEXIST) die(dir);
   // each thread writes its user_daily file the moment the queue runs dry, while the others finish their partitions
@@ -2326,6 +2334,7 @@ int main(void) {
   {
     static const char *const sn[] = {" d.split", " d.probe", " s.gather", " s.sort", " s.clicks", " s.walk", " s.assist"};
     sp_print(SP_DSPLIT, SP_N, sn, PROF ? (now_s() - pt0) * 1e3 / (double)(ticks() - pk0) : 0);
+    if (PROF) fprintf(stderr, "X: s.setup %.2f ms wall, one thread\n", (setup1 - setup0) * 1e3);
   }
   write_campaign();
   PH("write");
