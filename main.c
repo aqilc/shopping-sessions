@@ -802,20 +802,21 @@ static const char *chunk_begin(const Chunk *c) {
 // Tokenizer: calls LINE(ls, sep, nsep, nq) for each line starting in [begin, cend).
 // sep[k] = position of the k-th separator (',' or the line end), nq = quotes in the line.
 // Bytes past the file end are zero (map_file's PAD), so blocks need no end mask.
-// Commas go to sep_ SEPW at a time, unconditionally: slots past min(ns, MAXF) are scratch, so no per-field branch.
-// SEPW >= MAXF, so commas past the first SEPW of a block can only land past MAXF and need no store.
+// Commas go to sep_ W at a time, unconditionally: slots past min(ns, MAXF) are scratch, so no per-field branch.
+// W is the comma count of a well-formed line of the file kind: a mask holding more belongs to a line with too many
+// separators, which ns (counted, not stored) rejects whatever sep_ holds.
 #define MAXF 8
 #define SEPW 8
-INL int tk_commas(const char **sep, int ns, const char *blk, uint64_t m) {
+INL int tk_commas(const char **sep, int ns, const char *blk, uint64_t m, int w) {
   int n = __builtin_popcountll(m);
   const char **d = sep + (ns < MAXF ? ns : MAXF);
-  for (int j = 0; j < SEPW; j++) {
+  for (int j = 0; j < w; j++) {
     d[j] = blk + __builtin_ctzll(m | (1ull << 63));
     m &= m - 1;
   }
   return ns + n;
 }
-#define TOKENIZE(c, LINE)                                                                         \
+#define TOKENIZE(c, LINE, W)                                                                      \
   do {                                                                                            \
     const char *fend_ = (c)->base + (c)->fsize;                                                   \
     const char *cend_ = (c)->base + (c)->end;                                                     \
@@ -831,7 +832,7 @@ INL int tk_commas(const char **sep, int ns, const char *blk, uint64_t m) {
         int i_ = __builtin_ctzll(nl_);                                                            \
         uint64_t below_ = nl_ ^ (nl_ - 1);                                                        \
         nl_ &= nl_ - 1;                                                                           \
-        ns_ = tk_commas(sep_, ns_, blk_, cm_ & below_);                                           \
+        ns_ = tk_commas(sep_, ns_, blk_, cm_ & below_, W);                                          \
         sep_[ns_ < MAXF ? ns_ : MAXF] = blk_ + i_;                                                \
         ns_++;                                                                                    \
         uint32_t nq_ = qacc_ + (uint32_t)__builtin_popcountll(q_ & below_);                       \
@@ -841,7 +842,7 @@ INL int tk_commas(const char **sep, int ns, const char *blk, uint64_t m) {
         if (ls_ >= cend_) { done_ = 1; break; }                                                   \
       }                                                                                           \
       if (done_) break;                                                                           \
-      if (cm_) ns_ = tk_commas(sep_, ns_, blk_, cm_);                                             \
+      if (cm_) ns_ = tk_commas(sep_, ns_, blk_, cm_, W);                                          \
       qacc_ += (uint32_t)__builtin_popcountll(q_);                                                \
       blk_ += 64;                                                                                 \
       if (blk_ >= fend_) {                                                                        \
@@ -1027,8 +1028,8 @@ static void parse_task(int tid, long t, void *ctx) {
     c.fsize = n;
   }
   memset(b + c.fsize, 0, PAD); // past the read end: zeros like map_file's PAD, so the end of file ends the last line
-  if (c.kind == 0) { TOKENIZE((&c), EVL); }
-  else { TOKENIZE((&c), CLL); }
+  if (c.kind == 0) { TOKENIZE((&c), EVL, 6); }
+  else { TOKENIZE((&c), CLL, 3); }
   pend_flush(tid);
   free(big);
 #if defined(__AVX2__)
@@ -1082,7 +1083,7 @@ static inline void lk_line(int tid, const char *ls, const char *const *sep, int 
   lrec_put(tid, hstr(f[1], fl[1]), f[1], fl[1], pos + 1);
 }
 #define LKL(ls, sep, ns, nq) lk_line(tid, ls, sep, ns, nq)
-static void link_parse_task(int tid, long t, void *ctx) { (void)ctx; const Chunk *c = &lchunks[t]; TOKENIZE(c, LKL); }
+static void link_parse_task(int tid, long t, void *ctx) { (void)ctx; const Chunk *c = &lchunks[t]; TOKENIZE(c, LKL, 1); }
 static void link_insert_task(int tid, long p, void *ctx) {
   (void)tid; (void)ctx;
   uint64_t lo = (uint64_t)p * (lrmask + 1ull);
