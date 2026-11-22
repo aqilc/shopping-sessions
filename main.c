@@ -571,17 +571,27 @@ INL int32_t smap_get(const SMap *m, const char *p, uint32_t n) {
   }
 }
 
-// Campaign IDs are "c_" + a number (rules.md), so those of 1..5 digits without a leading zero are looked up by
-// value: no hash, probe or string compare. cdir[number] = index + 1; 0 sends the lookup to the string map.
+// Product and campaign IDs are a short prefix and a number ("p123", "c_123"), so the canonical ones (no leading
+// zero) are looked up by value: no hash, probe or string compare, and the product table stays in L2 where the
+// string map is megabytes. dir[number] = index + 1; 0 sends the lookup to the string map.
 #define CDIR_N 100000
-static uint16_t *cdir;
-// The number in a canonical ID ("c_", then 1..5 digits, the first not '0'), or -1. Reads p[0..7].
-INL int32_t camp_num(const char *p, uint32_t n) {
-  if (UNLIKELY(n - 3 > 4)) return -1;
-  uint64_t x = (ld8(p) ^ 0x3030303030305F63ULL) & (~0ULL >> (64 - 8 * n));
-  if (UNLIKELY((((x + 0x7676767676767F7FULL) | x) & (0x80 * ONES)) != 0 || (x & 0xFF0000) == 0)) return -1;
+#define PDIR_N 1000000
+static uint16_t *cdir; // campaign index + 1
+static uint8_t *pdir;  // category index + 1
+// The number in a canonical ID of n bytes (nmin..7: the prefix, then digits, the first not '0'), or -1.
+// e holds the prefix and '0' on the digit lanes, c 0x7F on the prefix lanes and 0x76 on the digit lanes, first
+// masks the first digit's lane. Reads p[0..7].
+INL int32_t id_num(const char *p, uint32_t n, uint32_t nmin, uint64_t e, uint64_t c, uint64_t first) {
+  if (UNLIKELY(n - nmin > 7 - nmin)) return -1;
+  uint64_t x = (ld8(p) ^ e) & (~0ULL >> (64 - 8 * n));
+  if (UNLIKELY((((x + c) | x) & (0x80 * ONES)) != 0 || (x & first) == 0)) return -1;
   return (int32_t)ts_parse8(x << (64 - 8 * n));
 }
+// "c_" + 1..5 digits
+INL int32_t camp_num(const char *p, uint32_t n) { return id_num(p, n, 3, 0x3030303030305F63ULL, 0x7676767676767F7FULL, 0xFF0000); }
+// "p" + 1..6 digits
+INL int32_t prod_num(const char *p, uint32_t n) { return id_num(p, n, 2, 0x3030303030303070ULL, 0x767676767676767FULL, 0xFF00); }
+static SMap prodmap; // product -> category index
 static SMap campmap; // campaign -> idx
 INL int32_t camp_get(const char *p, uint32_t n) {
   int32_t k = camp_num(p, n);
@@ -590,6 +600,14 @@ INL int32_t camp_get(const char *p, uint32_t n) {
     if (LIKELY(v)) return (int32_t)v - 1;
   }
   return smap_get(&campmap, p, n);
+}
+INL int32_t prod_get(const char *p, uint32_t n) {
+  int32_t k = prod_num(p, n);
+  if (LIKELY(k >= 0)) {
+    uint32_t v = pdir[k];
+    if (LIKELY(v)) return (int32_t)v - 1;
+  }
+  return smap_get(&prodmap, p, n);
 }
 
 // ---------- thread pool ----------
@@ -668,7 +686,6 @@ static void bkt_close(Bkt *b, uint32_t rs) {
 // ---------- globals ----------
 static int64_t WS, WE, CWS; // event window [WS,WE), click window [CWS,WE)
 static int64_t DAY0; static int32_t NDAYS;
-static SMap prodmap; // product -> category index
 static int unknown_cat;
 static int ncat; static const char **catp; static uint32_t *catn;
 static int ncamp; static const char **camp_id; static uint32_t *camp_idn; static const char **chan; static uint32_t *chann;
@@ -920,7 +937,7 @@ static inline void ev_line(int tid, const char *ls, const char *const *sep, int 
       uint32_t pr = parse_price(f[6], fl[6]);
       if (!pr) ok = 0;
       else {
-        int32_t c = smap_get(&prodmap, f[5], fl[5]);
+        int32_t c = prod_get(f[5], fl[5]);
         x = pr | ((uint32_t)(c < 0 ? unknown_cat : c) << 24) | X_PURCH;
       }
     } else ok = 0;
@@ -1978,6 +1995,7 @@ static void load_products(const char *dd) {
   SMap cm; smap_init(&cm, 1024);
   size_t lines = f.n / 8 + 16;
   smap_init(&prodmap, lines);
+  pdir = xcalloc(PDIR_N, 1);
   const char *p = f.p, *end = f.p + f.n;
   const char *nl = memchr(p, '\n', f.n); p = nl ? nl + 1 : end;
   Str *prods = xmalloc(sizeof(Str) * lines), *pcat = xmalloc(sizeof(Str) * lines); size_t npd = 0;
@@ -2008,6 +2026,8 @@ static void load_products(const char *dd) {
   for (size_t i = 0; i < npd; i++) {
     int32_t ci = smap_get(&cm, pcat[i].p, pcat[i].n);
     smap_put(&prodmap, prods[i].p, prods[i].n, ci, &cr);
+    int32_t k = prod_num(prods[i].p, prods[i].n);
+    if (cr && k >= 0 && ci >= 0) pdir[k] = (uint8_t)(ci + 1);
   }
 }
 
