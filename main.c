@@ -116,6 +116,12 @@ static MFile map_file(const char *path) {
   return f;
 }
 
+static size_t file_size(const char *path) {
+  struct stat st;
+  if (stat(path, &st) < 0) die(path);
+  return (size_t)st.st_size;
+}
+
 static int list_csv(const char *dir, char ***out) {
   DIR *d = opendir(dir);
   int n = 0, cap = 64;
@@ -638,13 +644,13 @@ INL char *rec_put(Arena *a, Bkt *b, char *st, const void *src, uint32_t rs, uint
 }
 
 // ---------- chunks ----------
-typedef struct { const char *base; size_t start, end, fsize; int kind; } Chunk;
+// base is the mapped file (links) or NULL with path set (events, clicks: parse_task reads the span into a buffer).
+typedef struct { const char *base; size_t start, end, fsize; int kind; const char *path; } Chunk;
 static Chunk *chunks; static long nchunks, chcap;
-static void add_chunks(MFile f, int kind, size_t csz) {
-  if (!f.n) return;
-  for (size_t s = 0; s < f.n; s += csz) {
+static void add_chunks(const char *base, const char *path, size_t n, int kind, size_t csz) {
+  for (size_t s = 0; s < n; s += csz) {
     if (nchunks == chcap) { chcap = chcap ? chcap * 2 : 256; chunks = xrealloc(chunks, sizeof(Chunk) * chcap); }
-    Chunk c = {f.p, s, s + csz < f.n ? s + csz : f.n, f.n, kind};
+    Chunk c = {base, s, s + csz < n ? s + csz : n, n, kind, path};
     chunks[nchunks++] = c;
   }
 }
@@ -727,10 +733,22 @@ typedef struct { uint64_t uh, uref, eh; uint32_t ts, x, ingest; } EPend;
 typedef struct { uint64_t uh, cref; uint32_t ts, camp; } CPend;
 typedef struct { EPend e[RING]; CPend c[RING]; uint32_t ne, nc; char pad[56]; } Pend;
 static Pend *pend; // [NT]
+static Arena *strs; // [NT] ID strings the records refer to, copied out of the read buffer
+// Copies the string ref r points at (in the read buffer, which has PAD readable bytes past every line) to strs.
+INL uint64_t keep_str(int tid, uint64_t r) {
+  Arena *a = &strs[tid];
+  uint32_t n = refn(r);
+  char *d = a->cur;
+  if (UNLIKELY(d + n + 16 > a->end)) die("strings full");
+  if (LIKELY(n <= 16)) memcpy(d, refp(r), 16);
+  else memcpy(d, refp(r), n);
+  a->cur = d + n;
+  return mkref(d, n);
+}
 INL void ev_emit(int tid, const EPend *p) {
   uint64_t pk = person_of(p->uh);
   size_t bi = (size_t)tid * NQART + qpart(pk);
-  PRec r = {pk, p->uref, p->ts, p->x};
+  PRec r = {pk, pk & LINKED ? 0 : keep_str(tid, p->uref), p->ts, p->x}; // a linked person's name is lname's
   char *d = rec_put(&arenas[tid], &pb[bi], pst + bi * (ST * sizeof(PRec)), &r, sizeof(PRec), pcap0);
   KRec k = {p->eh, p->ingest, (uint32_t)((d - arenas[tid].base) >> 3)};
   size_t ki = (size_t)tid * NPART + (p->eh >> (64 - PB));
@@ -739,7 +757,7 @@ INL void ev_emit(int tid, const EPend *p) {
 INL void cl_emit(int tid, const CPend *p) {
   uint64_t pk = person_of(p->uh);
   size_t bi = (size_t)tid * NQART + qpart(pk);
-  CRec r = {pk, p->cref, p->ts, p->camp};
+  CRec r = {pk, keep_str(tid, p->cref), p->ts, p->camp};
   rec_put(&arenas[tid], &cb[bi], cst + bi * (ST * sizeof(CRec)), &r, sizeof(CRec), ccap0);
 }
 static void pend_flush(int tid) {
@@ -825,12 +843,56 @@ static inline void cl_line(int tid, const char *ls, const char *const *sep, int 
 
 #define EVL(ls, sep, ns, nq) ev_line(tid, ls, sep, ns, nq)
 #define CLL(ls, sep, ns, nq) cl_line(tid, ls, sep, ns, nq)
+// Input is read, not mapped: no file page faults or teardown, and each task's span stays in the thread's L2.
+#ifndef IN_CHUNK
+#define IN_CHUNK (256u << 10)
+#endif
+#ifndef IN_MARGIN
+#define IN_MARGIN 4096u // read past the span for the line crossing its end
+#endif
+typedef struct { char *buf; int fd; const char *path; char pad[40]; } RBuf;
+static RBuf *rbufs; // [NT]
+static void read_at(int fd, char *d, size_t n, size_t off) {
+  while (n) {
+    ssize_t r = pread(fd, d, n, (off_t)off);
+    if (r <= 0) die("pread");
+    d += r; n -= (size_t)r; off += (size_t)r;
+  }
+}
 static void parse_task(int tid, long t, void *ctx) {
   (void)ctx;
-  const Chunk *c = &chunks[t];
-  if (c->kind == 0) { TOKENIZE(c, EVL); }
-  else { TOKENIZE(c, CLL); }
+  const Chunk *f = &chunks[t];
+  RBuf *rb = &rbufs[tid];
+  if (rb->path != f->path) {
+    if (rb->path) close(rb->fd);
+    rb->fd = open(f->path, O_RDONLY);
+    if (rb->fd < 0) die(f->path);
+    rb->path = f->path;
+  }
+  // The span starts one byte early (chunk_begin looks for the newline before start) and the chunk is rebased on it.
+  size_t off = f->start ? f->start - 1 : 0;
+  size_t n = f->end + IN_MARGIN - off;
+  if (off + n > f->fsize) n = f->fsize - off;
+  char *b = rb->buf;
+  read_at(rb->fd, b, n, off);
+  Chunk c = {b, f->start - off, f->end - off, n, f->kind, f->path};
+  char *big = NULL;
+  size_t rest = f->fsize - off;
+  if (n < rest && !memchr(b + c.end - 1, '\n', n - (c.end - 1)) && chunk_begin(&c) < b + c.end) {
+    // a line starting in the span ends past the margin: read twice as far until it ends
+    do {
+      n = 2 * n < rest ? 2 * n : rest;
+      big = xrealloc(big, n + PAD);
+      read_at(rb->fd, big, n, off);
+    } while (n < rest && !memchr(big + c.end - 1, '\n', n - (c.end - 1)));
+    c.base = b = big;
+    c.fsize = n;
+  }
+  memset(b + c.fsize, 0, PAD); // past the read end: zeros like map_file's PAD, so the end of file ends the last line
+  if (c.kind == 0) { TOKENIZE((&c), EVL); }
+  else { TOKENIZE((&c), CLL); }
   pend_flush(tid);
+  free(big);
 #if defined(__AVX2__)
   _mm_sfence(); // streamed runs are visible once the tasks are joined
 #endif
@@ -971,7 +1033,7 @@ static void load_links(const char *dd) {
   // chunks
   Chunk *save = chunks; long sn = nchunks, sc = chcap;
   chunks = NULL; nchunks = 0; chcap = 0;
-  for (int i = 0; i < nf; i++) add_chunks(fs[i], 2, 1 << 18);
+  for (int i = 0; i < nf; i++) add_chunks(fs[i].p, paths[i], fs[i].n, 2, 1 << 18);
   lchunks = chunks; nlchunks = nchunks;
   chunks = save; nchunks = sn; chcap = sc;
   run_par(nlchunks, nl_task, NULL);
@@ -1691,9 +1753,8 @@ static void close_task(int tid, long t, void *ctx) {
 #endif
 static void release_task(int tid, long t, void *ctx) {
   (void)tid; (void)ctx;
-  if (t < nchunks) { const Chunk *c = &chunks[t]; madvise((void *)(c->base + c->start), c->end - c->start, MADV_DONTNEED); return; }
-  t -= nchunks;
   madvise(arenas[t].base, (size_t)(arenas[t].cur - arenas[t].base), MADV_DONTNEED);
+  madvise(strs[t].base, (size_t)(strs[t].cur - strs[t].base), MADV_DONTNEED);
   madvise(scratch[t].base, 1ull << 30, MADV_DONTNEED);
 }
 
@@ -1724,12 +1785,11 @@ int main(void) {
   snprintf(dir, sizeof dir, "%s/events", dd); int ne = list_csv(dir, &ep);
   snprintf(dir, sizeof dir, "%s/clicks", dd); int ncl = list_csv(dir, &cp);
   size_t ebytes = 0, cbytes = 0;
-  MFile *ef = xmalloc(sizeof(MFile) * (ne + 1)), *cf = xmalloc(sizeof(MFile) * (ncl + 1));
-  for (int i = 0; i < ne; i++) { ef[i] = map_file(ep[i]); ebytes += ef[i].n; }
-  for (int i = 0; i < ncl; i++) { cf[i] = map_file(cp[i]); cbytes += cf[i].n; }
-  size_t csz = 1u << 20;
-  for (int i = 0; i < ne; i++) add_chunks(ef[i], 0, csz);
-  for (int i = 0; i < ncl; i++) add_chunks(cf[i], 1, csz);
+  size_t *ef = xmalloc(sizeof(size_t) * (ne + 1)), *cf = xmalloc(sizeof(size_t) * (ncl + 1));
+  for (int i = 0; i < ne; i++) { ef[i] = file_size(ep[i]); ebytes += ef[i]; }
+  for (int i = 0; i < ncl; i++) { cf[i] = file_size(cp[i]); cbytes += cf[i]; }
+  for (int i = 0; i < ne; i++) add_chunks(NULL, ep[i], ef[i], 0, IN_CHUNK);
+  for (int i = 0; i < ncl; i++) add_chunks(NULL, cp[i], cf[i], 1, IN_CHUNK);
   // partition sizing
   uint64_t eest = ebytes / 60 + 1024, cest = cbytes / 45 + 1024;
   // eest runs ~1.4x the real event count, so 48000 here is ~30-35K events per partition: 2^10 at 20M, 2^11 at
@@ -1743,6 +1803,12 @@ int main(void) {
   ccap0 = (uint32_t)(cest / NT / NQART); ccap0 = ccap0 / 2 + 32;
   arenas = xcalloc(NT, sizeof(Arena)); scratch = xcalloc(NT, sizeof(Arena));
   for (int t = 0; t < NT; t++) { arena_init(&arenas[t], ARENA_SZ); arena_init(&scratch[t], 1ull << 30); }
+  strs = xcalloc(NT, sizeof(Arena)); rbufs = xcalloc(NT, sizeof(RBuf));
+  for (int t = 0; t < NT; t++) {
+    arena_init(&strs[t], ebytes + cbytes + 64); // a copied ID is shorter than its line
+    rbufs[t].buf = aligned_alloc(64, (IN_CHUNK + IN_MARGIN + PAD + 127) & ~63u); // the span starts a byte early
+    if (!rbufs[t].buf) die("oom");
+  }
   pend = xcalloc(NT, sizeof(Pend));
   kb = xcalloc((size_t)NT * NPART, sizeof(Bkt));
   pb = xcalloc((size_t)NT * NQART, sizeof(Bkt));
@@ -1782,7 +1848,7 @@ int main(void) {
   PH(" w.user");
   write_campaign();
   PH("write");
-  if (RELEASE) run_par(nchunks + NT, release_task, NULL);
+  if (RELEASE) run_par(NT, release_task, NULL);
   PH("release");
   _exit(0);
 }
