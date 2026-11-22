@@ -1804,12 +1804,17 @@ static void close_task(int tid, long t, void *ctx) {
 #ifndef RELEASE
 #define RELEASE 1
 #endif
+// The big arenas go first so no thread picks one up after the files run out. Input goes a whole file per task (at a
+// file's first chunk): threads zapping neighboring chunks would share page-table pages and their locks.
 static void release_task(int tid, long t, void *ctx) {
   (void)tid; (void)ctx;
-  if (t < nchunks) { const Chunk *c = &chunks[t]; madvise((void *)(c->base + c->start), c->end - c->start, MADV_DONTNEED); return; }
-  t -= nchunks;
-  madvise(arenas[t].base, (size_t)(arenas[t].cur - arenas[t].base), MADV_DONTNEED);
-  madvise(scratch[t].base, 1ull << 30, MADV_DONTNEED);
+  if (t < NT) {
+    madvise(arenas[t].base, (size_t)(arenas[t].cur - arenas[t].base), MADV_DONTNEED);
+    madvise(scratch[t].base, 1ull << 30, MADV_DONTNEED);
+    return;
+  }
+  const Chunk *c = &chunks[t - NT];
+  if (c->start == 0) madvise((void *)c->base, c->fsize, MADV_DONTNEED);
 }
 
 int main(void) {
