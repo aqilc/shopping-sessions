@@ -1216,10 +1216,9 @@ enum { LT_NONE = 0, LT_STRING = 1, LT_DATE = 6 };
 typedef struct { const char *name; int type; int logical; int optional; } ColDef;
 typedef struct { Buf data; int64_t nvals; int64_t off; int64_t size; } ColOut;
 
-static void write_page(Buf *file, ColOut *co, Buf *levels, int64_t nvals) {
-  Buf hdr = {0};
-  TW w = {&hdr, {0}, 0};
-  size_t body = co->data.n + (levels ? levels->n : 0);
+// Appends the header of a data page with body bytes (levels + values) holding nvals values.
+static void page_hdr(Buf *file, size_t body, int64_t nvals) {
+  TW w = {file, {0}, 0};
   tw_i32(&w, 1, 0);
   tw_i32(&w, 2, (int32_t)body);
   tw_i32(&w, 3, (int32_t)body);
@@ -1229,14 +1228,14 @@ static void write_page(Buf *file, ColOut *co, Buf *levels, int64_t nvals) {
   tw_i32(&w, 3, 3);
   tw_i32(&w, 4, 3);
   tw_send(&w);
-  bbyte(&hdr, 0);
+  bbyte(file, 0);
+}
+static void write_page(Buf *file, ColOut *co, int64_t nvals) {
   co->off = (int64_t)file->n;
-  bput(file, hdr.b, hdr.n);
-  if (levels) bput(file, levels->b, levels->n);
+  page_hdr(file, co->data.n, nvals);
   bput(file, co->data.b, co->data.n);
   co->size = (int64_t)(file->n) - co->off;
   co->nvals = nvals;
-  free(hdr.b);
 }
 
 static void write_footer(Buf *file, const ColDef *cols, int nc, ColOut *co, int64_t nrows) {
@@ -1313,40 +1312,71 @@ static const ColDef CCOLS[7] = {
 
 static char *OUTDIR;
 
+// Lays the file out in the thread's scratch arena: sizes first, then page headers at their final offsets, then one
+// pass over the rows fills every column in place, and the file goes out in one write.
 static void write_user_task(int tid, long t, void *ctx) {
-  (void)tid; (void)ctx;
+  (void)ctx;
   UVec *v = &urows[t];
   if (!v->n && t != 0) return;
   size_t n = v->n;
-  ColOut co[6]; memset(co, 0, sizeof co);
-  size_t sbytes = 0;
-  for (size_t i = 0; i < n; i++) sbytes += refn(v->a[i].name) + 4;
-  bres(&co[0].data, sbytes); bres(&co[1].data, n * 4); bres(&co[2].data, n * 4); bres(&co[3].data, n * 4);
-  bres(&co[4].data, n * 8); bres(&co[5].data, n * 16 + 16);
+  size_t body[6] = {0, n * 4, n * 4, n * 4, n * 8, 0};
   for (size_t i = 0; i < n; i++) {
-    URow *r = &v->a[i];
-    uint32_t nn = refn(r->name);
-    memcpy(co[0].data.b + co[0].data.n, &nn, 4); memcpy(co[0].data.b + co[0].data.n + 4, refp(r->name), nn); co[0].data.n += 4 + nn;
-    int32_t d = r->day; memcpy(co[1].data.b + co[1].data.n, &d, 4); co[1].data.n += 4;
-    memcpy(co[2].data.b + co[2].data.n, &r->sessions, 4); co[2].data.n += 4;
-    memcpy(co[3].data.b + co[3].data.n, &r->events, 4); co[3].data.n += 4;
-    memcpy(co[4].data.b + co[4].data.n, &r->revenue, 8); co[4].data.n += 8;
-    if (r->top >= 0) { bu32(&co[5].data, catn[r->top]); bput(&co[5].data, catp[r->top], catn[r->top]); }
+    body[0] += refn(v->a[i].name) + 4;
+    if (v->a[i].top >= 0) body[5] += catn[v->a[i].top] + 4;
   }
-  Buf lev = {0};
+  // top_category definition levels: RLE/bit-packed hybrid, one bit-packed run of (n + 7) / 8 groups
   size_t groups = (n + 7) / 8;
-  Buf enc = {0};
-  bvar(&enc, (groups << 1) | 1);
-  bres(&enc, groups);
-  memset(enc.b + enc.n, 0, groups);
-  for (size_t i = 0; i < n; i++) if (v->a[i].top >= 0) enc.b[enc.n + i / 8] |= (uint8_t)(1u << (i % 8));
-  enc.n += groups;
-  bu32(&lev, (uint32_t)enc.n); bput(&lev, enc.b, enc.n);
-  Buf file = {0};
-  size_t tot = 64 + lev.n; for (int c = 0; c < 6; c++) tot += co[c].data.n + 64;
-  bres(&file, tot + 4096);
+  Buf lv = {0};
+  bvar(&lv, (groups << 1) | 1);
+  size_t lhead = lv.n;
+  free(lv.b);
+  size_t levn = 4 + lhead + groups;
+  body[5] += levn;
+  size_t cap = 4096; // the footer; bres must never grow this buffer, it is not malloc'd
+  for (int c = 0; c < 6; c++) cap += body[c] + 64;
+  Arena *S = &scratch[tid]; S->cur = S->base;
+  Buf file = {aalloc(S, cap), 0, cap};
   bput(&file, "PAR1", 4);
-  if (n) for (int c = 0; c < 6; c++) write_page(&file, &co[c], c == 5 ? &lev : NULL, (int64_t)n);
+  ColOut co[6]; memset(co, 0, sizeof co);
+  uint8_t *col[6];
+  for (int c = 0; n && c < 6; c++) {
+    co[c].off = (int64_t)file.n;
+    page_hdr(&file, body[c], (int64_t)n);
+    col[c] = file.b + file.n;
+    file.n += body[c];
+    co[c].size = (int64_t)file.n - co[c].off;
+    co[c].nvals = (int64_t)n;
+  }
+  if (n) {
+    uint8_t *lev = col[5];
+    uint32_t enc = (uint32_t)(lhead + groups);
+    memcpy(lev, &enc, 4);
+    uint8_t *p = lev + 4;
+    uint64_t g = (groups << 1) | 1;
+    while (g >= 0x80) { *p++ = (uint8_t)(g | 0x80); g >>= 7; }
+    *p++ = (uint8_t)g;
+    uint8_t *bits = p;
+    memset(bits, 0, groups);
+    col[5] += levn;
+    for (size_t i = 0; i < n; i++) {
+      URow *r = &v->a[i];
+      uint32_t nn = refn(r->name);
+      memcpy(col[0], &nn, 4);
+      memcpy(col[0] + 4, refp(r->name), nn);
+      col[0] += 4 + nn;
+      memcpy(col[1] + 4 * i, &r->day, 4);
+      memcpy(col[2] + 4 * i, &r->sessions, 4);
+      memcpy(col[3] + 4 * i, &r->events, 4);
+      memcpy(col[4] + 8 * i, &r->revenue, 8);
+      if (r->top >= 0) {
+        uint32_t cn = catn[r->top];
+        memcpy(col[5], &cn, 4);
+        memcpy(col[5] + 4, catp[r->top], cn);
+        col[5] += 4 + cn;
+        bits[i / 8] |= (uint8_t)(1u << (i % 8));
+      }
+    }
+  }
   write_footer(&file, UCOLS, 6, co, (int64_t)n);
   char path[4096];
   snprintf(path, sizeof path, "%s/user_daily/part-%03ld.parquet", OUTDIR, t);
@@ -1381,7 +1411,7 @@ static void write_campaign(void) {
   }
   Buf file = {0};
   bput(&file, "PAR1", 4);
-  if (n) for (int c = 0; c < 7; c++) write_page(&file, &co[c], NULL, n);
+  if (n) for (int c = 0; c < 7; c++) write_page(&file, &co[c], n);
   write_footer(&file, CCOLS, 7, co, n);
   char path[4096];
   snprintf(path, sizeof path, "%s/campaign_daily/part-000.parquet", OUTDIR);
