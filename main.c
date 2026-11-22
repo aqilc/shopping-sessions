@@ -694,7 +694,7 @@ typedef struct Blk { struct Blk *next; uint32_t n, cap; } Blk; // records follow
 // SALIGN 1 puts the header in the last 16 B of a cache line, so the records (and every stage run that is a
 // multiple of 64 B) start on a line and a streamed run fills whole write-combining lines.
 #ifndef SALIGN
-#define SALIGN 0
+#define SALIGN 1
 #endif
 #define BLK_PAD (SALIGN ? 48 : 0)
 typedef struct { char *cur, *end; Blk *head, *tail; } Bkt;
@@ -723,7 +723,7 @@ static int ncamp; static const char **camp_id; static uint32_t *camp_idn; static
 #define EVQ 64000 // estimated events per person partition (PRec and CRec streams)
 #endif
 #ifndef BHUGE
-#define BHUGE 0 // 1: the bucket heads (32 B per stream) sit on 2 MB pages like the stage runs
+#define BHUGE 1 // 1: the bucket heads (32 B per stream) sit on 2 MB pages like the stage runs
 #endif
 static uint32_t PB, QB; static uint32_t NPART, NQART; // eid partitions 2^PB, person partitions 2^QB
 
