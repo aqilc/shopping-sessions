@@ -1774,20 +1774,16 @@ static void sess_task(int tid, long q, long nq) {
     int64_t rrev = 0;
     for (uint32_t z = 0; z < ns; z++) {
       uint32_t s0 = sst[z], di = sdi[z];
-      if (z && di != sdi[z - 1]) {
-        uint32_t pd = sdi[z - 1];
-        orow[nr] = row_word(pd, rses, catd + (size_t)pd * 32, dmask[pd]);
-        oev[nr] = revs;
-        orev[nr] = rrev;
-        nr++;
-        dmask[pd] = 0;
-        rses = 0;
-        revs = 0;
-        rrev = 0;
-      }
-      rses++;
-      revs += scnt[so + z];
-      rrev += srev[so + z];
+      // A day change is a coin flip per session: the row's sums are carried in selects and stored for every
+      // session; the top category is filled in per row below.
+      int chg = (z != 0) & (di != sdi[z - (z != 0)]);
+      nr += (size_t)chg;
+      rses = (chg ? 0 : rses) + 1;
+      revs = (chg ? 0 : revs) + scnt[so + z];
+      rrev = (chg ? 0 : rrev) + srev[so + z];
+      orow[nr] = di | rses << 16;
+      oev[nr] = revs;
+      orev[nr] = rrev;
       while (hi < m && (uint32_t)(c[hi] >> 32) <= s0) hi++;
       // latest ts wins; among equal ts the smallest click_id. Branch-free but for ties: whether a session has a
       // qualifying click is a coin flip. c[0] is readable even for m == 0 (the click run is allocated one longer).
@@ -1806,12 +1802,12 @@ static void sess_task(int tid, long q, long nq) {
       hot[ci].sessions++;
       if (srev[so + z]) { cy[ci].purch++; cy[ci].revenue += srev[so + z]; }
     }
-    uint32_t ld = sdi[ns - 1];
-    orow[nr] = row_word(ld, rses, catd + (size_t)ld * 32, dmask[ld]);
-    oev[nr] = revs;
-    orev[nr] = rrev;
     nr++;
-    dmask[ld] = 0;
+    for (size_t r = rows0; r < nr; r++) {
+      uint32_t d = orow[r] & 0xFFFF;
+      orow[r] = row_word(d, orow[r] >> 16, catd + (size_t)d * 32, dmask[d]);
+      dmask[d] = 0;
+    }
     bvar(&U->uidx, (uint64_t)(nr - rows0) << 1);
     bu32(&U->uidx, U->np++);
     so += ns;
