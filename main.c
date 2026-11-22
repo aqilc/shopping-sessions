@@ -336,11 +336,12 @@ static uint32_t PB, QB; static uint32_t NPART, NQART; // eid partitions 2^PB, pe
 
 // ---------- linked IDs ----------
 // build table: key hash, string ref, union-find parent, best (name) slot
-static _Atomic uint64_t *lkey; static uint64_t *lref; static _Atomic uint32_t *lpar; static _Atomic uint32_t *lbest;
+static _Atomic uint32_t *lpar; static _Atomic uint32_t *lbest;
 static uint64_t lcap, lmask_b;
 // lookup table: id hash -> person key
-typedef struct { uint64_t key, pkey; } LEnt;
-static LEnt *ltab; static uint64_t ltmask; static uint64_t *lname; // lname[root slot] = name ref
+// Link ID table, open addressing on the ID hash: val is the ID's string ref while links load, its person key after.
+typedef struct { _Atomic uint64_t key; uint64_t val; } LEnt;
+static LEnt *ltab; static uint64_t *lname; // lname[root slot] = name ref
 static int have_links;
 
 #define LINKED (1ull << 63)
@@ -348,12 +349,13 @@ INL uint32_t qpart(uint64_t pkey) { return (uint32_t)((pkey >> 40) & (NQART - 1)
 
 INL uint64_t person_of(uint64_t uh) {
   if (have_links) {
-    uint64_t i = uh & ltmask;
+    uint64_t i = uh & lmask_b;
     for (;;) {
       const LEnt *e = &ltab[i];
-      if (e->key == uh) return e->pkey;
-      if (!e->key) break;
-      i = (i + 1) & ltmask;
+      uint64_t k = atomic_load_explicit(&e->key, memory_order_relaxed);
+      if (k == uh) return e->val;
+      if (!k) break;
+      i = (i + 1) & lmask_b;
     }
   }
   return uh & ~LINKED;
@@ -488,7 +490,7 @@ static inline void ev_line(int tid, const char *ls, const char *const *sep, int 
   uint64_t uh = 0;
   if (fl[1]) {
     uh = hstr(f[1], fl[1]);
-    if (have_links) __builtin_prefetch(&ltab[uh & ltmask]);
+    if (have_links) __builtin_prefetch(&ltab[uh & lmask_b]);
   }
   int64_t ing = parse_ts(f[3], fl[3]);
   int64_t ts = parse_ts(f[2], fl[2]);
@@ -530,7 +532,7 @@ static inline void cl_line(int tid, const char *ls, const char *const *sep, int 
   if (nqf != nq) return;
   if (fl[0] == 0 || fl[1] == 0) return;
   uint64_t uh = hstr(f[1], fl[1]);
-  if (have_links) __builtin_prefetch(&ltab[uh & ltmask]);
+  if (have_links) __builtin_prefetch(&ltab[uh & lmask_b]);
   int64_t ts = parse_ts(f[3], fl[3]);
   if (ts == BADTS || ts < CWS || ts >= WE) return;
   int32_t c = smap_get(&campmap, f[2], fl[2]);
@@ -561,11 +563,11 @@ static Chunk *lchunks; static long nlchunks;
 INL uint32_t lt_insert(uint64_t h, const char *p, uint32_t n) {
   uint64_t i = h & lmask_b;
   for (;;) {
-    uint64_t k = atomic_load_explicit(&lkey[i], memory_order_acquire);
+    uint64_t k = atomic_load_explicit(&ltab[i].key, memory_order_acquire);
     if (k == h) return (uint32_t)i;
     if (k == 0) {
       uint64_t z = 0;
-      if (atomic_compare_exchange_strong(&lkey[i], &z, h)) { lref[i] = mkref(p, n); return (uint32_t)i; }
+      if (atomic_compare_exchange_strong(&ltab[i].key, &z, h)) { ltab[i].val = mkref(p, n); return (uint32_t)i; }
       if (z == h) return (uint32_t)i;
     }
     i = (i + 1) & lmask_b;
@@ -620,13 +622,13 @@ static void best_task(int tid, long t, void *ctx) {
   (void)tid; (void)ctx;
   uint64_t lo = (uint64_t)t * LSPAN, hi = lo + LSPAN; if (hi > lcap) hi = lcap;
   for (uint64_t i = lo; i < hi; i++) {
-    if (!atomic_load_explicit(&lkey[i], memory_order_relaxed)) continue;
+    if (!atomic_load_explicit(&ltab[i].key, memory_order_relaxed)) continue;
     uint32_t r = uf_find((uint32_t)i);
-    uint64_t me = lref[i];
+    uint64_t me = ltab[i].val;
     uint32_t cur = atomic_load(&lbest[r]);
     for (;;) {
       if (cur != UINT32_MAX) {
-        uint64_t o = lref[cur];
+        uint64_t o = ltab[cur].val;
         if (str_cmp(refp(me), refn(me), refp(o), refn(o)) >= 0) break;
       }
       if (atomic_compare_exchange_weak(&lbest[r], &cur, (uint32_t)i)) break;
@@ -634,28 +636,28 @@ static void best_task(int tid, long t, void *ctx) {
   }
 }
 INL uint64_t mix64(uint64_t x) { x ^= x >> 33; x *= 0xff51afd7ed558ccdull; x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ull; x ^= x >> 33; return x; }
-static _Atomic uint64_t lt_count;
-static void fill_task(int tid, long t, void *ctx) {
+static void name_task(int tid, long t, void *ctx) { // lname[root] = smallest ID's ref
   (void)tid; (void)ctx;
   uint64_t lo = (uint64_t)t * LSPAN, hi = lo + LSPAN; if (hi > lcap) hi = lcap;
-  uint64_t cnt = 0;
+  for (uint64_t i = lo; i < hi; i++)
+    if (atomic_load_explicit(&ltab[i].key, memory_order_relaxed) && atomic_load_explicit(&lpar[i], memory_order_relaxed) == (uint32_t)i)
+      lname[i] = ltab[atomic_load(&lbest[i])].val;
+}
+static void pkey_task(int tid, long t, void *ctx) { // val: string ref -> person key
+  (void)tid; (void)ctx;
+  uint64_t lo = (uint64_t)t * LSPAN, hi = lo + LSPAN; if (hi > lcap) hi = lcap;
   for (uint64_t i = lo; i < hi; i++) {
-    uint64_t k = atomic_load_explicit(&lkey[i], memory_order_relaxed);
-    if (!k) continue;
+    if (!atomic_load_explicit(&ltab[i].key, memory_order_relaxed)) continue;
     uint32_t r = uf_find((uint32_t)i);
-    uint64_t pk = LINKED | (mix64(r) & 0x7FFFFFFF00000000ull) | r;
-    if ((uint32_t)i == r) lname[r] = lref[atomic_load(&lbest[r])];
-    // insert into lookup table (unique keys; CAS on key)
-    uint64_t j = k & ltmask;
-    for (;;) {
-      _Atomic uint64_t *kp = (_Atomic uint64_t *)&ltab[j].key;
-      uint64_t z = 0;
-      if (atomic_compare_exchange_strong(kp, &z, k)) { ltab[j].pkey = pk; break; }
-      j = (j + 1) & ltmask;
-    }
-    cnt++;
+    ltab[i].val = LINKED | (mix64(r) & 0x7FFFFFFF00000000ull) | r;
   }
-  atomic_fetch_add(&lt_count, cnt);
+}
+static _Atomic uint64_t nl_count;
+static void nl_task(int tid, long t, void *ctx) {
+  (void)tid; (void)ctx;
+  const Chunk *c = &lchunks[t]; const char *p = c->base + c->start, *e = c->base + c->end; uint64_t n = 0;
+  while ((p = memchr(p, '\n', (size_t)(e - p)))) { n++; p++; }
+  atomic_fetch_add(&nl_count, n);
 }
 
 static void load_links(const char *dd) {
@@ -665,33 +667,29 @@ static void load_links(const char *dd) {
   MFile *fs = xmalloc(sizeof(MFile) * (nf ? nf : 1));
   for (int i = 0; i < nf; i++) { fs[i] = map_file(paths[i]); bytes += fs[i].n; }
   if (bytes == 0) return;
-  uint64_t lines = nf;
-  for (int i = 0; i < nf; i++) { const char *p = fs[i].p, *e = p + fs[i].n; while ((p = memchr(p, '\n', (size_t)(e - p)))) { lines++; p++; } }
-  uint64_t est = 2 * lines + lines / 2 + 1024; // distinct IDs <= 2 * lines
-  lcap = 1024; while (lcap < est) lcap <<= 1;
-  lmask_b = lcap - 1;
-  lkey = hcalloc(lcap * 8); lref = hcalloc(lcap * 8);
-  lpar = hcalloc(lcap * 4); lbest = hcalloc(lcap * 4);
-  ledges = xcalloc(NT, sizeof(EVec));
   // chunks
   Chunk *save = chunks; long sn = nchunks, sc = chcap;
   chunks = NULL; nchunks = 0; chcap = 0;
   for (int i = 0; i < nf; i++) add_chunks(fs[i], 2, 1 << 20);
   lchunks = chunks; nlchunks = nchunks;
   chunks = save; nchunks = sn; chcap = sc;
+  run_par(nlchunks, nl_task, NULL);
+  uint64_t lines = nf + nl_count;
+  uint64_t est = 2 * lines + lines / 2 + 1024; // distinct IDs <= 2 * lines
+  lcap = 1024; while (lcap < est) lcap <<= 1;
+  lmask_b = lcap - 1;
+  ltab = hcalloc(lcap * sizeof(LEnt));
+  lpar = hcalloc(lcap * 4); lbest = hcalloc(lcap * 4);
+  ledges = xcalloc(NT, sizeof(EVec));
   long nspan = (long)((lcap + LSPAN - 1) / LSPAN);
   run_par(nspan, init_task, NULL);
   run_par(nlchunks, link_parse_task, NULL);
   run_par(NT, uf_task, NULL);
   run_par(nspan, best_task, NULL);
-  // count ids
-  uint64_t nid = 0;
-  for (uint64_t i = 0; i < lcap; i++) nid += lkey[i] != 0;
-  uint64_t tc = 1024; while (tc < 4 * nid) tc <<= 1; // low load: a miss (unlinked ID) usually ends at the first slot
-  ltab = hcalloc(tc * sizeof(LEnt)); ltmask = tc - 1;
   lname = hcalloc(lcap * 8);
-  run_par(nspan, fill_task, NULL);
-  have_links = nid > 0;
+  run_par(nspan, name_task, NULL);
+  run_par(nspan, pkey_task, NULL);
+  have_links = 1;
 }
 
 // ---------- dedup ----------
