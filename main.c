@@ -599,10 +599,10 @@ INL uint64_t person_of(uint64_t key) {
 
 // ---------- records ----------
 typedef struct { uint64_t h; uint32_t ingest; uint32_t loc; } KRec;     // dedup key, per eid partition
-// PRec and CRec: parse buckets them by user-id partition with pkey = the ID's key; the person pass rewrites pkey to
-// the person key, and moves the record to [NT + thread] buckets when the person's partition differs.
+// PRec and CRec: parse buckets them by user-id partition with pkey = the ID's key; the person pass copies the record
+// with pkey = the person key to [NT + thread] buckets when the person's partition differs.
 typedef struct { uint64_t pkey; uint64_t uref; uint32_t ts; uint32_t x; } PRec; // event payload
-typedef struct { uint64_t pkey; uint64_t cref; uint32_t ts; uint32_t camp; } CRec; // click, pkey 0 once moved
+typedef struct { uint64_t pkey; uint64_t cref; uint32_t ts; uint32_t camp; } CRec; // click
 // PRec.x: price (24 bits) | cat (5 bits) << 24 | purchase << 29 | dead << 31
 #define X_PURCH (1u << 29)
 #define X_DEAD (1u << 31)
@@ -1203,37 +1203,35 @@ static void pkey_task(int tid, long q, void *ctx) {
 }
 
 // ---------- person pass ----------
-// Per user-id partition, after dedup: each live record's ID key becomes its person key, read from the partition's
-// slice of the link table. A record whose person lives in another partition is copied to this thread's mover bucket
-// there, and its original is marked dead (events) or keyed 0 (clicks, which match no person then).
+// Per user-id partition, after dedup: each live record whose person (read from the partition's slice of the link
+// table) lives in another partition is copied, with its person key, to this thread's mover bucket there. The pass
+// only reads the originals: sess resolves them again and skips the moved ones, so they are not written back.
 static void person_task(int tid, long q, void *ctx) {
   (void)ctx;
   for (int t = 0; t < NT; t++) {
     for (Blk *k = pb[(size_t)t * NQART + q].head; k; k = k->next) {
-      PRec *r = (PRec *)(k + 1);
+      const PRec *r = (const PRec *)(k + 1);
       for (uint32_t j = 0; j < k->n; j++) {
         if (r[j].x & X_DEAD) continue;
         uint64_t pk = person_of(r[j].pkey);
         uint32_t d = qpart(pk);
-        if (d == q) { r[j].pkey = pk; continue; }
+        if (d == q) continue;
         PRec m = r[j];
         m.pkey = pk;
         size_t si = (size_t)tid * NQART + d;
         rec_put(&arenas[tid], &pb[(size_t)NT * NQART + si], pst + si * (ST * sizeof(PRec)), &m, sizeof(PRec), pcap0);
-        r[j].x |= X_DEAD;
       }
     }
     for (Blk *k = cb[(size_t)t * NQART + q].head; k; k = k->next) {
-      CRec *r = (CRec *)(k + 1);
+      const CRec *r = (const CRec *)(k + 1);
       for (uint32_t j = 0; j < k->n; j++) {
         uint64_t pk = person_of(r[j].pkey);
         uint32_t d = qpart(pk);
-        if (d == q) { r[j].pkey = pk; continue; }
+        if (d == q) continue;
         CRec m = r[j];
         m.pkey = pk;
         size_t si = (size_t)tid * NQART + d;
         rec_put(&arenas[tid], &cb[(size_t)NT * NQART + si], cst + si * (ST * sizeof(CRec)), &m, sizeof(CRec), ccap0);
-        r[j].pkey = 0;
       }
     }
   }
@@ -1402,12 +1400,17 @@ static void sess_task(int tid, long q, void *ctx) {
   uint32_t *pid = aalloc(S, ne * 4);
   size_t k = 0;
   for (int t = 0; t < 2 * NT; t++) {
+    int own = t < NT && have_links; // parse's buckets still hold ID keys, the person pass's hold person keys
     for (Blk *bk = pb[(size_t)t * NQART + q].head; bk; bk = bk->next) {
       PRec *r = (PRec *)(bk + 1);
       for (uint32_t j = 0; j < bk->n; j++) {
         uint32_t x = r[j].x;
         if (x & X_DEAD) continue;
         uint64_t pk = r[j].pkey;
+        if (own) {
+          pk = person_of(pk);
+          if (qpart(pk) != (uint32_t)q) continue; // a copy lives in its person's partition
+        }
         uint32_t i = pt_find(&pt, pk);
         if (!pt.key[i]) {
           if (UNLIKELY((np + 1) * 2 > pcap)) { // grow
@@ -1457,10 +1460,16 @@ static void sess_task(int tid, long q, void *ctx) {
   if (cmid) memset(ch4, 0, sizeof(Hist4));
   k = 0;
   for (int t = 0; t < 2 * NT; t++) {
+    int own = t < NT && have_links;
     for (Blk *bk = cb[(size_t)t * NQART + q].head; bk; bk = bk->next) {
       CRec *r = (CRec *)(bk + 1);
       for (uint32_t j = 0; j < bk->n; j++) {
-        uint32_t i = pt_find(&pt, r[j].pkey);
+        uint64_t pk = r[j].pkey;
+        if (own) {
+          pk = person_of(pk);
+          if (qpart(pk) != (uint32_t)q) continue;
+        }
+        uint32_t i = pt_find(&pt, pk);
         if (!pt.key[i]) continue;
         uint32_t id = pt.id[i];
         cpid[k] = id;
