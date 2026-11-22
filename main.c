@@ -1353,6 +1353,15 @@ static void close_task(int tid, long t, void *ctx) {
   for (uint32_t i = 0; i < NQART; i++) { bkt_close(&pb[(size_t)t * NQART + i], sizeof(PRec)); bkt_close(&cb[(size_t)t * NQART + i], sizeof(CRec)); }
 }
 
+// Drop pages in parallel (madvise takes the mmap lock shared) so exit has little left to tear down serially.
+static void release_task(int tid, long t, void *ctx) {
+  (void)tid; (void)ctx;
+  if (t < nchunks) { const Chunk *c = &chunks[t]; madvise((void *)(c->base + c->start), c->end - c->start, MADV_DONTNEED); return; }
+  t -= nchunks;
+  madvise(arenas[t].base, (size_t)(arenas[t].cur - arenas[t].base), MADV_DONTNEED);
+  madvise(scratch[t].base, 1ull << 30, MADV_DONTNEED);
+}
+
 int main(void) {
   PROF = getenv("SESS_PROF") != NULL; T0 = now_s();
   const char *dd = getenv("DATA_DIR"); if (!dd) dd = "/data";
@@ -1426,5 +1435,7 @@ int main(void) {
   run_par(NT, write_user_task, NULL);
   write_campaign();
   PH("write");
+  run_par(nchunks + NT, release_task, NULL);
+  PH("release");
   _exit(0);
 }
