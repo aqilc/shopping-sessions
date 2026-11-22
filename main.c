@@ -691,10 +691,16 @@ INL void *aalloc(Arena *a, size_t n) {
 
 // Bucket: chain of blocks of fixed-size records.
 typedef struct Blk { struct Blk *next; uint32_t n, cap; } Blk; // records follow (16-byte header)
+// SALIGN 1 puts the header in the last 16 B of a cache line, so the records (and every stage run that is a
+// multiple of 64 B) start on a line and a streamed run fills whole write-combining lines.
+#ifndef SALIGN
+#define SALIGN 0
+#endif
+#define BLK_PAD (SALIGN ? 48 : 0)
 typedef struct { char *cur, *end; Blk *head, *tail; } Bkt;
 static __attribute__((noinline)) void bkt_grow(Arena *a, Bkt *b, uint32_t rs, uint32_t cap) {
   if (b->tail) b->tail->n = (uint32_t)((b->cur - (char *)(b->tail + 1)) / rs);
-  Blk *k = aalloc(a, sizeof(Blk) + (size_t)rs * cap);
+  Blk *k = (Blk *)((char *)aalloc(a, BLK_PAD + sizeof(Blk) + (size_t)rs * cap) + BLK_PAD);
   k->next = NULL; k->n = 0; k->cap = cap;
   if (b->tail) b->tail->next = k; else b->head = k;
   b->tail = k;
@@ -710,6 +716,15 @@ static int64_t DAY0; static int32_t NDAYS;
 static int unknown_cat;
 static int ncat; static const char **catp; static uint32_t *catn;
 static int ncamp; static const char **camp_id; static uint32_t *camp_idn; static const char **chan; static uint32_t *chann;
+#ifndef EVP
+#define EVP 48000 // estimated events per eid partition (KRec streams, dedup table size)
+#endif
+#ifndef EVQ
+#define EVQ 64000 // estimated events per person partition (PRec and CRec streams)
+#endif
+#ifndef BHUGE
+#define BHUGE 0 // 1: the bucket heads (32 B per stream) sit on 2 MB pages like the stage runs
+#endif
 static uint32_t PB, QB; static uint32_t NPART, NQART; // eid partitions 2^PB, person partitions 2^QB
 
 // ---------- linked IDs ----------
@@ -759,33 +774,58 @@ static uint32_t kcap0, pcap0, ccap0;
 // A run starts at a block start or right after a full run, so it never spans blocks, and a record's stage slot is
 // its offset in the block mod the run size. Blocks start at a 64 B-aligned aalloc plus the 16 B Blk header, and a
 // run is a multiple of 16 B, so every run is 16 B-aligned for _mm_stream_si128.
+// Sweep knobs (-DNAME=value): STAGE 0/1, records per run STP/STK/STC (stage bytes per thread = NQART * STP * 24
+// + NPART * STK * 16 + NQART * STC * 24), STREAM 0 flushes a run with plain stores instead of streaming ones,
+// STW the streaming store width.
+#ifndef STAGE
 #if defined(__AVX2__)
 #define STAGE 1
 #else
 #define STAGE 0
 #endif
-#define ST 8 // records per run
-_Static_assert(sizeof(Blk) == 16 && ST * sizeof(PRec) % 16 == 0 && ST * sizeof(KRec) % 16 == 0 && ST * sizeof(CRec) % 16 == 0, "stage runs must stay 16 B-aligned");
+#endif
+#ifndef STP
+#define STP 8
+#endif
+#ifndef STK
+#define STK 8
+#endif
+#ifndef STC
+#define STC 8
+#endif
+#ifndef STREAM
+#define STREAM 1
+#endif
+#ifndef STW
+#define STW 16 // bytes per streaming store; 32 needs SALIGN 1 and runs that are multiples of 32 B
+#endif
+#define PRUN (STP * sizeof(PRec))
+#define KRUN (STK * sizeof(KRec))
+#define CRUN (STC * sizeof(CRec))
+_Static_assert(sizeof(Blk) == 16 && PRUN % 16 == 0 && KRUN % 16 == 0 && CRUN % 16 == 0, "stage runs must stay 16 B-aligned");
+_Static_assert(STW == 16 || (STW == 32 && SALIGN && PRUN % 32 == 0 && KRUN % 32 == 0 && CRUN % 32 == 0), "32 B stores need 32 B-aligned runs");
 static char *pst; // [NT][NQART] PRec runs
 static char *kst; // [NT][NPART] KRec runs
 static char *cst; // [NT][NQART] CRec runs
 INL void run_stream(char *d, const char *s, size_t n) {
-#if defined(__AVX2__)
+#if defined(__AVX2__) && STREAM && STW == 32
+  for (size_t i = 0; i < n; i += 32) _mm256_stream_si256((__m256i *)(d + i), _mm256_loadu_si256((const __m256i *)(s + i)));
+#elif defined(__AVX2__) && STREAM
   for (size_t i = 0; i < n; i += 16) _mm_stream_si128((__m128i *)(d + i), _mm_loadu_si128((const __m128i *)(s + i)));
 #else
   memcpy(d, s, n);
 #endif
 }
 // Copies the partial run staged at st to the slots it was assigned: the records since the last run boundary.
-static void stage_flush(Bkt *b, const char *st, uint32_t rs) {
+static void stage_flush(Bkt *b, const char *st, size_t run) {
   if (!b->tail) return;
-  size_t k = (size_t)(b->cur - (char *)(b->tail + 1)) % (ST * rs);
+  size_t k = (size_t)(b->cur - (char *)(b->tail + 1)) % run;
   memcpy(b->cur - k, st, k);
 }
-// Appends the rs-byte record at src to bucket b (stage run st) and returns its final address.
-INL char *rec_put(Arena *a, Bkt *b, char *st, const void *src, uint32_t rs, uint32_t cap0) {
+// Appends the rs-byte record at src to bucket b (stage run st of run bytes) and returns its final address.
+INL char *rec_put(Arena *a, Bkt *b, char *st, const void *src, uint32_t rs, size_t run, uint32_t cap0) {
   if (UNLIKELY(b->cur == b->end)) {
-    if (STAGE) stage_flush(b, st, rs);
+    if (STAGE) stage_flush(b, st, run);
     bkt_grow(a, b, rs, b->tail ? b->tail->cap : cap0);
   }
   char *d = b->cur;
@@ -794,9 +834,9 @@ INL char *rec_put(Arena *a, Bkt *b, char *st, const void *src, uint32_t rs, uint
     memcpy(d, src, rs);
     return d;
   }
-  size_t off = (size_t)(d - (char *)(b->tail + 1)) % (ST * rs);
+  size_t off = (size_t)(d - (char *)(b->tail + 1)) % run;
   memcpy(st + off, src, rs);
-  if (off + rs == ST * rs) run_stream(b->cur - ST * rs, st, ST * rs);
+  if (off + rs == run) run_stream(b->cur - run, st, run);
   return d;
 }
 
@@ -975,16 +1015,16 @@ INL void ev_emit(int tid, const EPend *p) {
   uint64_t pk = person_of(p->uh);
   size_t bi = (size_t)tid * NQART + qpart(pk);
   PRec r = {pk, pk & LINKED ? 0 : keep_str(tid, p->uref), p->ts, p->x}; // a linked person's name is its root's lref
-  char *d = rec_put(&arenas[tid], &pb[bi], pst + bi * (ST * sizeof(PRec)), &r, sizeof(PRec), pcap0);
+  char *d = rec_put(&arenas[tid], &pb[bi], pst + bi * PRUN, &r, sizeof(PRec), PRUN, pcap0);
   KRec k = {p->eh, p->ingest, (uint32_t)((d - arenas[tid].base) >> 3)};
   size_t ki = (size_t)tid * NPART + (p->eh >> (64 - PB));
-  rec_put(&arenas[tid], &kb[ki], kst + ki * (ST * sizeof(KRec)), &k, sizeof(KRec), kcap0);
+  rec_put(&arenas[tid], &kb[ki], kst + ki * KRUN, &k, sizeof(KRec), KRUN, kcap0);
 }
 INL void cl_emit(int tid, const CPend *p) {
   uint64_t pk = person_of(p->uh);
   size_t bi = (size_t)tid * NQART + qpart(pk);
   CRec r = {pk, keep_str(tid, p->cref), p->ts, p->camp};
-  rec_put(&arenas[tid], &cb[bi], cst + bi * (ST * sizeof(CRec)), &r, sizeof(CRec), ccap0);
+  rec_put(&arenas[tid], &cb[bi], cst + bi * CRUN, &r, sizeof(CRec), CRUN, ccap0);
 }
 static void pend_flush(int tid) {
   Pend *P = &pend[tid];
@@ -1038,7 +1078,7 @@ static inline void ev_line(int tid, const char *ob, const uint32_t *ix, uint32_t
   if (!ok) {
     size_t ki = (size_t)tid * NPART + (eh >> (64 - PB));
     KRec k = {eh, (uint32_t)is, LOC_NONE};
-    rec_put(&arenas[tid], &kb[ki], kst + ki * (ST * sizeof(KRec)), &k, sizeof(KRec), kcap0);
+    rec_put(&arenas[tid], &kb[ki], kst + ki * KRUN, &k, sizeof(KRec), KRUN, kcap0);
     return;
   }
   Pend *P = &pend[tid];
@@ -2261,13 +2301,13 @@ static void close_task(int tid, long t, void *ctx) {
   (void)tid; (void)ctx;
   for (uint32_t i = 0; i < NPART; i++) {
     size_t bi = (size_t)t * NPART + i;
-    if (STAGE) stage_flush(&kb[bi], kst + bi * (ST * sizeof(KRec)), sizeof(KRec));
+    if (STAGE) stage_flush(&kb[bi], kst + bi * KRUN, KRUN);
     bkt_close(&kb[bi], sizeof(KRec));
   }
   for (uint32_t i = 0; i < NQART; i++) {
     size_t bi = (size_t)t * NQART + i;
-    if (STAGE) stage_flush(&pb[bi], pst + bi * (ST * sizeof(PRec)), sizeof(PRec));
-    if (STAGE) stage_flush(&cb[bi], cst + bi * (ST * sizeof(CRec)), sizeof(CRec));
+    if (STAGE) stage_flush(&pb[bi], pst + bi * PRUN, PRUN);
+    if (STAGE) stage_flush(&cb[bi], cst + bi * CRUN, CRUN);
     bkt_close(&pb[bi], sizeof(PRec));
     bkt_close(&cb[bi], sizeof(CRec));
   }
@@ -2331,8 +2371,8 @@ int main(void) {
   uint64_t eest = ebytes / 60 + 1024, cest = cbytes / 45 + 1024;
   // eest runs ~1.4x the real event count, so 48000 here is ~30-35K events per partition: 2^10 at 20M, 2^11 at
   // 40-64M. Board, 64M-event replica: PB=QB 11 2975 ms, 10 3020, 12 3172, 13 3490 (diag a2e7094).
-  PB = 6; while (PB < 14 && (eest >> PB) > 48000) PB++;
-  QB = 6; while (QB < 13 && (eest >> QB) > 64000) QB++;
+  PB = 6; while (PB < 14 && (eest >> PB) > EVP) PB++;
+  QB = 6; while (QB < 13 && (eest >> QB) > EVQ) QB++;
   NPART = 1u << PB; NQART = 1u << QB;
   uint64_t per_t = eest / NT;
   // Blocks of an eighth of a bucket's expected share: a bucket's last block is the only unused memory (and the
@@ -2351,12 +2391,12 @@ int main(void) {
     if (!rbufs[t].buf) die("oom");
   }
   pend = xcalloc(NT, sizeof(Pend));
-  kb = xcalloc((size_t)NT * NPART, sizeof(Bkt));
-  pb = xcalloc((size_t)NT * NQART, sizeof(Bkt));
-  cb = xcalloc((size_t)NT * NQART, sizeof(Bkt));
-  if (STAGE) pst = hcalloc((size_t)NT * NQART * ST * sizeof(PRec));
-  if (STAGE) kst = hcalloc((size_t)NT * NPART * ST * sizeof(KRec));
-  if (STAGE) cst = hcalloc((size_t)NT * NQART * ST * sizeof(CRec));
+  kb = BHUGE ? hcalloc((size_t)NT * NPART * sizeof(Bkt)) : xcalloc((size_t)NT * NPART, sizeof(Bkt));
+  pb = BHUGE ? hcalloc((size_t)NT * NQART * sizeof(Bkt)) : xcalloc((size_t)NT * NQART, sizeof(Bkt));
+  cb = BHUGE ? hcalloc((size_t)NT * NQART * sizeof(Bkt)) : xcalloc((size_t)NT * NQART, sizeof(Bkt));
+  if (STAGE) pst = hcalloc((size_t)NT * NQART * PRUN);
+  if (STAGE) kst = hcalloc((size_t)NT * NPART * KRUN);
+  if (STAGE) cst = hcalloc((size_t)NT * NQART * CRUN);
   PH("map");
   run_par(nchunks, parse_task, NULL);
   run_par(NT, close_task, NULL);
