@@ -83,6 +83,13 @@ INL uint64_t hstr(const char *p, uint32_t n) {
     else { a = n ? ld8(p) & (~0ull >> (64 - 8 * n)) : 0; b = 0; }
     return mum(a ^ HS1, b ^ HSN[n]) | 1; // one round: the product's two halves folded together mix every output bit
   }
+  if (LIKELY(n <= 48)) {
+    // two lanes over the first 32 bytes (the second slides back when the string is shorter), then the last 16
+    uint32_t o = n < 32 ? n - 16 : 16;
+    uint64_t h = mum(ld8(p) ^ HS1, ld8(p + 8) ^ HS0 ^ n);
+    uint64_t g = mum(ld8(p + o) ^ HS2, ld8(p + o + 8) ^ HS3);
+    return mum(ld8(p + n - 16) ^ h, ld8(p + n - 8) ^ g) | 1;
+  }
   uint64_t h = HS0 ^ n;
   while (n > 16) { h = mum(ld8(p) ^ HS1, ld8(p + 8) ^ h); p += 16; n -= 16; }
   a = ld8(p + n - 16 + 0); b = ld8(p + n - 8);
