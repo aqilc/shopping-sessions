@@ -720,7 +720,7 @@ static int ncamp; static const char **camp_id; static uint32_t *camp_idn; static
 #define EVP 48000 // estimated events per eid partition (KRec streams, dedup table size)
 #endif
 #ifndef EVQ
-#define EVQ 64000 // estimated events per person partition (PRec and CRec streams)
+#define EVQ 128000 // estimated events per person partition (PRec and CRec streams)
 #endif
 #ifndef BHUGE
 #define BHUGE 1 // 1: the bucket heads (32 B per stream) sit on 2 MB pages like the stage runs
