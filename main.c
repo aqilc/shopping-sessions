@@ -563,10 +563,11 @@ static uint32_t PB, QB; static uint32_t NPART, NQART; // eid partitions 2^PB, pe
 
 // ---------- linked IDs ----------
 // Per slot, 0-based so the zeroed tables need no init pass: lpar = union-find parent + 1 (0 for a root; the root + 1
-// for every non-root once the best pass has run), lbest = the root's best (name) slot + 1 (0 for none yet).
-static _Atomic uint32_t *lpar; static _Atomic uint32_t *lbest;
+// for every non-root once the best pass has run), lbest = the root's best (name) slot + 1 (0 for none yet), and once
+// the names are taken, the root's home slot + 1: its ID with the most counted records (lhit).
+static _Atomic uint32_t *lpar; static _Atomic uint32_t *lbest; static _Atomic uint32_t *lhit;
 static uint64_t lcap, lmask_b; static unsigned LB; // lcap = 2^LB
-// Link ID table, open addressing on the ID key: val is the ID's string ref.
+// Link ID table, open addressing on the ID key: val is the ID's string ref, its person key after the home pass.
 // An ID's key is its hash without bit 63, and its home slot is the key's top LB bits, so the IDs of one user-id
 // partition (the key's top QB bits) live in one slice of lcap / NQART slots: the person pass of a partition only
 // touches its slice, which fits L2.
@@ -574,25 +575,26 @@ typedef struct { _Atomic uint64_t key; uint64_t val; } LEnt;
 static LEnt *ltab; static uint64_t *lname; // lname[root slot] = name ref
 static int have_links;
 
-// A person key is an unlinked ID's key, or LINKED | its root slot's partition << (63 - QB) | root slot. The person
-// lives in its root's user-id partition, so the root's own records stay where parse put them.
+// A person key is an unlinked ID's key, or LINKED | its home partition << (63 - QB) | root slot. The home is the
+// partition of the person's ID with the most counted records, so most of its records stay where parse put them.
 #define LINKED (1ull << 63)
 INL uint32_t qpart(uint64_t pkey) { return (uint32_t)((pkey & ~LINKED) >> (63 - QB)); }
 INL uint64_t lhome(uint64_t key) { return key >> (63 - LB); }
 
-// key -> person key, once the links are loaded; an ID in no link line is its own person.
-INL uint64_t person_of(uint64_t key) {
+// key -> its slot, or lcap for an ID in no link line
+INL uint64_t lfind(uint64_t key) {
   uint64_t i = lhome(key);
   for (;;) {
     uint64_t k = atomic_load_explicit(&ltab[i].key, memory_order_relaxed);
-    if (k == key) {
-      uint32_t p = atomic_load_explicit(&lpar[i], memory_order_relaxed);
-      uint64_t r = p ? p - 1 : i;
-      return LINKED | ((r >> (LB - QB)) << (63 - QB)) | r;
-    }
-    if (!k) return key;
+    if (k == key) return i;
+    if (!k) return lcap;
     i = (i + 1) & lmask_b;
   }
+}
+// key -> person key, once the home pass has run; an ID in no link line is its own person.
+INL uint64_t person_of(uint64_t key) {
+  uint64_t i = lfind(key);
+  return i < lcap ? ltab[i].val : key;
 }
 
 // ---------- records ----------
@@ -964,6 +966,7 @@ static void touch_task(int tid, long t, void *ctx) {
   touch_pages(ltab, lo * sizeof(LEnt), hi * sizeof(LEnt));
   touch_pages((void *)lpar, lo * 4, hi * 4);
   touch_pages((void *)lbest, lo * 4, hi * 4);
+  touch_pages((void *)lhit, lo * 4, hi * 4);
 }
 // Also points every non-root straight at its root: no union runs any more, so no compression can undo it.
 static void best_task(int tid, long t, void *ctx) {
@@ -988,8 +991,10 @@ static void name_task(int tid, long t, void *ctx) { // lname[root] = smallest ID
   (void)tid; (void)ctx;
   uint64_t lo = (uint64_t)t * LSPAN, hi = lo + LSPAN; if (hi > lcap) hi = lcap;
   for (uint64_t i = lo; i < hi; i++)
-    if (atomic_load_explicit(&ltab[i].key, memory_order_relaxed) && !atomic_load_explicit(&lpar[i], memory_order_relaxed))
+    if (atomic_load_explicit(&ltab[i].key, memory_order_relaxed) && !atomic_load_explicit(&lpar[i], memory_order_relaxed)) {
       lname[i] = ltab[atomic_load(&lbest[i]) - 1].val;
+      atomic_store_explicit(&lbest[i], 0, memory_order_relaxed); // free for the home pass
+    }
 }
 static _Atomic uint64_t nl_count;
 static void nl_task(int tid, long t, void *ctx) {
@@ -1039,7 +1044,7 @@ static void step_end(int s) {
   lcap = 1ull << LB;
   lmask_b = lcap - 1;
   ltab = hcalloc(lcap * sizeof(LEnt));
-  lpar = hcalloc(lcap * 4); lbest = hcalloc(lcap * 4);
+  lpar = hcalloc(lcap * 4); lbest = hcalloc(lcap * 4); lhit = hcalloc(lcap * 4);
   lname = hcalloc(lcap * 8);
   long nspan = (long)((lcap + LSPAN - 1) / LSPAN);
   ls_n[LS_TOUCH] = ls_n[LS_BEST] = ls_n[LS_NAME] = nspan;
@@ -1141,6 +1146,60 @@ static void dedup_task(int tid, long q, void *ctx) {
     }
   }
   SP_ADD(tid, SP_DPROBE, t0);
+}
+
+// ---------- home pass ----------
+// A person whose IDs fall in several user-id partitions lives in the one of its ID with the most records, which
+// halves the records the person pass moves against its root's partition (big40: 9.2M vs 19.3M). The counts come from
+// the records of the first HSAMP parse threads' buckets, a random sample since chunks go to threads as they free up.
+#ifndef HSAMP
+#define HSAMP 2
+#endif
+// Per user-id partition: counts the sample's records per slot of the partition's slice (an ID whose slot spilled into
+// the next slice is not counted), then offers each counted ID of the slice as its root's home.
+static void hit_task(int tid, long q, void *ctx) {
+  (void)tid; (void)ctx;
+  uint64_t lo = (uint64_t)q << (LB - QB), hi = lo + (1ull << (LB - QB));
+  int ns = HSAMP < NT ? HSAMP : NT;
+  for (int t = 0; t < ns; t++) {
+    for (Blk *k = pb[(size_t)t * NQART + q].head; k; k = k->next) {
+      const PRec *r = (const PRec *)(k + 1);
+      for (uint32_t j = 0; j < k->n; j++) {
+        uint64_t i = lfind(r[j].pkey);
+        if (i - lo < hi - lo) atomic_store_explicit(&lhit[i], atomic_load_explicit(&lhit[i], memory_order_relaxed) + 1, memory_order_relaxed);
+      }
+    }
+    for (Blk *k = cb[(size_t)t * NQART + q].head; k; k = k->next) {
+      const CRec *r = (const CRec *)(k + 1);
+      for (uint32_t j = 0; j < k->n; j++) {
+        uint64_t i = lfind(r[j].pkey);
+        if (i - lo < hi - lo) atomic_store_explicit(&lhit[i], atomic_load_explicit(&lhit[i], memory_order_relaxed) + 1, memory_order_relaxed);
+      }
+    }
+  }
+  // a home offered against a slice still counting may lose to a later count: a worse home, never a wrong one
+  for (uint64_t i = lo; i < hi; i++) {
+    uint32_t c = atomic_load_explicit(&lhit[i], memory_order_relaxed);
+    if (!c) continue;
+    uint32_t p = atomic_load_explicit(&lpar[i], memory_order_relaxed);
+    uint64_t r = p ? p - 1 : i;
+    uint32_t cur = atomic_load_explicit(&lbest[r], memory_order_relaxed);
+    while (!cur || atomic_load_explicit(&lhit[cur - 1], memory_order_relaxed) < c)
+      if (atomic_compare_exchange_weak(&lbest[r], &cur, (uint32_t)i + 1)) break;
+  }
+}
+// Per slice: val = the ID's person key, homed at its root's best ID, or at the root when no ID of it was counted.
+static void pkey_task(int tid, long q, void *ctx) {
+  (void)tid; (void)ctx;
+  uint64_t lo = (uint64_t)q << (LB - QB), hi = lo + (1ull << (LB - QB));
+  for (uint64_t i = lo; i < hi; i++) {
+    if (!atomic_load_explicit(&ltab[i].key, memory_order_relaxed)) continue;
+    uint32_t p = atomic_load_explicit(&lpar[i], memory_order_relaxed);
+    uint64_t r = p ? p - 1 : i;
+    uint32_t b = atomic_load_explicit(&lbest[r], memory_order_relaxed);
+    uint64_t h = (b ? b - 1 : r) >> (LB - QB);
+    ltab[i].val = LINKED | h << (63 - QB) | r;
+  }
 }
 
 // ---------- person pass ----------
@@ -2066,6 +2125,9 @@ int main(void) {
   run_par(NPART, dedup_task, NULL);
   if (have_links) {
     PH(" d.kill");
+    run_par(NQART, hit_task, NULL);
+    run_par(NQART, pkey_task, NULL);
+    PH(" d.home");
     run_par(NQART, person_task, NULL);
     run_par(NT, close_task, &have_links);
   }
