@@ -1256,6 +1256,7 @@ static void sess_task(int tid, long q, void *ctx) {
   for (uint32_t i = 0; i < np; i++) coff[i + 1] += coff[i];
   memcpy(pos, coff, ((size_t)np + 1) * 4);
   uint64_t *cl = aalloc(S, (nlive + 1) * 8);
+  cl[nlive] = 0;
   const uint64_t *csorted = cbig ? radix3(ctx_, tmp, (uint32_t)nlive, *ch)
                           : cmid ? radix4(ctx_, tmp, (uint32_t)nlive, *ch4) : sort_u64(ctx_, tmp, (uint32_t)nlive);
   for (size_t i = 0; i < nlive; i++) cl[pos[cpid[(uint32_t)csorted[i]]]++] = csorted[i];
@@ -1345,16 +1346,19 @@ static void sess_task(int tid, long q, void *ctx) {
       row.day = (int32_t)(DAY0 + di);
       row.sessions++; row.events += scnt[so + z]; row.revenue += srev[so + z];
       while (hi < m && (uint32_t)(c[hi] >> 32) <= s0) hi++;
-      uint32_t credited = (uint32_t)ncamp;
-      if (hi && (int64_t)(c[hi - 1] >> 32) >= (int64_t)s0 - 604800000LL) {
-        // latest ts wins; among equal ts the smallest click_id
-        uint32_t ct = (uint32_t)(c[hi - 1] >> 32), best = (uint32_t)c[hi - 1];
-        for (uint32_t y = hi - 1; y > 0 && (uint32_t)(c[y - 1] >> 32) == ct; y--) {
+      // latest ts wins; among equal ts the smallest click_id. Branch-free but for ties: whether a session has a
+      // qualifying click is a coin flip. c[0] is readable even for m == 0 (the click run is allocated one longer).
+      uint32_t y = hi - (hi != 0);
+      uint32_t ct = (uint32_t)(c[y] >> 32), best = (uint32_t)c[y];
+      int ok = hi != 0 && (int64_t)ct >= (int64_t)s0 - 604800000LL;
+      if (UNLIKELY(ok && y > 0 && (uint32_t)(c[y - 1] >> 32) == ct)) {
+        for (; y > 0 && (uint32_t)(c[y - 1] >> 32) == ct; y--) {
           uint32_t o = (uint32_t)c[y - 1];
           if (str_cmp(refp(cref[o]), refn(cref[o]), refp(cref[best]), refn(cref[best])) < 0) best = o;
         }
-        credited = ccamp[best];
       }
+      uint32_t cbest = ccamp[best];
+      uint32_t credited = ok ? cbest : (uint32_t)ncamp;
       size_t ci = (size_t)credited * NDAYS + di;
       hot[ci].sessions++;
       if (srev[so + z]) { cy[ci].purch++; cy[ci].revenue += srev[so + z]; }
