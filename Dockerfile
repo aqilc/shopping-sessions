@@ -4,9 +4,9 @@ RUN cd /gen && cargo build --release -q
 
 FROM debian:bookworm-slim AS build
 RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev clang-14 && rm -rf /var/lib/apt/lists/*
-COPY main.c b1.c b4.c bs.c st2.c diag.c /src/
+COPY main.c hk1.c hk2.c hk3.c hk4.c diag.c /src/
 RUN mkdir /v && F="-O3 -static -pthread -march=x86-64-v3" && cd /src && \
-    for v in b1 b4 bs st2; do clang-14 $F -o /v/$v $v.c; done && \
+    for v in hk1 hk2 hk3 hk4; do clang-14 $F -o /v/$v $v.c; done && \
     clang-14 $F -o /v/base main.c && cp /v/base /v/base2 && \
     gcc -O2 -static -DGEN_E=20000000 -DGEN_SEED=777 -o /diag diag.c
 

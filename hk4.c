@@ -72,8 +72,17 @@ INL uint64_t hstr(const char *p, uint32_t n) {
   if (LIKELY(n <= 16)) {
     if (n >= 8) { a = ld8(p); b = ld8(p + n - 8); }
     else { a = n ? ld8(p) & (~0ull >> (64 - 8 * n)) : 0; b = 0; }
-    uint64_t h = mum(a ^ HS1, b ^ HS0 ^ n);
-    return mum(h ^ HS2, (uint64_t)n ^ HS3) | 1;
+    // One round: the product's two halves folded together mix every output bit. The multiplier's key is rotated
+    // by the length, so strings of different lengths meet only if their words differ by that 64-bit pattern.
+    uint64_t k = (HS0 << n) | (HS0 >> (64 - n) % 64);
+    return mum(a ^ HS1, b ^ k) | 1;
+  }
+  if (LIKELY(n <= 48)) {
+    // two lanes over the first 32 bytes (the second slides back when the string is shorter), then the last 16
+    uint32_t o = n < 32 ? n - 16 : 16;
+    uint64_t h = mum(ld8(p) ^ HS1, ld8(p + 8) ^ HS0 ^ n);
+    uint64_t g = mum(ld8(p + o) ^ HS2, ld8(p + o + 8) ^ HS3);
+    return mum(ld8(p + n - 16) ^ h, ld8(p + n - 8) ^ g) | 1;
   }
   uint64_t h = HS0 ^ n;
   while (n > 16) { h = mum(ld8(p) ^ HS1, ld8(p + 8) ^ h); p += 16; n -= 16; }
@@ -721,12 +730,10 @@ INL uint64_t person_of(uint64_t uh) {
 
 // ---------- records ----------
 typedef struct { uint64_t h; uint32_t ingest; uint32_t loc; } KRec;     // dedup key, per eid partition
-typedef struct { uint64_t pkey; uint32_t ts; uint32_t x; } PRec; // event payload, per person partition
+typedef struct { uint64_t pkey; uint64_t uref; uint32_t ts; uint32_t x; } PRec; // event payload, per person partition
 typedef struct { uint64_t pkey; uint64_t cref; uint32_t ts; uint32_t camp; } CRec; // click, per person partition
-// PRec.x: price (24 bits) | cat (5 bits) << 24 | purchase << 29 | name << 30 | dead << 31
-// An event with X_NAME is followed in its bucket by a name slot: the user ID's string ref in the pkey field.
+// PRec.x: price (24 bits) | cat (5 bits) << 24 | purchase << 29 | dead << 31
 #define X_PURCH (1u << 29)
-#define X_NAME (1u << 30)
 #define X_DEAD (1u << 31)
 #define LOC_NONE 0x0FFFFFFFu
 
@@ -940,43 +947,23 @@ typedef struct { EPend e[RING]; CPend c[RING]; uint32_t ne, nc; char pad[56]; } 
 static Pend *pend; // [NT]
 static Arena *strs; // [NT] ID strings the records refer to, copied out of the read buffer
 // Copies the string ref r points at (in the read buffer, which has PAD readable bytes past every line) to strs.
+// No bounds check: a thread copies less than the bytes of the lines it parses, and its arena holds every input
+// byte plus the 48 a fixed-size copy writes.
 INL uint64_t keep_str(int tid, uint64_t r) {
   Arena *a = &strs[tid];
   uint32_t n = refn(r);
   char *d = a->cur;
-  if (UNLIKELY(d + n + 16 > a->end)) die("strings full");
   if (LIKELY(n <= 16)) memcpy(d, refp(r), 16);
+  else if (LIKELY(n <= 48)) memcpy(d, refp(r), 48);
   else memcpy(d, refp(r), n);
   a->cur = d + n;
   return mkref(d, n);
 }
-// Unlinked persons whose name some thread has stored (or is about to): 8-slot sets, a cache line each, shared by
-// all threads without locks. A lost or evicted entry only stores the name once more, so sess finds every unlinked
-// person's name in its partition while most events carry none (fewer fresh bytes for the kernel to zero).
-static _Atomic uint64_t *seen; static uint64_t seen_mask;
-INL _Atomic uint64_t *seen_set(uint64_t pk) { return seen + ((pk >> 8) & seen_mask) * 8; }
-INL int seen_add(uint64_t pk) {
-  _Atomic uint64_t *s = seen_set(pk);
-  uint64_t v[8];
-  for (int k = 0; k < 8; k++) v[k] = atomic_load_explicit(&s[k], memory_order_relaxed);
-  int hit = 0;
-  for (int k = 0; k < 8; k++) hit |= v[k] == pk;
-  if (LIKELY(hit && pk)) return 1;
-  int at = (int)(pk & 7);
-  for (int k = 7; k >= 0; k--) if (!v[k]) at = k;
-  atomic_store_explicit(&s[at], pk, memory_order_relaxed);
-  return 0;
-}
 INL void ev_emit(int tid, const EPend *p) {
   uint64_t pk = person_of(p->uh);
   size_t bi = (size_t)tid * NQART + qpart(pk);
-  int name = !(pk & LINKED) && !seen_add(pk); // a linked person's name is its root's lref
-  PRec r = {pk, p->ts, p->x | (name ? X_NAME : 0)};
+  PRec r = {pk, pk & LINKED ? 0 : keep_str(tid, p->uref), p->ts, p->x}; // a linked person's name is its root's lref
   char *d = rec_put(&arenas[tid], &pb[bi], pst + bi * (ST * sizeof(PRec)), &r, sizeof(PRec), pcap0);
-  if (name) {
-    PRec nr = {keep_str(tid, p->uref), 0, 0};
-    rec_put(&arenas[tid], &pb[bi], pst + bi * (ST * sizeof(PRec)), &nr, sizeof(PRec), pcap0);
-  }
   KRec k = {p->eh, p->ingest, (uint32_t)((d - arenas[tid].base) >> 3)};
   size_t ki = (size_t)tid * NPART + (p->eh >> (64 - PB));
   rec_put(&arenas[tid], &kb[ki], kst + ki * (ST * sizeof(KRec)), &k, sizeof(KRec), kcap0);
@@ -1005,7 +992,6 @@ static inline void ev_line(int tid, const char *ob, const uint32_t *ix, uint32_t
   if (fl[1]) {
     uh = hstr(f[1], fl[1]);
     if (have_links) { __builtin_prefetch(&lkey[lhome(uh)]); __builtin_prefetch(&lval[lhome(uh)]); }
-    __builtin_prefetch(seen_set(uh & ~LINKED));
   }
   int64_t is, ing;
   if (LIKELY(fl[3] == 20)) {
@@ -1484,22 +1470,6 @@ INL uint32_t pt_find(const PTab *t, uint64_t pk) {
   return i;
 }
 
-#define PT_HELD 0x80000000u // pt.id flag: the person has a name but no live event yet
-// Doubles the table (entries move with their ids) and returns the new capacity.
-static uint32_t pt_grow(Arena *S, PTab *t) {
-  PTab o = *t;
-  uint32_t cap = (o.mask + 1) * 2;
-  t->key = aalloc(S, (size_t)cap * 8); memset(t->key, 0, (size_t)cap * 8);
-  t->id = aalloc(S, (size_t)cap * 4);
-  t->mask = cap - 1;
-  for (uint32_t z = 0; z <= o.mask; z++) {
-    if (!o.key[z]) continue;
-    uint32_t g = pt_find(t, o.key[z]);
-    t->key[g] = o.key[z]; t->id[g] = o.id[z];
-  }
-  return cap;
-}
-
 // A person's events go to buckets of 2^BSH ms, shorter than the 30 min gap, so a session never breaks inside a
 // bucket, and between consecutive non-empty buckets it breaks when the later's first ts is over 30 min past the
 // earlier's last: sessions come from per-bucket min/max with no sort by ts.
@@ -1524,62 +1494,42 @@ static void sess_task(int tid, long q, void *ctx) {
   pt.id = aalloc(S, (size_t)pcap * 4);
   pt.mask = pcap - 1;
   uint32_t np = 0;
-  uint32_t nheld = 0; // names met before any live event of their person: pt.id is PT_HELD | index into held
   uint64_t *pkeys = aalloc(S, ne * 8);
-  uint64_t *names = aalloc(S, ne * 8); // 0 until the person's name slot is met
-  uint64_t *held = aalloc(S, ne * 8);
+  uint64_t *names = aalloc(S, ne * 8);
   uint32_t *eoff = aalloc(S, (ne + 1) * 4);
   eoff[0] = 0;
   uint64_t *tx = aalloc(S, ne * 8); // ts << 32 | x
   uint32_t *pid = aalloc(S, ne * 4);
   size_t k = 0;
   for (int t = 0; t < NT; t++) {
-    int name_next = 0;
-    uint64_t name_pk = 0;
     for (Blk *bk = pb[(size_t)t * NQART + q].head; bk; bk = bk->next) {
       PRec *r = (PRec *)(bk + 1);
       for (uint32_t j = 0; j < bk->n; j++) {
-        if (UNLIKELY(name_next)) {
-          name_next = 0;
-          uint64_t ref = r[j].pkey;
-          uint32_t i = pt_find(&pt, name_pk);
-          if (pt.key[i]) {
-            if (!(pt.id[i] & PT_HELD)) names[pt.id[i]] = ref;
-            continue;
-          }
-          if (UNLIKELY((np + nheld + 1) * 2 > pcap)) {
-            pcap = pt_grow(S, &pt);
-            i = pt_find(&pt, name_pk);
-          }
-          pt.key[i] = name_pk; pt.id[i] = PT_HELD | nheld;
-          held[nheld++] = ref;
-          continue;
-        }
         uint32_t x = r[j].x;
-        uint64_t pk = r[j].pkey;
-        if (x & X_NAME) { name_next = 1; name_pk = pk; }
         if (x & X_DEAD) continue;
+        uint64_t pk = r[j].pkey;
         uint32_t i = pt_find(&pt, pk);
         if (!pt.key[i]) {
-          if (UNLIKELY((np + nheld + 1) * 2 > pcap)) {
-            pcap = pt_grow(S, &pt);
+          if (UNLIKELY((np + 1) * 2 > pcap)) { // grow
+            pcap *= 2;
+            pt.key = aalloc(S, (size_t)pcap * 8); memset(pt.key, 0, (size_t)pcap * 8);
+            pt.id = aalloc(S, (size_t)pcap * 4);
+            pt.mask = pcap - 1;
+            for (uint32_t z = 0; z < np; z++) {
+              uint32_t g = pt_find(&pt, pkeys[z]);
+              pt.key[g] = pkeys[z]; pt.id[g] = z;
+            }
             i = pt_find(&pt, pk);
           }
           pt.key[i] = pk; pt.id[i] = np;
           pkeys[np] = pk;
-          names[np] = pk & LINKED ? lref[(uint32_t)pk] : 0;
-          np++;
-          eoff[np] = 0;
-        } else if (UNLIKELY(pt.id[i] & PT_HELD)) {
-          pkeys[np] = pk;
-          names[np] = held[pt.id[i] & ~PT_HELD];
-          pt.id[i] = np;
+          names[np] = pk & LINKED ? lref[(uint32_t)pk] : r[j].uref;
           np++;
           eoff[np] = 0;
         }
         uint32_t id = pt.id[i];
         eoff[id + 1]++;
-        tx[k] = ((uint64_t)r[j].ts << 32) | (x & ~X_NAME);
+        tx[k] = ((uint64_t)r[j].ts << 32) | x;
         pid[k] = id;
         k++;
       }
@@ -1611,7 +1561,7 @@ static void sess_task(int tid, long q, void *ctx) {
       CRec *r = (CRec *)(bk + 1);
       for (uint32_t j = 0; j < bk->n; j++) {
         uint32_t i = pt_find(&pt, r[j].pkey);
-        if (!pt.key[i] || (pt.id[i] & PT_HELD)) continue;
+        if (!pt.key[i]) continue;
         uint32_t id = pt.id[i];
         cpid[k] = id;
         cref[k] = r[j].cref;
@@ -2272,8 +2222,6 @@ int main(void) {
   pb = xcalloc((size_t)NT * NQART, sizeof(Bkt));
   cb = xcalloc((size_t)NT * NQART, sizeof(Bkt));
   if (STAGE) pst = hcalloc((size_t)NT * NQART * ST * sizeof(PRec));
-  uint64_t nseen = 1024; while (nseen < eest / 128) nseen <<= 1; // 8-slot sets: a slot per ~16 estimated events
-  seen = hcalloc(nseen * 64); seen_mask = nseen - 1;
   if (STAGE) kst = hcalloc((size_t)NT * NPART * ST * sizeof(KRec));
   if (STAGE) cst = hcalloc((size_t)NT * NQART * ST * sizeof(CRec));
   PH("map");
