@@ -1629,7 +1629,9 @@ static void sess_task(int tid, long q, void *ctx) {
   uint32_t nb = (uint32_t)((WE - 1 - WS) >> BSH) + 1;
   TBkt *tb = aalloc(S, (size_t)nb * sizeof(TBkt));
   for (uint32_t b = 0; b < nb; b++) { tb[b].mn = UINT32_MAX; tb[b].mx = 0; tb[b].cnt = 0; tb[b].rev = 0; }
-  uint64_t *bits = aalloc(S, ((size_t)nb / 64 + 1) * 8); memset(bits, 0, ((size_t)nb / 64 + 1) * 8);
+  if (nb > 64 * 64) die("event window over 2^12 time buckets"); // wmask in the walk is one word
+  uint16_t *blist = aalloc(S, ((size_t)nb + 1) * 2); // the person's non-empty buckets, in first-event order
+  uint64_t *bits = aalloc(S, 64 * 8); memset(bits, 0, 64 * 8);
   int64_t *catd = aalloc(S, (size_t)NDAYS * 32 * 8); memset(catd, 0, (size_t)NDAYS * 32 * 8);
   uint32_t *dmask = aalloc(S, (size_t)NDAYS * 4); memset(dmask, 0, (size_t)NDAYS * 4);
   uint64_t *pur = aalloc(S, nalive * 8); // the person's purchases, ts << 32 | x
@@ -1653,40 +1655,53 @@ static void sess_task(int tid, long q, void *ctx) {
     memcpy(U->names.b + U->names.n, &nn, 4);
     memcpy(U->names.b + U->names.n + 4, refp(names[p]), nn);
     U->names.n += 4 + nn;
-    uint32_t blo = nb, bhi = 0, npur = 0;
+    uint32_t nbk = 0, npur = 0;
     for (uint32_t i = 0; i < n; i++) {
       uint32_t t = (uint32_t)(e[i] >> 32);
       uint32_t x = (uint32_t)e[i];
       uint32_t b = (t - ebase) >> BSH;
       TBkt *B = &tb[b];
+      blist[nbk] = (uint16_t)b; // kept only when this event is the bucket's first
+      nbk += B->cnt == 0;
       B->mn = t < B->mn ? t : B->mn;
       B->mx = t > B->mx ? t : B->mx;
       B->cnt++;
-      bits[b >> 6] |= 1ull << (b & 63);
-      blo = b < blo ? b : blo;
-      bhi = b > bhi ? b : bhi;
       if (x & X_PURCH) { B->rev += x & 0xFFFFFF; pur[npur++] = e[i]; }
     }
-    // buckets in ts order -> sessions
-    uint32_t ns = 0, last = 0;
-    for (uint32_t w = blo >> 6; w <= bhi >> 6; w++) {
-      uint64_t bw = bits[w];
+    // The non-empty buckets go to a bitmap here, not per event: an event's update of a bitmap word waits for the
+    // previous event's store to the same word.
+    uint64_t wmask = 0; // non-empty words of bits
+    for (uint32_t i = 0; i < nbk; i++) {
+      uint32_t b = blist[i];
+      bits[b >> 6] |= 1ull << (b & 63);
+      wmask |= 1ull << (b >> 6);
+    }
+    // buckets in ts order -> sessions. One loop over the nbk set bits, the next word picked by selects: a loop
+    // per word leaves it after 1 or 2 buckets, a mispredicted exit for about every session.
+    uint32_t ns = 0, last = 0, w = 0;
+    uint64_t bw = 0;
+    for (uint32_t k = nbk; k; k--) {
+      uint32_t wn = (uint32_t)__builtin_ctzll(wmask | 1ull << 63);
+      uint64_t next = bits[wn];
+      int refill = bw == 0;
+      w = refill ? wn : w;
+      wmask = refill ? wmask & (wmask - 1) : wmask;
+      bw = refill ? next : bw;
       bits[w] = 0;
-      for (; bw; bw &= bw - 1) {
-        TBkt *B = &tb[w * 64 + (uint32_t)__builtin_ctzll(bw)];
-        if (!ns || B->mn - last > 1800000u) {
-          sst[ns] = B->mn;
-          sdi[ns] = (uint32_t)((CWS + (int64_t)B->mn) / 86400000LL - DAY0);
-          scnt[so + ns] = 0;
-          srev[so + ns] = 0;
-          ns++;
-        }
-        last = B->mx;
-        scnt[so + ns - 1] += B->cnt;
-        srev[so + ns - 1] += (int64_t)B->rev;
-        B->day = sdi[ns - 1];
-        B->mn = UINT32_MAX; B->mx = 0; B->cnt = 0; B->rev = 0;
+      TBkt *B = &tb[w * 64 + (uint32_t)__builtin_ctzll(bw)];
+      bw &= bw - 1;
+      if (!ns || B->mn - last > 1800000u) {
+        sst[ns] = B->mn;
+        sdi[ns] = (uint32_t)((CWS + (int64_t)B->mn) / 86400000LL - DAY0);
+        scnt[so + ns] = 0;
+        srev[so + ns] = 0;
+        ns++;
       }
+      last = B->mx;
+      scnt[so + ns - 1] += B->cnt;
+      srev[so + ns - 1] += (int64_t)B->rev;
+      B->day = sdi[ns - 1];
+      B->mn = UINT32_MAX; B->mx = 0; B->cnt = 0; B->rev = 0;
     }
     // purchases count for the category of their session's day
     for (uint32_t i = 0; i < npur; i++) {
