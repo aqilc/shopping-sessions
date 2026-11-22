@@ -148,7 +148,7 @@ int main(void) {
   cp(dd, big, "products.csv"); cp(dd, big, "campaigns.csv"); cp(dd, big, "manifest.json");
   SUMF("replica x%d %.0f ms\n", K, (now() - t) * 1e3);
 #endif
-  static const char *V[] = {"base", "r1", "r2", "r3", "r3lf", "r3pf", "base2"};
+  static const char *V[] = {"base", "t0", "t1", "t2", "t3", "t4", "base2"};
   enum { NV = 7, NR = 6 };
   static R res[NV][NR];
   run("/v/base", big, nc); // warm-up, discarded
