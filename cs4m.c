@@ -1727,7 +1727,7 @@ int main(void) {
   MFile *ef = xmalloc(sizeof(MFile) * (ne + 1)), *cf = xmalloc(sizeof(MFile) * (ncl + 1));
   for (int i = 0; i < ne; i++) { ef[i] = map_file(ep[i]); ebytes += ef[i].n; }
   for (int i = 0; i < ncl; i++) { cf[i] = map_file(cp[i]); cbytes += cf[i].n; }
-  size_t csz = 1u << 20;
+  size_t csz = 1u << 22;
   for (int i = 0; i < ne; i++) add_chunks(ef[i], 0, csz);
   for (int i = 0; i < ncl; i++) add_chunks(cf[i], 1, csz);
   // partition sizing
@@ -1782,6 +1782,7 @@ int main(void) {
   PH(" w.user");
   write_campaign();
   PH("write");
+  if (RELEASE) run_par(nchunks + NT, release_task, NULL);
   PH("release");
   _exit(0);
 }
