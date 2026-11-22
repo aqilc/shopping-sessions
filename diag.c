@@ -27,29 +27,30 @@ static void cat(const char *p, const char *grep, int maxl) {
 }
 
 static int RUNI;
-static void run(const char *data, const char *out, const char *ncpu, const char *tag) {
-  mkdir(out, 0777);
-  char e1[512], e2[512], e3[64], lf[600];
+typedef struct { double w, ph[16]; int x; } R;
+static const char *PHN[] = {"links", "map", "parse", "dedup", "sess", "write", "release"};
+static R run(const char *bin, const char *data, const char *ncpu) {
+  char e1[512], e2[512], e3[64], lf[600], out[600];
+  const char *sc = getenv("SCRATCH_DIR"); if (!sc) sc = "/scratch";
+  snprintf(out, sizeof out, "%s/o%02d", sc, RUNI); mkdir(out, 0777);
   snprintf(e1, sizeof e1, "DATA_DIR=%s", data); snprintf(e2, sizeof e2, "OUTPUT_DIR=%s", out);
   snprintf(e3, sizeof e3, "NCPU=%s", ncpu);
-  const char *sc = getenv("SCRATCH_DIR"); if (!sc) sc = "/scratch";
   snprintf(lf, sizeof lf, "%s/run%02d.log", sc, RUNI++);
-  char *env[] = {e1, e2, e3, "SESS_PROF=1", NULL}, *argv[] = {"/sess", NULL};
+  char *env[] = {e1, e2, e3, "SESS_PROF=1", NULL}, *argv[] = {(char *)bin, NULL};
   double t = now(); pid_t p = fork();
-  if (p == 0) { int fd = open(lf, O_WRONLY | O_CREAT | O_TRUNC, 0666); dup2(fd, 2); execve("/sess", argv, env); _exit(127); }
+  if (p == 0) { int fd = open(lf, O_WRONLY | O_CREAT | O_TRUNC, 0666); dup2(fd, 2); execve(bin, argv, env); _exit(127); }
   int st; waitpid(p, &st, 0);
-  double w = (now() - t) * 1e3;
-  SUMF("%s nt%s w%.0f x%d:", tag, ncpu, w, WIFEXITED(st) ? WEXITSTATUS(st) : -WTERMSIG(st));
+  R r = {0}; r.w = (now() - t) * 1e3; r.x = WIFEXITED(st) ? WEXITSTATUS(st) : -WTERMSIG(st);
   FILE *f = fopen(lf, "r"); char l[256], nm[64]; double v, prev = 0;
-  while (f && fgets(l, sizeof l, f)) {
+  while (f && fgets(l, sizeof l, f))
     if (sscanf(l, " %63s %lf ms", nm, &v) == 2) {
-      int sub = nm[0] == 'l' && nm[1] == '.';
-      SUMF(" %s%.0f", sub ? nm + 1 : nm, v - prev); prev = v;
+      for (int i = 0; i < 7; i++) if (!strcmp(nm, PHN[i])) r.ph[i] = v - prev;
+      prev = v;
     }
-  }
   if (f) fclose(f);
-  SUMF("\n");
+  return r;
 }
+static double med3(double a, double b, double c) { return a > b ? (b > c ? b : (a > c ? c : a)) : (a > c ? a : (b > c ? c : b)); }
 
 // Copy every CSV in src/sub to dst/sub K times, prefixing the first two fields with a
 // per-copy tag (inside the quote if the field is quoted) so ids stay distinct per copy.
@@ -116,19 +117,30 @@ int main(void) {
   const char *dd = getenv("DATA_DIR"); if (!dd) dd = "/data";
   const char *sc = getenv("SCRATCH_DIR"); if (!sc) sc = "/scratch";
   const char *nc = getenv("NCPU"); if (!nc) nc = "8";
-  char out[512], big[512], bout[512];
-  snprintf(out, sizeof out, "%s/o-dev", sc); snprintf(big, sizeof big, "%s/big", sc); snprintf(bout, sizeof bout, "%s/o-big", sc);
-  for (int i = 0; i < 3; i++) run(dd, out, nc, "dev");
+  char big[512]; snprintf(big, sizeof big, "%s/big", sc);
+  R d = run("/v/base", dd, nc); SUMF("dev base w%.0f x%d parse%.0f sess%.0f\n", d.w, d.x, d.ph[2], d.ph[4]);
   int K = getenv("DIAG_K") ? atoi(getenv("DIAG_K")) : 20;
   double t = now(); mkdir(big, 0777);
   rep(dd, big, "events", K, 2); rep(dd, big, "clicks", K, 2); rep(dd, big, "links", K, 2);
   cp(dd, big, "products.csv"); cp(dd, big, "campaigns.csv"); cp(dd, big, "manifest.json");
   SUMF("replica x%d %.0f ms\n", K, (now() - t) * 1e3);
-  for (int i = 0; i < 3; i++) run(big, bout, nc, "big");
-  run(big, bout, "4", "big-nt4");
-  run(big, bout, "16", "big-nt16");
+  static const char *V[] = {"base", "wp", "v4", "s1", "s2", "s3"};
+  enum { NV = 6, NR = 3 };
+  static R res[NV][NR];
+  run("/v/base", big, nc); // warm-up, discarded
+  for (int r = 0; r < NR; r++)
+    for (int v = 0; v < NV; v++) { char b[64]; snprintf(b, sizeof b, "/v/%s", V[v]); res[v][r] = run(b, big, nc); }
+  for (int v = 0; v < NV; v++) {
+    R *x = res[v];
+    SUMF("%s w%.0f(%.0f/%.0f/%.0f) x%d", V[v], med3(x[0].w, x[1].w, x[2].w), x[0].w, x[1].w, x[2].w, x[0].x | x[1].x | x[2].x);
+    for (int i = 0; i < 7; i++) SUMF(" %.2s%.0f", PHN[i], med3(x[0].ph[i], x[1].ph[i], x[2].ph[i]));
+    SUMF("\n");
+  }
   // A real answer for the dev check too, then fail on purpose so logs are shown.
-  run(dd, getenv("OUTPUT_DIR") ? getenv("OUTPUT_DIR") : "/output", nc, "final-dev");
+  const char *od = getenv("OUTPUT_DIR"); if (!od) od = "/output";
+  { char e1[512], e2[512], e3[64]; snprintf(e1, sizeof e1, "DATA_DIR=%s", dd); snprintf(e2, sizeof e2, "OUTPUT_DIR=%s", od); snprintf(e3, sizeof e3, "NCPU=%s", nc);
+    char *env[] = {e1, e2, e3, NULL}, *argv[] = {"/v/base", NULL};
+    pid_t p = fork(); if (p == 0) { execve("/v/base", argv, env); _exit(127); } int st; waitpid(p, &st, 0); SUMF("final-dev x%d\n", WEXITSTATUS(st)); }
   SUMF("diag done, exit 1 on purpose\n");
   fputs(SUM, stderr);
   return 1;
