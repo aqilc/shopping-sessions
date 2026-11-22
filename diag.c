@@ -136,8 +136,8 @@ int main(void) {
   rep(dd, big, "events", K, 2); rep(dd, big, "clicks", K, 2); rep(dd, big, "links", K, 2);
   cp(dd, big, "products.csv"); cp(dd, big, "campaigns.csv"); cp(dd, big, "manifest.json");
   SUMF("replica x%d %.0f ms\n", K, (now() - t) * 1e3);
-  static const char *V[] = {"base", "pb10", "pb11", "pb13", "v6c", "fuse2"};
-  enum { NV = 6, NR = 3 };
+  static const char *V[] = {"base", "pb10", "pb11", "pb13", "v6c", "fuse2", "ss"};
+  enum { NV = 7, NR = 3 };
   static R res[NV][NR];
   run("/v/base", big, nc); // warm-up, discarded
   for (int r = 0; r < NR; r++)
