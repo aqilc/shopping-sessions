@@ -571,6 +571,27 @@ INL int32_t smap_get(const SMap *m, const char *p, uint32_t n) {
   }
 }
 
+// Campaign IDs are "c_" + a number (rules.md), so those of 1..5 digits without a leading zero are looked up by
+// value: no hash, probe or string compare. cdir[number] = index + 1; 0 sends the lookup to the string map.
+#define CDIR_N 100000
+static uint16_t *cdir;
+// The number in a canonical ID ("c_", then 1..5 digits, the first not '0'), or -1. Reads p[0..7].
+INL int32_t camp_num(const char *p, uint32_t n) {
+  if (UNLIKELY(n - 3 > 4)) return -1;
+  uint64_t x = (ld8(p) ^ 0x3030303030305F63ULL) & (~0ULL >> (64 - 8 * n));
+  if (UNLIKELY((((x + 0x7676767676767F7FULL) | x) & (0x80 * ONES)) != 0 || (x & 0xFF0000) == 0)) return -1;
+  return (int32_t)ts_parse8(x << (64 - 8 * n));
+}
+static SMap campmap; // campaign -> idx
+INL int32_t camp_get(const char *p, uint32_t n) {
+  int32_t k = camp_num(p, n);
+  if (LIKELY(k >= 0)) {
+    uint32_t v = cdir[k];
+    if (LIKELY(v)) return (int32_t)v - 1;
+  }
+  return smap_get(&campmap, p, n);
+}
+
 // ---------- thread pool ----------
 static int NT = 8;
 typedef void (*task_fn)(int tid, long task, void *ctx);
@@ -650,7 +671,6 @@ static int64_t DAY0; static int32_t NDAYS;
 static SMap prodmap; // product -> category index
 static int unknown_cat;
 static int ncat; static const char **catp; static uint32_t *catn;
-static SMap campmap; // campaign -> idx
 static int ncamp; static const char **camp_id; static uint32_t *camp_idn; static const char **chan; static uint32_t *chann;
 static uint32_t PB, QB; static uint32_t NPART, NQART; // eid partitions 2^PB, person partitions 2^QB
 
@@ -931,7 +951,7 @@ static inline void cl_line(int tid, const char *ls, const char *const *sep, int 
   if (have_links) { __builtin_prefetch(&lkey[lhome(uh)]); __builtin_prefetch(&lval[lhome(uh)]); }
   int64_t ts = parse_ts_w(f[3], fl[3], &mw_cl);
   if (ts == BADTS || ts < CWS || ts >= WE) return;
-  int32_t c = smap_get(&campmap, f[2], fl[2]);
+  int32_t c = camp_get(f[2], fl[2]);
   if (c < 0) return;
   Pend *P = &pend[tid];
   CPend *e = &P->c[P->nc % RING];
@@ -1994,6 +2014,7 @@ static void load_campaigns(const char *dd) {
   MFile f = map_file(path);
   size_t lines = f.n / 4 + 16;
   smap_init(&campmap, lines);
+  cdir = xcalloc(CDIR_N, sizeof *cdir);
   camp_id = xmalloc(sizeof(char *) * lines); camp_idn = xmalloc(4 * lines);
   chan = xmalloc(sizeof(char *) * lines); chann = xmalloc(4 * lines);
   const char *p = f.p, *end = f.p + f.n;
@@ -2005,6 +2026,8 @@ static void load_campaigns(const char *dd) {
     if (le > p && split2(p, (size_t)(le - p), fp, fl) && fl[0]) {
       int cr;
       smap_put(&campmap, fp[0], fl[0], ncamp, &cr);
+      int32_t k = camp_num(fp[0], fl[0]);
+      if (cr && k >= 0 && ncamp < 0xFFFF) cdir[k] = (uint16_t)(ncamp + 1);
       if (cr) { camp_id[ncamp] = fp[0]; camp_idn[ncamp] = fl[0]; chan[ncamp] = fp[1]; chann[ncamp] = fl[1]; ncamp++; }
     }
     p = le + 1;
