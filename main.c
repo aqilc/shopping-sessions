@@ -1681,10 +1681,11 @@ static void sess_task(int tid, long q, long nq) {
   uint64_t *pur = aalloc(S, nalive * 8 + 8); // the person's purchases, ts << 32 | x
   // sessions, person after person from soff[p]: start ts, day index, events, revenue
   uint32_t *soff = aalloc(S, ((size_t)np + 1) * 4);
-  uint32_t *sst0 = aalloc(S, nalive * 4);
+  uint32_t *sst0 = aalloc(S, nalive * 4 + 4); // the click merges read one past a person's sessions
   uint32_t *sdi0 = aalloc(S, nalive * 4);
   uint32_t *scnt = aalloc(S, nalive * 4);
   int64_t *srev = aalloc(S, nalive * 8);
+  uint32_t *shi = aalloc(S, ((size_t)nb + 1) * 4); // per session of the person: clicks at or before its start
   uint32_t so = 0;
   Ahead ah;
   ahead_init(&ah, nq);
@@ -1770,7 +1771,15 @@ static void sess_task(int tid, long q, long nq) {
       dmask[d] |= 1u << cat;
     }
     // sessions -> credited click, campaign aggregates, one row per day
-    uint32_t hi = 0, rses = 0, revs = 0;
+    // The clicks at or before each session start come from one select-driven merge: a scan per session ends on
+    // a mispredicted exit. c[m] is readable (the click array is allocated one longer).
+    for (uint32_t z = 0, h = 0; z < ns;) {
+      uint32_t adv = (uint32_t)(h < m) & (uint32_t)((uint32_t)(c[h] >> 32) <= sst[z]);
+      shi[z] = h;
+      h += adv;
+      z += adv ^ 1;
+    }
+    uint32_t rses = 0, revs = 0;
     int64_t rrev = 0;
     for (uint32_t z = 0; z < ns; z++) {
       uint32_t s0 = sst[z], di = sdi[z];
@@ -1788,7 +1797,7 @@ static void sess_task(int tid, long q, long nq) {
       rses++;
       revs += scnt[so + z];
       rrev += srev[so + z];
-      while (hi < m && (uint32_t)(c[hi] >> 32) <= s0) hi++;
+      uint32_t hi = shi[z];
       // latest ts wins; among equal ts the smallest click_id. Branch-free but for ties: whether a session has a
       // qualifying click is a coin flip. c[0] is readable even for m == 0 (the click run is allocated one longer).
       uint32_t y = hi - (hi != 0);
@@ -1823,6 +1832,7 @@ static void sess_task(int tid, long q, long nq) {
   SP_ADD(tid, SP_WALK, t0);
   uint32_t *drun = aalloc(S, (size_t)so * 4);
   uint32_t *jprev = aalloc(S, ((size_t)ncamp + 1) * 4); // valid where st[] carries this person's stamp
+  uint32_t *cip = aalloc(S, (nlive + 1) * 4), *cjp = aalloc(S, (nlive + 1) * 4); // per click of the person: its session range
   for (uint32_t p = 0; p < np; p++) {
     const uint64_t *c = cl + coff[p];
     uint32_t m = coff[p + 1] - coff[p];
@@ -1834,13 +1844,22 @@ static void sess_task(int tid, long q, long nq) {
     drun[ns - 1] = ns;
     for (uint32_t z = ns - 1; z-- > 0;) drun[z] = sdi[z] == sdi[z + 1] ? drun[z + 1] : z + 1;
     uint32_t sv = ++stampv[tid];
-    uint32_t ip = 0, jp = 0;
+    // each click's sessions [ip, jp) from two select-driven merges, as for the credited click
+    for (uint32_t z = 0, ip = 0; z < m;) {
+      uint32_t adv = (uint32_t)(ip < ns) & (uint32_t)(sst[ip] < (uint32_t)(c[z] >> 32));
+      cip[z] = ip;
+      ip += adv;
+      z += adv ^ 1;
+    }
+    for (uint32_t z = 0, jp = 0; z < m;) {
+      uint32_t adv = (uint32_t)(jp < ns) & (uint32_t)(sst[jp] <= (int64_t)(c[z] >> 32) + 604800000LL);
+      cjp[z] = jp;
+      jp += adv;
+      z += adv ^ 1;
+    }
     for (uint32_t z = 0; z < m; z++) {
-      int64_t t = (int64_t)(c[z] >> 32);
       uint32_t cc = ccamp[(uint32_t)c[z]];
-      while (ip < ns && sst[ip] < t) ip++;
-      while (jp < ns && sst[jp] <= t + 604800000LL) jp++;
-      uint32_t from = ip;
+      uint32_t from = cip[z], jp = cjp[z];
       if (st[cc] != sv) st[cc] = sv;
       else if (jprev[cc] > from) from = jprev[cc];
       jprev[cc] = jp;
