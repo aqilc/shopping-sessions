@@ -35,6 +35,28 @@ static void *xrealloc(void *p, size_t n) { p = realloc(p, n ? n : 1); if (!p) di
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static int PROF; static double T0;
 #define PH(name) do { if (PROF) fprintf(stderr, "%-10s %7.1f ms\n", name, (now_s() - T0) * 1e3); } while (0)
+// Sub-phase ticks per thread (SESS_PROF): a cheap counter, scaled to ms against now_s over the phase.
+INL uint64_t ticks(void) {
+#if defined(__x86_64__)
+  return __rdtsc();
+#elif defined(__aarch64__)
+  uint64_t v; __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v)); return v;
+#else
+  return (uint64_t)(now_s() * 1e9);
+#endif
+}
+enum { SP_DZERO, SP_DPROBE, SP_GATHER, SP_SORT, SP_CLICKS, SP_WALK, SP_ASSIST, SP_N };
+static uint64_t sprof[16][8]; // [thread][SP_*], one cache line per thread
+#define SP_ADD(tid, k, t0) do { if (PROF) { uint64_t t1_ = ticks(); sprof[tid][k] += t1_ - (t0); (t0) = t1_; } } while (0)
+// Prints sub-phases k0..k1-1 as PH-style lines: max over threads, then the sum.
+static void sp_print(int k0, int k1, const char *const *names, double ms_per_tick) {
+  if (!PROF) return;
+  for (int k = k0; k < k1; k++) {
+    uint64_t mx = 0, sum = 0;
+    for (int t = 0; t < 16; t++) { sum += sprof[t][k]; if (sprof[t][k] > mx) mx = sprof[t][k]; }
+    fprintf(stderr, "%-10s %7.1f ms max/thread, %.1f ms sum\n", names[k - k0], mx * ms_per_tick, sum * ms_per_tick);
+  }
+}
 
 // ---------- hashing / strings ----------
 INL uint64_t ld8(const char *p) { uint64_t w; memcpy(&w, p, 8); return w; }
@@ -882,8 +904,10 @@ static void dedup_task(int tid, long q, void *ctx) {
   if (!cnt) return;
   size_t cap = 64; while (cap < cnt * 2) cap <<= 1;
   Arena *s = &scratch[tid]; s->cur = s->base;
+  uint64_t t0 = PROF ? ticks() : 0;
   DSlot *tab = aalloc(s, cap * sizeof(DSlot));
   memset(tab, 0, cap * sizeof(DSlot));
+  SP_ADD(tid, SP_DZERO, t0);
   uint64_t mask = cap - 1;
   for (int t = 0; t < NT; t++) {
     for (Blk *k = kb[(size_t)t * NPART + q].head; k; k = k->next) {
@@ -905,6 +929,7 @@ static void dedup_task(int tid, long q, void *ctx) {
       }
     }
   }
+  SP_ADD(tid, SP_DPROBE, t0);
 }
 
 // ---------- sessionize ----------
@@ -978,6 +1003,7 @@ static void sess_task(int tid, long q, void *ctx) {
     for (Blk *k = cb[(size_t)t * NQART + q].head; k; k = k->next) nc += k->n;
   }
   if (!ne) return;
+  uint64_t t0 = PROF ? ticks() : 0;
   // one pass over the records: per person counts, (ts << 32 | slot) and (person << 32 | x) per slot
   uint32_t pcap = 256; while (pcap < ne) pcap <<= 1;
   uint32_t *tab = aalloc(S, (size_t)pcap * 4); memset(tab, 0, (size_t)pcap * 4);
@@ -1017,6 +1043,7 @@ static void sess_task(int tid, long q, void *ctx) {
     }
   }
   size_t nalive = k;
+  SP_ADD(tid, SP_GATHER, t0);
   for (uint32_t i = 0; i < np; i++) eoff[i + 1] += eoff[i];
   uint32_t *pos = aalloc(S, ((size_t)np + 1) * 4); memcpy(pos, eoff, ((size_t)np + 1) * 4);
   uint64_t *ev = aalloc(S, nalive * 8 + 8);
@@ -1027,6 +1054,7 @@ static void sess_task(int tid, long q, void *ctx) {
     uint64_t v = px[(uint32_t)tx[i]];
     ev[pos[v >> 32]++] = (tx[i] & 0xFFFFFFFF00000000ull) | (uint32_t)v;
   }
+  SP_ADD(tid, SP_SORT, t0);
   // clicks: per person runs of (ts << 32 | click slot); ts ties are settled by click_id at credit time
   uint32_t *cpid = aalloc(S, (nc + 1) * 4);
   uint64_t *cref = aalloc(S, (nc + 1) * 8);
@@ -1055,6 +1083,8 @@ static void sess_task(int tid, long q, void *ctx) {
   uint64_t *cl = aalloc(S, (nlive + 1) * 8);
   sort_u64(ctx_, tmp, (uint32_t)nlive);
   for (size_t i = 0; i < nlive; i++) cl[pos[cpid[(uint32_t)ctx_[i]]]++] = ctx_[i];
+  SP_ADD(tid, SP_CLICKS, t0);
+  uint64_t tassist = 0;
   UVec *ur = &urows[tid];
   CAgg *ca = &cagg[(size_t)tid * (ncamp + 1) * NDAYS];
   uint32_t *st = stamp[tid];
@@ -1118,6 +1148,7 @@ static void sess_task(int tid, long q, void *ctx) {
     }
     if (curday != INT64_MIN) flush_row(ur, &row, catsum, touched);
     if (!m) continue;
+    uint64_t ta = PROF ? ticks() : 0;
     // assists: a click at t assists the sessions starting in [t, t + 7 days]; per campaign only the
     // sessions past the previous click's range count, so each (session, campaign) pair counts once
     drun[ns - 1] = ns;
@@ -1139,7 +1170,10 @@ static void sess_task(int tid, long q, void *ctx) {
         from = to;
       }
     }
+    if (PROF) tassist += ticks() - ta;
   }
+  SP_ADD(tid, SP_WALK, t0);
+  if (PROF) { sprof[tid][SP_WALK] -= tassist; sprof[tid][SP_ASSIST] += tassist; }
 }
 
 // ---------- parquet writer ----------
@@ -1534,6 +1568,7 @@ int main(void) {
   run_par(nchunks, parse_task, NULL);
   run_par(NT, close_task, NULL);
   PH("parse");
+  double pt0 = now_s(); uint64_t pk0 = ticks();
   run_par(NPART, dedup_task, NULL);
   PH("dedup");
   urows = xcalloc(NT, sizeof(UVec));
@@ -1547,11 +1582,17 @@ int main(void) {
   long *order = xmalloc(sizeof(long) * NQART);
   for (uint32_t q = 0; q < NQART; q++) order[q] = q;
   qsort(order, NQART, sizeof(long), cmp_q);
+  PH(" s.setup");
   run_par_o(NQART, order, sess_task, NULL);
   PH("sess");
+  {
+    static const char *const sn[] = {" d.zero", " d.probe", " s.gather", " s.sort", " s.clicks", " s.walk", " s.assist"};
+    sp_print(SP_DZERO, SP_N, sn, PROF ? (now_s() - pt0) * 1e3 / (double)(ticks() - pk0) : 0);
+  }
   snprintf(dir, sizeof dir, "%s/user_daily", od); if (mkdir(dir, 0777) && errno != EEXIST) die(dir);
   snprintf(dir, sizeof dir, "%s/campaign_daily", od); if (mkdir(dir, 0777) && errno != EEXIST) die(dir);
   run_par(NT, write_user_task, NULL);
+  PH(" w.user");
   write_campaign();
   PH("write");
   run_par(nchunks + NT, release_task, NULL);
