@@ -964,6 +964,20 @@ static uint64_t *radix3(uint64_t *a, uint64_t *tmp, uint32_t n, Hist c) {
   }
   return src;
 }
+typedef uint32_t Hist4[4][256]; // 8-bit digit counts of the high 32 bits
+INL void hist4_add(Hist4 c, uint32_t k) { c[0][k & 255]++; c[1][(k >> 8) & 255]++; c[2][(k >> 16) & 255]++; c[3][k >> 24]++; }
+// LSD radix on bits 32..63, 4 passes of 8 bits, from the digit counts of the n keys (consumed).
+static uint64_t *radix4(uint64_t *a, uint64_t *tmp, uint32_t n, Hist4 c) {
+  uint64_t *src = a, *dst = tmp;
+  for (int p = 0; p < 4; p++) {
+    uint32_t s = 0;
+    for (int b = 0; b < 256; b++) { uint32_t v = c[p][b]; c[p][b] = s; s += v; }
+    int sh = 32 + 8 * p;
+    for (uint32_t i = 0; i < n; i++) { uint32_t k = (uint32_t)(src[i] >> sh) & 255; dst[c[p][k]++] = src[i]; }
+    uint64_t *t = src; src = dst; dst = t;
+  }
+  return src;
+}
 // Sorts n keys by their high 32 bits, using tmp as the other buffer; returns whichever of a and tmp holds the result.
 static uint64_t *sort_u64(uint64_t *a, uint64_t *tmp, uint32_t n) {
   if (n < 2) return a;
@@ -971,19 +985,11 @@ static uint64_t *sort_u64(uint64_t *a, uint64_t *tmp, uint32_t n) {
     for (uint32_t i = 1; i < n; i++) { uint64_t x = a[i]; uint32_t j = i; while (j && a[j - 1] > x) { a[j] = a[j - 1]; j--; } a[j] = x; }
     return a;
   }
-  if (n <= 8192) { // 4 passes of 8 bits over ts
-    uint32_t c[4][256];
+  if (n <= 8192) {
+    Hist4 c;
     memset(c, 0, sizeof c);
-    for (uint32_t i = 0; i < n; i++) { uint32_t k = (uint32_t)(a[i] >> 32); c[0][k & 255]++; c[1][(k >> 8) & 255]++; c[2][(k >> 16) & 255]++; c[3][k >> 24]++; }
-    uint64_t *src = a, *dst = tmp;
-    for (int p = 0; p < 4; p++) {
-      uint32_t s = 0;
-      for (int b = 0; b < 256; b++) { uint32_t v = c[p][b]; c[p][b] = s; s += v; }
-      int sh = 32 + 8 * p;
-      for (uint32_t i = 0; i < n; i++) { uint32_t k = (uint32_t)(src[i] >> sh) & 255; dst[c[p][k]++] = src[i]; }
-      uint64_t *t = src; src = dst; dst = t;
-    }
-    return src;
+    for (uint32_t i = 0; i < n; i++) hist4_add(c, (uint32_t)(a[i] >> 32));
+    return radix4(a, tmp, n, c);
   }
   Hist c;
   memset(c, 0, sizeof c);
@@ -1082,6 +1088,12 @@ static void sess_task(int tid, long q, void *ctx) {
   uint32_t *ccamp = aalloc(S, (nc + 1) * 4);
   uint64_t *ctx_ = aalloc(S, (nc + 1) * 8);
   uint32_t *coff = aalloc(S, ((size_t)np + 1) * 4); memset(coff, 0, ((size_t)np + 1) * 4);
+  // the click sort digits are counted here too, for the radix sort_u64 would pick for nc keys
+  int cbig = nc > 8192, cmid = nc > 48 && !cbig;
+  Hist *ch = aalloc(S, sizeof(Hist));
+  Hist4 *ch4 = aalloc(S, sizeof(Hist4));
+  if (cbig) memset(ch, 0, sizeof(Hist));
+  if (cmid) memset(ch4, 0, sizeof(Hist4));
   k = 0;
   for (int t = 0; t < NT; t++) {
     for (Blk *bk = cb[(size_t)t * NQART + q].head; bk; bk = bk->next) {
@@ -1093,6 +1105,8 @@ static void sess_task(int tid, long q, void *ctx) {
         cref[k] = r[j].cref;
         ccamp[k] = r[j].camp;
         ctx_[k] = ((uint64_t)r[j].ts << 32) | k;
+        if (cbig) hist_add(*ch, r[j].ts);
+        if (cmid) hist4_add(*ch4, r[j].ts);
         coff[id]++;
         k++;
       }
@@ -1102,7 +1116,8 @@ static void sess_task(int tid, long q, void *ctx) {
   for (uint32_t i = 0; i < np; i++) coff[i + 1] += coff[i];
   memcpy(pos, coff, ((size_t)np + 1) * 4);
   uint64_t *cl = aalloc(S, (nlive + 1) * 8);
-  const uint64_t *csorted = sort_u64(ctx_, tmp, (uint32_t)nlive);
+  const uint64_t *csorted = cbig ? radix3(ctx_, tmp, (uint32_t)nlive, *ch)
+                          : cmid ? radix4(ctx_, tmp, (uint32_t)nlive, *ch4) : sort_u64(ctx_, tmp, (uint32_t)nlive);
   for (size_t i = 0; i < nlive; i++) cl[pos[cpid[(uint32_t)csorted[i]]]++] = csorted[i];
   SP_ADD(tid, SP_CLICKS, t0);
   uint64_t tassist = 0;
