@@ -135,11 +135,21 @@ int main(void) {
     if (K > kmax) K = kmax;
   }
   double t = now(); mkdir(big, 0777);
+#ifdef GEN_E
+  { // generator data (real skew: full-size whales, shared-device persons, chains), not a replica
+    char ev[32], cl[32], sd[32]; int ge = getenv("DIAG_GEN") ? atoi(getenv("DIAG_GEN")) : GEN_E; snprintf(ev, sizeof ev, "%d", ge); snprintf(cl, sizeof cl, "%d", ge / 4); snprintf(sd, sizeof sd, "%d", GEN_SEED);
+    char *argv[] = {"/gen", "--seed", sd, "--events", ev, "--clicks", cl, "--output", big, "--threads", "8", NULL};
+    pid_t p = fork(); if (p == 0) { int fd = open("/dev/null", O_WRONLY); dup2(fd, 1); execv("/gen", argv); _exit(127); }
+    int st; waitpid(p, &st, 0); (void)K;
+    SUMF("gen seed %d events %d x%d %.0f ms\n", GEN_SEED, ge, WEXITSTATUS(st), (now() - t) * 1e3);
+  }
+#else
   rep(dd, big, "events", K, 2); rep(dd, big, "clicks", K, 2); rep(dd, big, "links", K, 2);
   cp(dd, big, "products.csv"); cp(dd, big, "campaigns.csv"); cp(dd, big, "manifest.json");
   SUMF("replica x%d %.0f ms\n", K, (now() - t) * 1e3);
-  static const char *V[] = {"base", "rd", "nl", "mm", "wb", "pw"};
-  enum { NV = 6, NR = 4 };
+#endif
+  static const char *V[] = {"base", "v10", "v8", "base2"};
+  enum { NV = 4, NR = 5 };
   static R res[NV][NR];
   run("/v/base", big, nc); // warm-up, discarded
   for (int r = 0; r < NR; r++)
