@@ -1287,12 +1287,7 @@ static void load_links(const char *dd) {
 
 // ---------- dedup ----------
 #define DPF 8 // records ahead whose table slot is prefetched
-INL void kill_loc(uint32_t tl) {
-  uint32_t l = tl & 0x0FFFFFFFu;
-  if (l == LOC_NONE) return;
-  PRec *r = (PRec *)(arenas[tl >> 28].base + ((size_t)l << 3));
-  r->x |= X_DEAD;
-}
+INL PRec *kill_rec(uint32_t tl) { return (PRec *)(arenas[tl >> 28].base + ((size_t)(tl & 0x0FFFFFFFu) << 3)); }
 static void dedup_task(int tid, long q, void *ctx) {
   (void)ctx;
   size_t cnt = 0;
@@ -1308,6 +1303,10 @@ static void dedup_task(int tid, long q, void *ctx) {
   uint32_t mask = cap - 1;
   uint64_t *tab = aalloc(s, (size_t)cap * 8);
   memset(tab, 0, (size_t)cap * 8);
+  // A losing copy's payload is a cold line anywhere in the arenas: it is prefetched when found and marked dead
+  // after the pass, so those misses overlap instead of each stalling the probe loop.
+  uint32_t *kl = aalloc(s, cnt * 4);
+  size_t nk = 0;
   SP_ADD(tid, SP_DSPLIT, t0);
   for (int t = 0; t < NT; t++) {
     const char *ab = arenas[t].base;
@@ -1329,8 +1328,12 @@ static void dedup_task(int tid, long q, void *ctx) {
             uint32_t dr = (uint32_t)d;
             KRec *o = (KRec *)(arenas[dr >> 28].base + ((size_t)(dr & 0x0FFFFFFFu) << 4));
             if (o->h == h) {
-              if (r[j].ingest < o->ingest) { kill_loc((dr & 0xF0000000u) | o->loc); tab[i] = v; }
-              else kill_loc(((uint32_t)t << 28) | r[j].loc);
+              uint32_t dead = ((uint32_t)t << 28) | r[j].loc;
+              if (r[j].ingest < o->ingest) { dead = (dr & 0xF0000000u) | o->loc; tab[i] = v; }
+              if ((dead & 0x0FFFFFFFu) != LOC_NONE) {
+                __builtin_prefetch(kill_rec(dead), 1);
+                kl[nk++] = dead;
+              }
               break;
             }
           }
@@ -1339,6 +1342,7 @@ static void dedup_task(int tid, long q, void *ctx) {
       }
     }
   }
+  for (size_t j = 0; j < nk; j++) kill_rec(kl[j])->x |= X_DEAD;
   SP_ADD(tid, SP_DPROBE, t0);
 }
 
