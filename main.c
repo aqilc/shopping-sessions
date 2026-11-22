@@ -890,7 +890,6 @@ static void load_links(const char *dd) {
 }
 
 // ---------- dedup ----------
-typedef struct { uint64_t h; uint32_t ingest; uint32_t loc; } DSlot; // loc: thread << 28 | loc
 INL void kill_loc(uint32_t tl) {
   uint32_t l = tl & 0x0FFFFFFFu;
   if (l == LOC_NONE) return;
@@ -905,24 +904,32 @@ static void dedup_task(int tid, long q, void *ctx) {
   size_t cap = 64; while (cap < cnt * 2) cap <<= 1;
   Arena *s = &scratch[tid]; s->cur = s->base;
   uint64_t t0 = PROF ? ticks() : 0;
-  DSlot *tab = aalloc(s, cap * sizeof(DSlot));
-  memset(tab, 0, cap * sizeof(DSlot));
+  // 8-byte slot: 32 hash bits as a fingerprint << 32 | the record's ref (thread << 28 | arena offset / 16, never 0
+  // since a block header comes first), so the table is half the size; a fingerprint match is confirmed on the record.
+  uint64_t *tab = aalloc(s, cap * 8);
+  memset(tab, 0, cap * 8);
   SP_ADD(tid, SP_DZERO, t0);
   uint64_t mask = cap - 1;
   for (int t = 0; t < NT; t++) {
+    const char *ab = arenas[t].base;
     for (Blk *k = kb[(size_t)t * NPART + q].head; k; k = k->next) {
       KRec *r = (KRec *)(k + 1);
+      uint64_t ref0 = ((uint64_t)t << 28) | (uint64_t)(((const char *)r - ab) >> 4);
       for (uint32_t j = 0; j < k->n; j++) {
         uint64_t h = r[j].h;
-        uint32_t tl = ((uint32_t)t << 28) | r[j].loc;
+        uint64_t fp = (h >> 24) << 32;
         uint64_t i = h & mask;
         for (;;) {
-          DSlot *d = &tab[i];
-          if (!d->h) { d->h = h; d->ingest = r[j].ingest; d->loc = tl; break; }
-          if (d->h == h) {
-            if (r[j].ingest < d->ingest) { kill_loc(d->loc); d->ingest = r[j].ingest; d->loc = tl; }
-            else kill_loc(tl);
-            break;
+          uint64_t d = tab[i];
+          if (!d) { tab[i] = fp | (ref0 + j); break; }
+          if ((d & 0xFFFFFFFF00000000ull) == fp) {
+            uint32_t dr = (uint32_t)d;
+            KRec *o = (KRec *)(arenas[dr >> 28].base + ((size_t)(dr & 0x0FFFFFFFu) << 4));
+            if (o->h == h) {
+              if (r[j].ingest < o->ingest) { kill_loc((dr & 0xF0000000u) | o->loc); tab[i] = fp | (ref0 + j); }
+              else kill_loc(((uint32_t)t << 28) | r[j].loc);
+              break;
+            }
           }
           i = (i + 1) & mask;
         }
