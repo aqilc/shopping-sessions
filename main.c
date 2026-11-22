@@ -943,8 +943,11 @@ static void dedup_task(int tid, long q, void *ctx) {
 typedef struct { uint64_t name; int32_t day; uint32_t sessions, events; int32_t top; int64_t revenue; } URow;
 typedef struct { URow *a; size_t n, cap; } UVec;
 static UVec *urows; // [NT]
-typedef struct { int64_t sessions, purch, revenue, assisted; } CAgg;
+// Per thread and (campaign, day), randomly hit per session and per click, so kept small for L2: a count of
+// sessions or (session, campaign) pairs on one day is at most that day's sessions, so 32 bits hold it.
+typedef struct { uint32_t sessions, purch; int64_t revenue; } CAgg;
 static CAgg *cagg; // [NT][(ncamp+1)*NDAYS]
+static uint32_t *cassist; // [NT][(ncamp+1)*NDAYS] assisted sessions
 static uint32_t **stamp; static uint32_t *stampv;
 
 // Sorts n keys by their high 32 bits, using tmp as the other buffer; returns whichever of a and tmp holds the result.
@@ -1094,6 +1097,7 @@ static void sess_task(int tid, long q, void *ctx) {
   uint64_t tassist = 0;
   UVec *ur = &urows[tid];
   CAgg *ca = &cagg[(size_t)tid * (ncamp + 1) * NDAYS];
+  uint32_t *cas = &cassist[(size_t)tid * (ncamp + 1) * NDAYS];
   uint32_t *st = stamp[tid];
   int64_t catsum[32] = {0};
   uint32_t *sst = aalloc(S, nalive * 4); // per person: session start ts, day index, end of its day run
@@ -1173,7 +1177,7 @@ static void sess_task(int tid, long q, void *ctx) {
       jprev[cc] = jp;
       while (from < jp) {
         uint32_t to = drun[from] < jp ? drun[from] : jp;
-        ca[(size_t)cc * NDAYS + sdi[from]].assisted += to - from;
+        cas[(size_t)cc * NDAYS + sdi[from]] += to - from;
         from = to;
       }
     }
@@ -1389,12 +1393,15 @@ static void write_campaign(void) {
   size_t stride = (size_t)(ncamp + 1) * NDAYS;
   for (int c = 0; c <= ncamp; c++) {
     for (int d = 0; d < NDAYS; d++) {
-      CAgg a = {0, 0, 0, 0};
+      int64_t sessions = 0, purch = 0, revenue = 0, assisted = 0;
       for (int t = 0; t < NT; t++) {
-        CAgg *x = &cagg[(size_t)t * stride + (size_t)c * NDAYS + d];
-        a.sessions += x->sessions; a.purch += x->purch; a.revenue += x->revenue; a.assisted += x->assisted;
+        size_t i = (size_t)t * stride + (size_t)c * NDAYS + d;
+        sessions += cagg[i].sessions;
+        purch += cagg[i].purch;
+        revenue += cagg[i].revenue;
+        assisted += cassist[i];
       }
-      if (!a.sessions && !a.assisted) continue;
+      if (!sessions && !assisted) continue;
       const char *id = c == ncamp ? "organic" : camp_id[c];
       uint32_t idn = c == ncamp ? 7 : camp_idn[c];
       const char *ch = c == ncamp ? "organic" : chan[c];
@@ -1402,10 +1409,10 @@ static void write_campaign(void) {
       bu32(&co[0].data, idn); bput(&co[0].data, id, idn);
       bu32(&co[1].data, chn); bput(&co[1].data, ch, chn);
       int32_t day = (int32_t)(DAY0 + d); bput(&co[2].data, &day, 4);
-      bi64(&co[3].data, a.sessions);
-      bi64(&co[4].data, a.purch);
-      bi64(&co[5].data, a.revenue);
-      bi64(&co[6].data, c == ncamp ? 0 : a.assisted);
+      bi64(&co[3].data, sessions);
+      bi64(&co[4].data, purch);
+      bi64(&co[5].data, revenue);
+      bi64(&co[6].data, c == ncamp ? 0 : assisted);
       n++;
     }
   }
@@ -1614,6 +1621,7 @@ int main(void) {
   PH("dedup");
   urows = xcalloc(NT, sizeof(UVec));
   cagg = xcalloc((size_t)NT * (ncamp + 1) * NDAYS, sizeof(CAgg));
+  cassist = xcalloc((size_t)NT * (ncamp + 1) * NDAYS, sizeof(uint32_t));
   stamp = xmalloc(sizeof(uint32_t *) * NT);
   stampv = xcalloc(NT, sizeof(uint32_t));
   for (int t = 0; t < NT; t++) stamp[t] = xcalloc(ncamp + 1, sizeof(uint32_t));
