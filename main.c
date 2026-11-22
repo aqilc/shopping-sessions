@@ -60,7 +60,7 @@ static MFile map_file(const char *path) {
   f.n = (size_t)st.st_size;
   if (f.n) {
 #ifdef MAP_POPULATE
-    void *m = mmap(NULL, f.n, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0);
+    void *m = mmap(NULL, f.n, PROT_READ, MAP_PRIVATE, fd, 0);
 #else
     void *m = mmap(NULL, f.n, PROT_READ, MAP_PRIVATE, fd, 0);
 #endif
