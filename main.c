@@ -656,21 +656,40 @@ INL uint32_t lt_insert(uint64_t h, const char *p, uint32_t n) {
     i = (i + 1) & lmask_b;
   }
 }
+// Link lines go through a delay line too: prefetch both slots, insert LRING lines later.
+#define LRING 16
+typedef struct { uint64_t ha, hb; const char *pa, *pb; uint32_t na, nb; } LPend;
+typedef struct { LPend e[LRING]; uint32_t n; char pad[60]; } LRing;
+static LRing *lring; // [NT]
+INL void lk_emit(int tid, const LPend *p) {
+  uint32_t a = lt_insert(p->ha, p->pa, p->na);
+  uint32_t b = lt_insert(p->hb, p->pb, p->nb);
+  if (a == b) return;
+  EVec *v = &ledges[tid];
+  if (v->n == v->cap) { v->cap = v->cap ? v->cap * 2 : 4096; v->e = xrealloc(v->e, v->cap * sizeof(Edge)); }
+  v->e[v->n].a = a; v->e[v->n].b = b; v->n++;
+}
 static inline void lk_line(int tid, const char *ls, const char *const *sep, int ns, uint32_t nq) {
   if (ns != 2) return;
   const char *f[2]; uint32_t fl[2]; uint32_t nqf = 0;
   for (int k = 0; k < 2; k++) if (!field(ls, sep, k, &f[k], &fl[k], &nqf, nq)) return;
   if (nqf != nq) return;
   if (fl[0] == 0 || fl[1] == 0) return;
-  uint32_t a = lt_insert(hstr(f[0], fl[0]), f[0], fl[0]);
-  uint32_t b = lt_insert(hstr(f[1], fl[1]), f[1], fl[1]);
-  if (a == b) return;
-  EVec *v = &ledges[tid];
-  if (v->n == v->cap) { v->cap = v->cap ? v->cap * 2 : 4096; v->e = xrealloc(v->e, v->cap * sizeof(Edge)); }
-  v->e[v->n].a = a; v->e[v->n].b = b; v->n++;
+  uint64_t ha = hstr(f[0], fl[0]), hb = hstr(f[1], fl[1]);
+  __builtin_prefetch(&ltab[ha & lmask_b], 1); __builtin_prefetch(&ltab[hb & lmask_b], 1);
+  LRing *R = &lring[tid];
+  LPend *e = &R->e[R->n % LRING];
+  if (R->n >= LRING) lk_emit(tid, e);
+  e->ha = ha; e->hb = hb; e->pa = f[0]; e->pb = f[1]; e->na = fl[0]; e->nb = fl[1];
+  R->n++;
+}
+static void lring_flush(int tid) {
+  LRing *R = &lring[tid];
+  for (uint32_t i = R->n > LRING ? R->n - LRING : 0; i < R->n; i++) lk_emit(tid, &R->e[i % LRING]);
+  R->n = 0;
 }
 #define LKL(ls, sep, ns, nq) lk_line(tid, ls, sep, ns, nq)
-static void link_parse_task(int tid, long t, void *ctx) { (void)ctx; const Chunk *c = &lchunks[t]; TOKENIZE(c, LKL); }
+static void link_parse_task(int tid, long t, void *ctx) { (void)ctx; const Chunk *c = &lchunks[t]; TOKENIZE(c, LKL); lring_flush(tid); }
 
 INL uint32_t uf_find(uint32_t x) {
   for (;;) {
@@ -753,10 +772,11 @@ static void load_links(const char *dd) {
   // chunks
   Chunk *save = chunks; long sn = nchunks, sc = chcap;
   chunks = NULL; nchunks = 0; chcap = 0;
-  for (int i = 0; i < nf; i++) add_chunks(fs[i], 2, 1 << 20);
+  for (int i = 0; i < nf; i++) add_chunks(fs[i], 2, 1 << 18);
   lchunks = chunks; nlchunks = nchunks;
   chunks = save; nchunks = sn; chcap = sc;
   run_par(nlchunks, nl_task, NULL);
+  PH(" l.count");
   uint64_t lines = nf + nl_count;
   uint64_t est = 2 * lines + lines / 2 + 1024; // distinct IDs <= 2 * lines
   lcap = 1024; while (lcap < est) lcap <<= 1;
@@ -764,13 +784,19 @@ static void load_links(const char *dd) {
   ltab = hcalloc(lcap * sizeof(LEnt));
   lpar = hcalloc(lcap * 4); lbest = hcalloc(lcap * 4);
   ledges = xcalloc(NT, sizeof(EVec));
+  lring = xcalloc(NT, sizeof(LRing));
   long nspan = (long)((lcap + LSPAN - 1) / LSPAN);
   run_par(nspan, init_task, NULL);
+  PH(" l.init");
   run_par(nlchunks, link_parse_task, NULL);
+  PH(" l.parse");
   run_par(NT, uf_task, NULL);
+  PH(" l.uf");
   run_par(nspan, best_task, NULL);
+  PH(" l.best");
   lname = hcalloc(lcap * 8);
   run_par(nspan, name_task, NULL);
+  PH(" l.name");
   run_par(nspan, pkey_task, NULL);
   have_links = 1;
 }
