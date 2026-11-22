@@ -979,7 +979,12 @@ static void load_links(const char *dd) {
   if (nid == 0) { lmap = NULL; }
 }
 
+#include <time.h>
+static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
+static int PROF; static double T0;
+#define PH(name) do { if (PROF) fprintf(stderr, "%-10s %7.1f ms\n", name, (now_s() - T0) * 1e3); } while (0)
 int main(void) {
+  PROF = getenv("SESS_PROF") != NULL; T0 = now_s();
   const char *dd = getenv("DATA_DIR"); if (!dd) dd = "/data";
   const char *od = getenv("OUTPUT_DIR"); if (!od) od = "/output";
   OUTDIR = (char *)od;
@@ -997,6 +1002,7 @@ int main(void) {
   load_products(dd);
   load_campaigns(dd);
   load_links(dd);
+  PH("setup");
 
   char dir[4096];
   char **ep, **cp;
@@ -1004,20 +1010,25 @@ int main(void) {
   snprintf(dir, sizeof dir, "%s/clicks", dd); int ncl = list_csv(dir, &cp);
   for (int i = 0; i < ne; i++) add_chunks(map_file(ep[i]), 0);
   for (int i = 0; i < ncl; i++) add_chunks(map_file(cp[i]), 1);
+  PH("map");
   ebuf = xcalloc((size_t)NT * P1, sizeof(EVec));
   pbuf = xcalloc((size_t)NT * P2, sizeof(PVec));
   cbuf = xcalloc((size_t)NT * P2, sizeof(CVec));
   run_par((long)chunks.n, parse_task, NULL);
+  PH("parse");
   run_par(P1, dedup_task, NULL);
+  PH("dedup");
   urows = xcalloc(NT, sizeof(UVec));
   cagg = xcalloc((size_t)NT * (ncamp + 1) * NDAYS, sizeof(CAgg));
   stamp = xmalloc(sizeof(uint32_t *) * NT);
   stampv = xcalloc(NT, sizeof(uint32_t));
   for (int t = 0; t < NT; t++) stamp[t] = xcalloc(ncamp + 1, sizeof(uint32_t));
   run_par(P2, sess_task, NULL);
+  PH("sess");
   snprintf(dir, sizeof dir, "%s/user_daily", od); if (mkdir(dir, 0777) && errno != EEXIST) die(dir);
   snprintf(dir, sizeof dir, "%s/campaign_daily", od); if (mkdir(dir, 0777) && errno != EEXIST) die(dir);
   run_par(NT, write_user_task, NULL);
   write_campaign();
+  PH("write");
   _exit(0);
 }
