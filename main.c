@@ -913,16 +913,19 @@ static Chunk *lchunks; static long nlchunks;
 // into its own table region (L2-sized, no atomics) and writes the dense ids into the edges.
 typedef struct { uint64_t h, ref, pre; uint32_t tid, pos; } LRec; // pos: edge index * 2 + side
 #define LBLK 256
-typedef struct LBlk { struct LBlk *next; uint32_t n; LRec r[LBLK]; } LBlk;
+typedef struct LBlk { struct LBlk *next; uint32_t n; char pad[52]; LRec r[LBLK]; } LBlk; // a cache-line header
 typedef struct { LBlk *head; uint32_t n; } LBkt;
 static LBkt *lbkt; // [NT][LP]
 static uint32_t LPB, LP;
 static uint32_t *lbase; // [LP] first dense id of each bucket
+static LBlk *lpool; static _Atomic uint64_t lpool_n; static uint64_t lpool_cap; // bucket blocks, one huge-page mapping
 INL void lrec_put(int tid, uint64_t h, const char *p, uint32_t n, uint32_t pos) {
   LBkt *b = &lbkt[(size_t)tid * LP + (LPB ? h >> (64 - LPB) : 0)];
   LBlk *k = b->head;
   if (UNLIKELY(!k || k->n == LBLK)) {
-    k = xmalloc(sizeof(LBlk));
+    uint64_t q = atomic_fetch_add_explicit(&lpool_n, 1, memory_order_relaxed);
+    if (UNLIKELY(q >= lpool_cap)) die("links: block pool full");
+    k = &lpool[q];
     k->next = b->head; k->n = 0;
     b->head = k;
   }
@@ -954,7 +957,7 @@ static void link_insert_task(int tid, long p, void *ctx) {
   lval[lo] = 0;
   uint32_t id = lbase[p];
   for (int t = 0; t < NT; t++) {
-    for (LBlk *k = lbkt[(size_t)t * LP + p].head; k;) {
+    for (LBlk *k = lbkt[(size_t)t * LP + p].head; k; k = k->next) {
       for (uint32_t j = 0; j < k->n; j++) {
         const LRec *r = &k->r[j];
         uint64_t i = lhome(r->h);
@@ -975,9 +978,6 @@ static void link_insert_task(int tid, long p, void *ctx) {
         Edge *e = &ledges[r->tid].e[r->pos >> 1];
         if (r->pos & 1) e->b = d; else e->a = d;
       }
-      LBlk *nx = k->next;
-      free(k);
-      k = nx;
     }
   }
 }
@@ -1037,6 +1037,9 @@ static void load_links(const char *dd) {
   LPB = 0; while (LPB < 20 && (bytes >> (17 + LPB))) LPB++;
   LP = 1u << LPB;
   lbkt = xcalloc((size_t)NT * LP, sizeof(LBkt));
+  // a line is >= 4 bytes ("a,b\n") with two IDs, plus a part-full block per bucket
+  lpool_cap = bytes / 2 / LBLK + 1 + (uint64_t)NT * LP;
+  lpool = hcalloc(lpool_cap * sizeof(LBlk)); // NORESERVE: only the blocks used are mapped
   ledges = xcalloc(NT, sizeof(EVec));
   run_par(nlchunks, link_parse_task, NULL);
   PH(" l.parse");
