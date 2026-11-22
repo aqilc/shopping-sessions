@@ -563,11 +563,26 @@ static uint32_t PB, QB; static uint32_t NPART, NQART; // eid partitions 2^PB, pe
 // ---------- linked IDs ----------
 // Link ID table, open addressing on the ID hash in 2^LRB-slot regions (a region per hash partition, probes wrap
 // inside it): lkey[slot] = hash, lval[slot] = the ID's dense id (from 1) while links load, its root's after.
-// The dense arrays (by id): string ref, union-find parent, best (name) id, and lname[root] = name ref.
+// The dense arrays (by id): string ref, its first 8 bytes as a big-endian number, and union-find parent. A root is its set's smallest ID, the person's name.
 static uint64_t *lkey; static uint32_t *lval;
-static uint64_t *lref; static _Atomic uint32_t *lpar; static _Atomic uint32_t *lbest; static uint64_t *lname;
-static uint64_t lcap; static uint32_t lshift, lrmask; static uint32_t lnid; // ids < lnid
+static uint64_t *lref, *lpre; static _Atomic uint32_t *lpar;
+static uint64_t lcap; static uint32_t lshift, lrmask;
 static int have_links;
+// lbits: 2^LFB bits per slot, indexed by the top hash bits (the home slot, then LFB more), set for every ID in the
+// table. A clear bit means unlinked, and the map is 16x smaller than lkey alone, so most unlinked IDs are settled
+// from cache without the two table lines.
+#ifndef LFB
+#define LFB 2
+#endif
+static uint64_t *lbits;
+INL uint64_t lbit(uint64_t h) { return h >> (lshift - LFB); }
+INL uint32_t lmaybe(uint64_t h) { return (uint32_t)(lbits[lbit(h) >> 6] >> (lbit(h) & 63)) & 1; }
+// Prefetches the table lines of home slot i when lk is set (else slot 0's, one line that stays hot); no branch.
+INL void lprefetch(uint64_t i, uint32_t lk) {
+  i &= -(uint64_t)lk;
+  __builtin_prefetch(&lkey[i]);
+  __builtin_prefetch(&lval[i]);
+}
 
 #define LINKED (1ull << 63)
 INL uint32_t qpart(uint64_t pkey) { return (uint32_t)((pkey >> 40) & (NQART - 1)); }
@@ -733,9 +748,13 @@ INL int field(const char *ls, const char *const *sep, int k, const char **fp, ui
 }
 
 // Delay line: person lookups miss cache, so each is resolved RING lines after its prefetch.
-#define RING 32
-typedef struct { uint64_t uh, uref, eh; uint32_t ts, x, ingest; } EPend;
-typedef struct { uint64_t uh, cref; uint32_t ts, camp; } CPend;
+// 8 lines are ~1 us of parse per thread, several memory round trips, and short enough that the prefetched line is
+// still in L1 when it is read.
+#ifndef RING
+#define RING 8
+#endif
+typedef struct { uint64_t uh, uref, eh; uint32_t ts, x, ingest, lk; } EPend; // lk: the ID may be in the link table
+typedef struct { uint64_t uh, cref; uint32_t ts, camp, lk; } CPend;
 typedef struct { EPend e[RING]; CPend c[RING]; uint32_t ne, nc; char pad[56]; } Pend;
 static Pend *pend; // [NT]
 static Arena *strs; // [NT] ID strings the records refer to, copied out of the read buffer
@@ -751,16 +770,16 @@ INL uint64_t keep_str(int tid, uint64_t r) {
   return mkref(d, n);
 }
 INL void ev_emit(int tid, const EPend *p) {
-  uint64_t pk = person_of(p->uh);
+  uint64_t pk = p->lk ? person_of(p->uh) : p->uh & ~LINKED;
   size_t bi = (size_t)tid * NQART + qpart(pk);
-  PRec r = {pk, pk & LINKED ? 0 : keep_str(tid, p->uref), p->ts, p->x}; // a linked person's name is lname's
+  PRec r = {pk, pk & LINKED ? 0 : keep_str(tid, p->uref), p->ts, p->x}; // a linked person's name is its root's lref
   char *d = rec_put(&arenas[tid], &pb[bi], pst + bi * (ST * sizeof(PRec)), &r, sizeof(PRec), pcap0);
   KRec k = {p->eh, p->ingest, (uint32_t)((d - arenas[tid].base) >> 3)};
   size_t ki = (size_t)tid * NPART + (p->eh >> (64 - PB));
   rec_put(&arenas[tid], &kb[ki], kst + ki * (ST * sizeof(KRec)), &k, sizeof(KRec), kcap0);
 }
 INL void cl_emit(int tid, const CPend *p) {
-  uint64_t pk = person_of(p->uh);
+  uint64_t pk = p->lk ? person_of(p->uh) : p->uh & ~LINKED;
   size_t bi = (size_t)tid * NQART + qpart(pk);
   CRec r = {pk, keep_str(tid, p->cref), p->ts, p->camp};
   rec_put(&arenas[tid], &cb[bi], cst + bi * (ST * sizeof(CRec)), &r, sizeof(CRec), ccap0);
@@ -782,9 +801,10 @@ static inline void ev_line(int tid, const char *ls, const char *const *sep, int 
   if (fl[0] == 0) return;
   uint64_t eh = hstr(f[0], fl[0]);
   uint64_t uh = 0;
+  uint32_t lk = 0;
   if (fl[1]) {
     uh = hstr(f[1], fl[1]);
-    if (have_links) { __builtin_prefetch(&lkey[lhome(uh)]); __builtin_prefetch(&lval[lhome(uh)]); }
+    if (have_links) { lk = lmaybe(uh); lprefetch(lhome(uh), lk); }
   }
   int64_t is, ing;
   if (LIKELY(fl[3] == 20)) {
@@ -823,7 +843,7 @@ static inline void ev_line(int tid, const char *ls, const char *const *sep, int 
   Pend *P = &pend[tid];
   EPend *e = &P->e[P->ne % RING];
   if (P->ne >= RING) ev_emit(tid, e);
-  e->uh = uh; e->uref = mkref(f[1], fl[1]); e->eh = eh; e->ts = (uint32_t)(ts - CWS); e->x = x; e->ingest = (uint32_t)is;
+  e->uh = uh; e->uref = mkref(f[1], fl[1]); e->eh = eh; e->ts = (uint32_t)(ts - CWS); e->x = x; e->ingest = (uint32_t)is; e->lk = lk;
   P->ne++;
 }
 
@@ -834,7 +854,8 @@ static inline void cl_line(int tid, const char *ls, const char *const *sep, int 
   if (nqf != nq) return;
   if (fl[0] == 0 || fl[1] == 0) return;
   uint64_t uh = hstr(f[1], fl[1]);
-  if (have_links) { __builtin_prefetch(&lkey[lhome(uh)]); __builtin_prefetch(&lval[lhome(uh)]); }
+  uint32_t lk = 0;
+  if (have_links) { lk = lmaybe(uh); lprefetch(lhome(uh), lk); }
   int64_t ts = parse_ts(f[3], fl[3]);
   if (ts == BADTS || ts < CWS || ts >= WE) return;
   int32_t c = smap_get(&campmap, f[2], fl[2]);
@@ -842,7 +863,7 @@ static inline void cl_line(int tid, const char *ls, const char *const *sep, int 
   Pend *P = &pend[tid];
   CPend *e = &P->c[P->nc % RING];
   if (P->nc >= RING) cl_emit(tid, e);
-  e->uh = uh; e->cref = mkref(f[0], fl[0]); e->ts = (uint32_t)(ts - CWS); e->camp = (uint32_t)c;
+  e->uh = uh; e->cref = mkref(f[0], fl[0]); e->ts = (uint32_t)(ts - CWS); e->camp = (uint32_t)c; e->lk = lk;
   P->nc++;
 }
 
@@ -911,23 +932,29 @@ static Chunk *lchunks; static long nlchunks;
 
 // The parse writes each ID occurrence to a bucket by the top LPB hash bits; a task per bucket then inserts its IDs
 // into its own table region (L2-sized, no atomics) and writes the dense ids into the edges.
-typedef struct { uint64_t h, ref; uint32_t tid, pos; } LRec; // pos: edge index * 2 + side
+typedef struct { uint64_t h, ref, pre; uint32_t tid, pos; } LRec; // pos: edge index * 2 + side
 #define LBLK 256
-typedef struct LBlk { struct LBlk *next; uint32_t n; LRec r[LBLK]; } LBlk;
+typedef struct LBlk { struct LBlk *next; uint32_t n; char pad[52]; LRec r[LBLK]; } LBlk; // a cache-line header
 typedef struct { LBlk *head; uint32_t n; } LBkt;
 static LBkt *lbkt; // [NT][LP]
 static uint32_t LPB, LP;
 static uint32_t *lbase; // [LP] first dense id of each bucket
+static LBlk *lpool; static _Atomic uint64_t lpool_n; static uint64_t lpool_cap; // bucket blocks, one huge-page mapping
 INL void lrec_put(int tid, uint64_t h, const char *p, uint32_t n, uint32_t pos) {
   LBkt *b = &lbkt[(size_t)tid * LP + (LPB ? h >> (64 - LPB) : 0)];
   LBlk *k = b->head;
   if (UNLIKELY(!k || k->n == LBLK)) {
-    k = xmalloc(sizeof(LBlk));
+    uint64_t q = atomic_fetch_add_explicit(&lpool_n, 1, memory_order_relaxed);
+    if (UNLIKELY(q >= lpool_cap)) die("links: block pool full");
+    k = &lpool[q];
     k->next = b->head; k->n = 0;
     b->head = k;
   }
   LRec *r = &k->r[k->n++];
-  r->h = h; r->ref = mkref(p, n); r->tid = (uint32_t)tid; r->pos = pos;
+  uint64_t w;
+  memcpy(&w, p, 8); // the read buffer has PAD readable bytes past every line
+  if (n < 8) w &= (1ull << (8 * n)) - 1;
+  r->h = h; r->ref = mkref(p, n); r->pre = __builtin_bswap64(w); r->tid = (uint32_t)tid; r->pos = pos;
   b->n++;
 }
 static inline void lk_line(int tid, const char *ls, const char *const *sep, int ns, uint32_t nq) {
@@ -951,7 +978,7 @@ static void link_insert_task(int tid, long p, void *ctx) {
   lval[lo] = 0;
   uint32_t id = lbase[p];
   for (int t = 0; t < NT; t++) {
-    for (LBlk *k = lbkt[(size_t)t * LP + p].head; k;) {
+    for (LBlk *k = lbkt[(size_t)t * LP + p].head; k; k = k->next) {
       for (uint32_t j = 0; j < k->n; j++) {
         const LRec *r = &k->r[j];
         uint64_t i = lhome(r->h);
@@ -962,9 +989,10 @@ static void link_insert_task(int tid, long p, void *ctx) {
           if (!key) {
             d = id++;
             lkey[i] = r->h; lval[i] = d;
+            lbits[lbit(r->h) >> 6] |= 1ull << (lbit(r->h) & 63);
             lref[d] = r->ref;
+            lpre[d] = r->pre;
             atomic_store_explicit(&lpar[d], d, memory_order_relaxed);
-            atomic_store_explicit(&lbest[d], 0, memory_order_relaxed);
             break;
           }
           i = lnext_slot(i);
@@ -972,9 +1000,6 @@ static void link_insert_task(int tid, long p, void *ctx) {
         Edge *e = &ledges[r->tid].e[r->pos >> 1];
         if (r->pos & 1) e->b = d; else e->a = d;
       }
-      LBlk *nx = k->next;
-      free(k);
-      k = nx;
     }
   }
 }
@@ -992,45 +1017,30 @@ static void uf_task(int tid, long t, void *ctx) {
   (void)tid; (void)ctx;
   EVec *v = &ledges[t];
   for (size_t i = 0; i < v->n; i++) {
+    if (i + 16 < v->n) {
+      __builtin_prefetch(&lpar[v->e[i + 16].a]); __builtin_prefetch(&lpar[v->e[i + 16].b]);
+      __builtin_prefetch(&lpre[v->e[i + 16].a]); __builtin_prefetch(&lpre[v->e[i + 16].b]);
+    }
     uint32_t a = v->e[i].a, b = v->e[i].b;
     for (;;) {
       a = uf_find(a); b = uf_find(b);
       if (a == b) break;
-      if (a < b) { uint32_t s = a; a = b; b = s; } // link larger root under smaller
+      // link the root with the larger string under the smaller (ids break ties: equal hashes are one id)
+      uint64_t pa = lpre[a], pb = lpre[b];
+      int c = pa != pb ? (pa < pb ? -1 : 1) : str_cmp(refp(lref[a]), refn(lref[a]), refp(lref[b]), refn(lref[b]));
+      if (c < 0 || (c == 0 && a < b)) { uint32_t s = a; a = b; b = s; }
       uint32_t exp = a;
       if (atomic_compare_exchange_strong(&lpar[a], &exp, b)) break;
     }
   }
 }
 #define LSPAN 65536
-static void best_task(int tid, long t, void *ctx) { // lbest[root] = the id with the smallest string
-  (void)tid; (void)ctx;
-  uint32_t lo = (uint32_t)t * LSPAN, hi = lo + LSPAN;
-  if (lo == 0) lo = 1;
-  if (hi > lnid) hi = lnid;
-  for (uint32_t i = lo; i < hi; i++) {
-    uint64_t me = lref[i];
-    if (!me) continue; // a bucket's ids past its distinct IDs
-    uint32_t r = uf_find(i);
-    uint32_t cur = atomic_load(&lbest[r]);
-    for (;;) {
-      if (cur) {
-        uint64_t o = lref[cur];
-        if (str_cmp(refp(me), refn(me), refp(o), refn(o)) >= 0) break;
-      }
-      if (atomic_compare_exchange_weak(&lbest[r], &cur, i)) break;
-    }
-  }
-}
-static void pkey_task(int tid, long t, void *ctx) { // lval: id -> root id; lname[root] = its best id's string
+static void pkey_task(int tid, long t, void *ctx) { // lval: id -> root id
   (void)tid; (void)ctx;
   uint64_t lo = (uint64_t)t * LSPAN, hi = lo + LSPAN; if (hi > lcap) hi = lcap;
   for (uint64_t i = lo; i < hi; i++) {
     if (!lkey[i]) continue;
-    uint32_t id = lval[i];
-    uint32_t r = uf_find(id);
-    lval[i] = r;
-    if (r == id) lname[r] = lref[atomic_load_explicit(&lbest[r], memory_order_relaxed)];
+    lval[i] = uf_find(lval[i]);
   }
 }
 static void load_links(const char *dd) {
@@ -1049,6 +1059,9 @@ static void load_links(const char *dd) {
   LPB = 0; while (LPB < 20 && (bytes >> (17 + LPB))) LPB++;
   LP = 1u << LPB;
   lbkt = xcalloc((size_t)NT * LP, sizeof(LBkt));
+  // a line is >= 4 bytes ("a,b\n") with two IDs, plus a part-full block per bucket
+  lpool_cap = bytes / 2 / LBLK + 1 + (uint64_t)NT * LP;
+  lpool = hcalloc(lpool_cap * sizeof(LBlk)); // NORESERVE: only the blocks used are mapped
   ledges = xcalloc(NT, sizeof(EVec));
   run_par(nlchunks, link_parse_task, NULL);
   PH(" l.parse");
@@ -1063,20 +1076,19 @@ static void load_links(const char *dd) {
     if (n > most) most = n;
   }
   if (nid >= (1ull << 31)) die("links: too many IDs");
-  lnid = (uint32_t)nid;
   uint32_t lrb = 4; while ((1ull << lrb) < most + most / 10 + 1) lrb++;
   lrmask = (1u << lrb) - 1;
   lcap = (uint64_t)LP << lrb;
   lshift = 64 - LPB - lrb;
   lkey = hcalloc(lcap * 8); lval = hcalloc(lcap * 4);
-  lref = hcalloc(nid * 8); lpar = hcalloc(nid * 4); lbest = hcalloc(nid * 4); lname = hcalloc(nid * 8);
+  lbits = hcalloc((lcap << LFB) / 8 + 8); // a region's bits are whole words (>= 16 slots), so insert tasks never share one
+  lref = hcalloc(nid * 8); lpre = hcalloc(nid * 8); lpar = hcalloc(nid * 4);
   run_par(LP, link_insert_task, NULL);
   PH(" l.insert");
   run_par(NT, uf_task, NULL);
   PH(" l.uf");
-  run_par((long)((lnid + LSPAN - 1) / LSPAN), best_task, NULL);
-  PH(" l.best");
   run_par((long)((lcap + LSPAN - 1) / LSPAN), pkey_task, NULL);
+  if (PROF) fprintf(stderr, " l.slots %llu ids %llu\n", (unsigned long long)lcap, (unsigned long long)nid);
   have_links = 1;
 }
 
@@ -1330,7 +1342,7 @@ static void sess_task(int tid, long q, void *ctx) {
           }
           pt.key[i] = pk; pt.id[i] = np;
           pkeys[np] = pk;
-          names[np] = pk & LINKED ? lname[(uint32_t)pk] : r[j].uref;
+          names[np] = pk & LINKED ? lref[(uint32_t)pk] : r[j].uref;
           np++;
           eoff[np] = 0;
         }
@@ -1963,6 +1975,42 @@ static void release_task(int tid, long t, void *ctx) {
   madvise(scratch[t].base, 1ull << 30, MADV_DONTNEED);
 }
 
+// Fresh arena pages cost a fault and a kernel zeroing pass each (2 MB at a time on huge pages, which also flushes
+// the faulting core's L2). Helper threads touch the expected arena use while products, campaigns and links load,
+// so the parse writes into mapped memory. -DPREFAULT=0 leaves the faults to the parse.
+#ifndef PREFAULT
+#define PREFAULT 1
+#endif
+#define PF_SPAN (4u << 20)
+typedef struct { char *p; size_t n; } PfSpan;
+static PfSpan *pfs; static long npfs; static atomic_long pf_next;
+static void pf_add(char *p, size_t n) {
+  pfs = xrealloc(pfs, sizeof(PfSpan) * (size_t)(npfs + (long)(n / PF_SPAN) + 1));
+  for (size_t o = 0; o < n; o += PF_SPAN) { PfSpan s = {p + o, n - o < PF_SPAN ? n - o : PF_SPAN}; pfs[npfs++] = s; }
+}
+static void *pf_main(void *a) {
+  (void)a;
+  for (;;) {
+    long i = atomic_fetch_add_explicit(&pf_next, 1, memory_order_relaxed);
+    if (i >= npfs) return NULL;
+    for (size_t o = 0; o < pfs[i].n; o += 4096) pfs[i].p[o] = 0; // nothing is stored here before the helpers are joined
+  }
+}
+// Lines in a file of n bytes, from the newline density of a 64 KB sample at its middle.
+static uint64_t est_lines(const char *path, size_t n) {
+  enum { SAMPLE = 64 << 10 };
+  static char buf[SAMPLE];
+  size_t len = n < SAMPLE ? n : SAMPLE;
+  if (!len) return 0;
+  int fd = open(path, O_RDONLY);
+  if (fd < 0) die(path);
+  read_at(fd, buf, len, (n - len) / 2);
+  close(fd);
+  uint64_t nl = 1;
+  for (size_t i = 0; i < len; i++) nl += buf[i] == '\n';
+  return (uint64_t)((double)n * (double)nl / (double)len);
+}
+
 int main(void) {
   PROF = getenv("SESS_PROF") != NULL; T0 = now_s();
   const char *dd = getenv("DATA_DIR"); if (!dd) dd = "/data";
@@ -1979,12 +2027,6 @@ int main(void) {
   CWS = WS - 604800000LL;
   DAY0 = WS / 86400000LL; if (WS < 0 && WS % 86400000LL) DAY0--;
   NDAYS = (int32_t)((WE - 1) / 86400000LL - DAY0 + 1);
-  load_products(dd);
-  load_campaigns(dd);
-  PH("small");
-  load_links(dd);
-  PH("links");
-
   char dir[4096];
   char **ep, **cp;
   snprintf(dir, sizeof dir, "%s/events", dd); int ne = list_csv(dir, &ep);
@@ -2016,6 +2058,32 @@ int main(void) {
     rbufs[t].buf = aligned_alloc(64, (IN_CHUNK + IN_MARGIN + PAD + 127) & ~63u); // the span starts a byte early
     if (!rbufs[t].buf) die("oom");
   }
+  pthread_t pft[64];
+  if (PREFAULT) {
+    size_t emax = 0, cmax = 0;
+    for (int i = 1; i < ne; i++) if (ef[i] > ef[emax]) emax = (size_t)i;
+    for (int i = 1; i < ncl; i++) if (cf[i] > cf[cmax]) cmax = (size_t)i;
+    uint64_t el = ne ? (uint64_t)((double)est_lines(ep[emax], ef[emax]) * (double)ebytes / (double)(ef[emax] + 1)) : 0;
+    uint64_t cl = ncl ? (uint64_t)((double)est_lines(cp[cmax], cf[cmax]) * (double)cbytes / (double)(cf[cmax] + 1)) : 0;
+    // A thread's share: 12% over the records for block tails and uneven task counts (gen20: threads end within 3% of
+    // it), and ~6.5 B of copied ID per line (gen20, big20, dev).
+    size_t rec = (size_t)((double)(el * (sizeof(PRec) + sizeof(KRec)) + cl * sizeof(CRec)) * 1.12 / NT);
+    size_t str = (size_t)((el + cl) * 13 / 2 / (uint64_t)NT);
+    if (rec > ARENA_SZ) rec = ARENA_SZ;
+    if (str > ebytes + cbytes) str = ebytes + cbytes;
+    for (int t = 0; t < NT; t++) { pf_add(arenas[t].base, rec); pf_add(strs[t].base, str); }
+    for (int i = 1; i < NT; i++) pthread_create(&pft[i], NULL, pf_main, NULL);
+  }
+  load_products(dd);
+  load_campaigns(dd);
+  PH("small");
+  load_links(dd);
+  PH("links");
+  if (PREFAULT) {
+    pf_main(NULL);
+    for (int i = 1; i < NT; i++) pthread_join(pft[i], NULL);
+  }
+  PH("prefault");
   pend = xcalloc(NT, sizeof(Pend));
   kb = xcalloc((size_t)NT * NPART, sizeof(Bkt));
   pb = xcalloc((size_t)NT * NQART, sizeof(Bkt));
