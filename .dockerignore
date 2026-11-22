@@ -1,4 +1,2 @@
 *
-!main.c
-!diag.c
-!gen
+!*.c
