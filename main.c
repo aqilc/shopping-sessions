@@ -946,12 +946,14 @@ typedef struct { EPend e[RING]; CPend c[RING]; uint32_t ne, nc; char pad[56]; } 
 static Pend *pend; // [NT]
 static Arena *strs; // [NT] ID strings the records refer to, copied out of the read buffer
 // Copies the string ref r points at (in the read buffer, which has PAD readable bytes past every line) to strs.
+// No bounds check: a thread copies less than the bytes of the lines it parses, and its arena holds every input
+// byte plus the 48 a fixed-size copy writes.
 INL uint64_t keep_str(int tid, uint64_t r) {
   Arena *a = &strs[tid];
   uint32_t n = refn(r);
   char *d = a->cur;
-  if (UNLIKELY(d + n + 16 > a->end)) die("strings full");
   if (LIKELY(n <= 16)) memcpy(d, refp(r), 16);
+  else if (LIKELY(n <= 48)) memcpy(d, refp(r), 48);
   else memcpy(d, refp(r), n);
   a->cur = d + n;
   return mkref(d, n);
