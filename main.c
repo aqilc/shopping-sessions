@@ -1,4 +1,7 @@
-// Shopping Sessions engine: one static binary, no deps.
+// Shopping Sessions engine v3: one static binary, no deps.
+// Pipeline: links (parallel union-find) -> parse events+clicks (SIMD tokenizer,
+// person resolved at parse) -> dedup by event-id partition (marks dead payloads)
+// -> sessionize by person partition -> per-thread Parquet.
 #define _GNU_SOURCE
 #include <dirent.h>
 #include <errno.h>
@@ -12,45 +15,65 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
+#if defined(__x86_64__)
+#include <immintrin.h>
+#elif defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 #define LIKELY(x) __builtin_expect(!!(x), 1)
 #define UNLIKELY(x) __builtin_expect(!!(x), 0)
+#define INL static inline __attribute__((always_inline))
 
 static void die(const char *m) { fprintf(stderr, "fatal: %s (%s)\n", m, strerror(errno)); _exit(2); }
 static void *xmalloc(size_t n) { void *p = malloc(n ? n : 1); if (!p) die("oom"); return p; }
 static void *xcalloc(size_t a, size_t b) { void *p = calloc(a ? a : 1, b ? b : 1); if (!p) die("oom"); return p; }
 static void *xrealloc(void *p, size_t n) { p = realloc(p, n ? n : 1); if (!p) die("oom"); return p; }
 
+static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
+static int PROF; static double T0;
+#define PH(name) do { if (PROF) fprintf(stderr, "%-10s %7.1f ms\n", name, (now_s() - T0) * 1e3); } while (0)
+
 // ---------- hashing / strings ----------
-static inline uint64_t hstr(const char *p, uint32_t n) {
-  uint64_t h = 0x9E3779B97F4A7C15ull ^ ((uint64_t)n * 0x2545F4914F6CDD1Dull);
-  while (n >= 8) {
-    uint64_t w; memcpy(&w, p, 8);
-    h = (h ^ w) * 0xbf58476d1ce4e5b9ull; h ^= h >> 31;
-    p += 8; n -= 8;
+INL uint64_t ld8(const char *p) { uint64_t w; memcpy(&w, p, 8); return w; }
+INL uint64_t mum(uint64_t a, uint64_t b) { __uint128_t r = (__uint128_t)a * b; return (uint64_t)r ^ (uint64_t)(r >> 64); }
+#define HS0 0xa0761d6478bd642full
+#define HS1 0xe7037ed1a0b428dbull
+#define HS2 0x8ebc6af09c88c6e3ull
+#define HS3 0x589965cc75374cc3ull
+// Reads up to 7 bytes past p+n: every buffer we hash is padded.
+INL uint64_t hstr(const char *p, uint32_t n) {
+  uint64_t a, b;
+  if (LIKELY(n <= 16)) {
+    if (n >= 8) { a = ld8(p); b = ld8(p + n - 8); }
+    else { a = n ? ld8(p) & (~0ull >> (64 - 8 * n)) : 0; b = 0; }
+    uint64_t h = mum(a ^ HS1, b ^ HS0 ^ n);
+    return mum(h ^ HS2, (uint64_t)n ^ HS3) | 1;
   }
-  if (n) {
-    uint64_t w = 0; memcpy(&w, p, n);
-    h = (h ^ w) * 0x94d049bb133111ebull; h ^= h >> 29;
-  }
-  h *= 0xff51afd7ed558ccdull; h ^= h >> 32;
-  h *= 0xc4ceb9fe1a85ec53ull; h ^= h >> 29;
-  return h;
+  uint64_t h = HS0 ^ n;
+  while (n > 16) { h = mum(ld8(p) ^ HS1, ld8(p + 8) ^ h); p += 16; n -= 16; }
+  a = ld8(p + n - 16 + 0); b = ld8(p + n - 8);
+  h = mum(a ^ HS2, b ^ h);
+  return mum(h ^ HS3, HS1) | 1;
 }
-static inline int str_eq(const char *a, uint32_t an, const char *b, uint32_t bn) {
-  return an == bn && memcmp(a, b, an) == 0;
-}
+INL int str_eq(const char *a, uint32_t an, const char *b, uint32_t bn) { return an == bn && memcmp(a, b, an) == 0; }
 static inline int str_cmp(const char *a, uint32_t an, const char *b, uint32_t bn) {
   uint32_t m = an < bn ? an : bn;
   int c = memcmp(a, b, m);
   if (c) return c;
   return an < bn ? -1 : (an > bn ? 1 : 0);
 }
+// string ref: 48-bit pointer | len << 48
+INL uint64_t mkref(const char *p, uint32_t n) { return (uint64_t)(uintptr_t)p | ((uint64_t)n << 48); }
+INL const char *refp(uint64_t r) { return (const char *)(uintptr_t)(r & 0xFFFFFFFFFFFFull); }
+INL uint32_t refn(uint64_t r) { return (uint32_t)(r >> 48); }
 
 // ---------- files ----------
 typedef struct { const char *p; size_t n; } MFile;
-
+#define PAD 4096
+// Map a file with at least PAD readable zero bytes after its end.
 static MFile map_file(const char *path) {
   MFile f = {0, 0};
   int fd = open(path, O_RDONLY);
@@ -58,15 +81,15 @@ static MFile map_file(const char *path) {
   struct stat st;
   if (fstat(fd, &st) < 0) die("fstat");
   f.n = (size_t)st.st_size;
+  size_t pg = 4096;
+  size_t span = ((f.n + pg - 1) / pg) * pg + PAD;
+  char *r = mmap(NULL, span, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (r == MAP_FAILED) die("mmap reserve");
   if (f.n) {
-#ifdef MAP_POPULATE
-    void *m = mmap(NULL, f.n, PROT_READ, MAP_PRIVATE, fd, 0);
-#else
-    void *m = mmap(NULL, f.n, PROT_READ, MAP_PRIVATE, fd, 0);
-#endif
+    void *m = mmap(r, f.n, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0);
     if (m == MAP_FAILED) die("mmap");
-    f.p = (const char *)m;
   }
+  f.p = r;
   close(fd);
   return f;
 }
@@ -82,8 +105,10 @@ static int list_csv(const char *dir, char ***out) {
       if (l < 4 || strcmp(e->d_name + l - 4, ".csv") != 0) continue;
       char *path = xmalloc(strlen(dir) + l + 2);
       sprintf(path, "%s/%s", dir, e->d_name);
-      struct stat st;
-      if (stat(path, &st) < 0 || !S_ISREG(st.st_mode)) { free(path); continue; }
+      if (e->d_type != DT_REG) {
+        struct stat st;
+        if (stat(path, &st) < 0 || !S_ISREG(st.st_mode)) { free(path); continue; }
+      }
       if (n == cap) { cap *= 2; v = xrealloc(v, sizeof(char *) * cap); }
       v[n++] = path;
     }
@@ -93,32 +118,35 @@ static int list_csv(const char *dir, char ***out) {
   return n;
 }
 
-// ---------- CSV ----------
-// Split line [p, p+n) into exactly nf fields, unquoting. Returns 1 if well formed.
-static inline int split_fields(const char *p, size_t n, int nf, const char **fp, uint32_t *fn) {
-  if (n == 0) return 0;
-  const char *end = p + n;
-  int k = 0;
-  const char *s = p;
-  for (;;) {
-    const char *c = memchr(s, ',', (size_t)(end - s));
-    const char *fe = c ? c : end;
-    if (k >= nf) return 0;
-    size_t l = (size_t)(fe - s);
-    if (l && s[0] == '"') {
-      if (l < 2 || s[l - 1] != '"') return 0;
-      if (l > 2 && memchr(s + 1, '"', l - 2)) return 0;
-      fp[k] = s + 1; fn[k] = (uint32_t)(l - 2);
-    } else {
-      if (l && memchr(s, '"', l)) return 0;
-      fp[k] = s; fn[k] = (uint32_t)l;
-    }
-    k++;
-    if (!c) break;
-    s = c + 1;
-  }
-  return k == nf;
+// ---------- SIMD masks over 64 bytes ----------
+#if defined(__AVX2__)
+typedef struct { __m256i a, b; } Blk64;
+INL Blk64 blk_load(const char *p) { Blk64 x = {_mm256_loadu_si256((const __m256i *)p), _mm256_loadu_si256((const __m256i *)(p + 32))}; return x; }
+INL uint64_t blk_eq(Blk64 x, char c) {
+  __m256i v = _mm256_set1_epi8(c);
+  uint32_t lo = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x.a, v));
+  uint32_t hi = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x.b, v));
+  return (uint64_t)lo | ((uint64_t)hi << 32);
 }
+#elif defined(__aarch64__)
+typedef struct { uint8x16_t v[4]; } Blk64;
+INL Blk64 blk_load(const char *p) { Blk64 x; for (int i = 0; i < 4; i++) x.v[i] = vld1q_u8((const uint8_t *)p + 16 * i); return x; }
+INL uint64_t nmask(uint8x16_t m) { // 16 lanes of 0xFF/0 -> 16 bits
+  static const uint8_t bits[16] = {1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
+  uint8x16_t b = vandq_u8(m, vld1q_u8(bits));
+  uint8x8_t lo = vget_low_u8(b), hi = vget_high_u8(b);
+  return (uint64_t)vaddv_u8(lo) | ((uint64_t)vaddv_u8(hi) << 8);
+}
+INL uint64_t blk_eq(Blk64 x, char c) {
+  uint8x16_t v = vdupq_n_u8((uint8_t)c);
+  return nmask(vceqq_u8(x.v[0], v)) | (nmask(vceqq_u8(x.v[1], v)) << 16) | (nmask(vceqq_u8(x.v[2], v)) << 32) |
+         (nmask(vceqq_u8(x.v[3], v)) << 48);
+}
+#else
+typedef struct { const char *p; } Blk64;
+INL Blk64 blk_load(const char *p) { Blk64 x = {p}; return x; }
+INL uint64_t blk_eq(Blk64 x, char c) { uint64_t m = 0; for (int i = 0; i < 64; i++) m |= (uint64_t)(x.p[i] == c) << i; return m; }
+#endif
 
 // ---------- timestamps ----------
 #define BADTS INT64_MIN
@@ -130,8 +158,8 @@ static inline int64_t days_from_civil(int64_t y, unsigned m, unsigned d) {
   const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
   return era * 146097 + (int64_t)doe - 719468;
 }
-static inline int isdig(char c) { return (unsigned)(c - '0') <= 9; }
-static inline int dd(const char *p, int *v) {
+INL int isdig(char c) { return (unsigned)(c - '0') <= 9; }
+INL int dd(const char *p, int *v) {
   unsigned a = (unsigned)(p[0] - '0'), b = (unsigned)(p[1] - '0');
   if (a > 9 || b > 9) return 0;
   *v = (int)(a * 10 + b);
@@ -139,20 +167,8 @@ static inline int dd(const char *p, int *v) {
 }
 static const int mdays[13] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
 
-static int64_t parse_ts(const char *p, uint32_t n) {
-  if (n == 0) return BADTS;
-  // F3: all digits
-  uint32_t i = 0;
-  while (i < n && isdig(p[i])) i++;
-  if (i == n) {
-    uint32_t j = 0;
-    while (j < n && p[j] == '0') j++;
-    if (n - j > 18) return INT64_MAX; // valid form, far outside any window
-    int64_t v = 0;
-    for (; j < n; j++) v = v * 10 + (p[j] - '0');
-    return v;
-  }
-  if (n != 20 && n != 25) return BADTS;
+// Calendar part "YYYY-MM-DDTHH:MM:SS" -> ms, or BADTS.
+INL int64_t parse_cal(const char *p) {
   if (p[4] != '-' || p[7] != '-' || p[10] != 'T' || p[13] != ':' || p[16] != ':') return BADTS;
   int y1, y2, mo, da, hh, mi, ss;
   if (!dd(p, &y1) || !dd(p + 2, &y2) || !dd(p + 5, &mo) || !dd(p + 8, &da) || !dd(p + 11, &hh) ||
@@ -163,24 +179,40 @@ static int64_t parse_ts(const char *p, uint32_t n) {
   int dim = mdays[mo];
   if (mo == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0)) dim = 29;
   if (da > dim) return BADTS;
-  int64_t off = 0;
+  int64_t days = days_from_civil(y, (unsigned)mo, (unsigned)da);
+  return days * 86400000LL + (int64_t)(hh * 3600 + mi * 60 + ss) * 1000;
+}
+
+static int64_t parse_ts(const char *p, uint32_t n) {
   if (n == 20) {
     if (p[19] != 'Z') return BADTS;
-  } else {
+    return parse_cal(p);
+  }
+  if (n == 25) {
     char sg = p[19];
     if ((sg != '+' && sg != '-') || p[22] != ':') return BADTS;
     int oh, om;
     if (!dd(p + 20, &oh) || !dd(p + 23, &om)) return BADTS;
     if (oh > 23 || om > 59) return BADTS;
-    off = (int64_t)(oh * 60 + om) * 60000;
-    if (sg == '-') off = -off;
+    int64_t c = parse_cal(p);
+    if (c == BADTS) return BADTS;
+    int64_t off = (int64_t)(oh * 60 + om) * 60000;
+    return sg == '-' ? c + off : c - off;
   }
-  int64_t days = days_from_civil(y, (unsigned)mo, (unsigned)da);
-  return days * 86400000LL + (int64_t)(hh * 3600 + mi * 60 + ss) * 1000 - off;
+  if (n == 0) return BADTS;
+  uint32_t i = 0;
+  while (i < n && isdig(p[i])) i++;
+  if (i != n) return BADTS;
+  uint32_t j = 0;
+  while (j < n && p[j] == '0') j++;
+  if (n - j > 18) return INT64_MAX; // valid form, far outside any window
+  int64_t v = 0;
+  for (; j < n; j++) v = v * 10 + (p[j] - '0');
+  return v;
 }
 
 // price: digits only, 1..10,000,000; returns 0 if bad
-static inline uint32_t parse_price(const char *p, uint32_t n) {
+INL uint32_t parse_price(const char *p, uint32_t n) {
   if (n == 0) return 0;
   uint32_t j = 0;
   for (uint32_t i = 0; i < n; i++) if (!isdig(p[i])) return 0;
@@ -201,7 +233,6 @@ static void smap_init(SMap *m, size_t want) {
   m->s = xcalloc(cap, sizeof(SSlot));
   m->mask = cap - 1;
 }
-// insert if absent; returns pointer to slot
 static SSlot *smap_put(SMap *m, const char *p, uint32_t n, int32_t v, int *created) {
   uint64_t h = hstr(p, n);
   uint64_t i = h & m->mask;
@@ -212,7 +243,7 @@ static SSlot *smap_put(SMap *m, const char *p, uint32_t n, int32_t v, int *creat
     i = (i + 1) & m->mask;
   }
 }
-static inline int32_t smap_get(const SMap *m, const char *p, uint32_t n) {
+INL int32_t smap_get(const SMap *m, const char *p, uint32_t n) {
   uint64_t h = hstr(p, n);
   uint64_t i = h & m->mask;
   for (;;) {
@@ -223,381 +254,680 @@ static inline int32_t smap_get(const SMap *m, const char *p, uint32_t n) {
   }
 }
 
-// ---------- globals ----------
-static int NT = 8;
-static int64_t WS, WE, CWS; // event window [WS,WE), click window [CWS,WE)
-static int32_t DAY0, NDAYS;
-static SMap prodmap; // product -> category index
-static int unknown_cat;
-static int ncat; static const char **catp; static uint32_t *catn;
-static SMap campmap; // campaign -> idx
-static int ncamp; static const char **camp_id; static uint32_t *camp_idn; static const char **chan; static uint32_t *chann;
-
-// linked IDs: id -> person name
-typedef struct { uint64_t h; const char *p; uint32_t n; uint32_t idx; const char *np; uint32_t nn; uint32_t _pad; } LSlot;
-static LSlot *lmap; static uint64_t lmask;
-
-static inline void resolve_person(const char *u, uint32_t un, const char **np, uint32_t *nn) {
-  if (lmap) {
-    uint64_t h = hstr(u, un);
-    uint64_t i = h & lmask;
-    for (;;) {
-      const LSlot *s = &lmap[i];
-      if (!s->p) break;
-      if (s->h == h && str_eq(s->p, s->n, u, un)) { *np = s->np; *nn = s->nn; return; }
-      i = (i + 1) & lmask;
-    }
-  }
-  *np = u; *nn = un;
-}
-
 // ---------- thread pool ----------
+static int NT = 8;
 typedef void (*task_fn)(int tid, long task, void *ctx);
-typedef struct { task_fn fn; void *ctx; long ntask; atomic_long next; int tid; } Pool;
+typedef struct { task_fn fn; void *ctx; long ntask; const long *order; atomic_long next; } Pool;
 typedef struct { Pool *p; int tid; } PArg;
 static void *pool_main(void *a) {
   PArg *pa = a;
   Pool *p = pa->p;
   for (;;) {
-    long t = atomic_fetch_add(&p->next, 1);
+    long t = atomic_fetch_add_explicit(&p->next, 1, memory_order_relaxed);
     if (t >= p->ntask) break;
-    p->fn(pa->tid, t, p->ctx);
+    p->fn(pa->tid, p->order ? p->order[t] : t, p->ctx);
   }
   return NULL;
 }
-static void run_par(long ntask, task_fn fn, void *ctx) {
-  Pool p; p.fn = fn; p.ctx = ctx; p.ntask = ntask; atomic_init(&p.next, 0);
-  pthread_t th[256]; PArg args[256];
-  int nt = NT;
-  for (int i = 0; i < nt; i++) { args[i].p = &p; args[i].tid = i; }
-  for (int i = 1; i < nt; i++) pthread_create(&th[i], NULL, pool_main, &args[i]);
+static void run_par_o(long ntask, const long *order, task_fn fn, void *ctx) {
+  Pool p; p.fn = fn; p.ctx = ctx; p.ntask = ntask; p.order = order; atomic_init(&p.next, 0);
+  pthread_t th[64]; PArg args[64];
+  for (int i = 0; i < NT; i++) { args[i].p = &p; args[i].tid = i; }
+  for (int i = 1; i < NT; i++) pthread_create(&th[i], NULL, pool_main, &args[i]);
   pool_main(&args[0]);
-  for (int i = 1; i < nt; i++) pthread_join(th[i], NULL);
+  for (int i = 1; i < NT; i++) pthread_join(th[i], NULL);
+}
+static void run_par(long ntask, task_fn fn, void *ctx) { run_par_o(ntask, NULL, fn, ctx); }
+
+// ---------- per-thread arenas ----------
+#define ARENA_SZ (2ull << 30) // payload locs are 28-bit units of 8 bytes
+typedef struct { char *base, *cur, *end; char pad[40]; } Arena;
+static Arena *arenas; // [NT] record storage (addressable by loc)
+static Arena *scratch; // [NT] per-task scratch, reset per task
+static void arena_init(Arena *a, size_t sz) {
+  char *m = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+  if (m == MAP_FAILED) die("arena");
+#ifdef MADV_HUGEPAGE
+  madvise(m, sz, MADV_HUGEPAGE);
+#endif
+  a->base = a->cur = m; a->end = m + sz;
+}
+INL void *aalloc(Arena *a, size_t n) {
+  n = (n + 63) & ~(size_t)63;
+  if (UNLIKELY(a->cur + n > a->end)) die("arena full");
+  void *r = a->cur; a->cur += n; return r;
 }
 
-// ---------- growable vectors ----------
-#define VEC(T) struct { T *a; size_t n, cap; }
-#define VPUSH(v, x) do { if ((v).n == (v).cap) { (v).cap = (v).cap ? (v).cap * 2 : 64; (v).a = xrealloc((v).a, (v).cap * sizeof(*(v).a)); } (v).a[(v).n++] = (x); } while (0)
+// Bucket: chain of blocks of fixed-size records.
+typedef struct Blk { struct Blk *next; uint32_t n, cap; } Blk; // records follow (16-byte header)
+typedef struct { char *cur, *end; Blk *head, *tail; } Bkt;
+static __attribute__((noinline)) void bkt_grow(Arena *a, Bkt *b, uint32_t rs, uint32_t cap) {
+  if (b->tail) b->tail->n = (uint32_t)((b->cur - (char *)(b->tail + 1)) / rs);
+  Blk *k = aalloc(a, sizeof(Blk) + (size_t)rs * cap);
+  k->next = NULL; k->n = 0; k->cap = cap;
+  if (b->tail) b->tail->next = k; else b->head = k;
+  b->tail = k;
+  b->cur = (char *)(k + 1); b->end = b->cur + (size_t)rs * cap;
+}
+static void bkt_close(Bkt *b, uint32_t rs) {
+  if (b->tail) b->tail->n = (uint32_t)((b->cur - (char *)(b->tail + 1)) / rs);
+}
+
+// ---------- globals ----------
+static int64_t WS, WE, CWS; // event window [WS,WE), click window [CWS,WE)
+static int64_t DAY0; static int32_t NDAYS;
+static SMap prodmap; // product -> category index
+static int unknown_cat;
+static int ncat; static const char **catp; static uint32_t *catn;
+static SMap campmap; // campaign -> idx
+static int ncamp; static const char **camp_id; static uint32_t *camp_idn; static const char **chan; static uint32_t *chann;
+static uint32_t PB, QB; static uint32_t NPART, NQART; // eid partitions 2^PB, person partitions 2^QB
+
+// ---------- linked IDs ----------
+// build table: key hash, string ref, union-find parent, best (name) slot
+static _Atomic uint64_t *lkey; static uint64_t *lref; static _Atomic uint32_t *lpar; static _Atomic uint32_t *lbest;
+static uint64_t lcap, lmask_b;
+// lookup table: id hash -> person key
+typedef struct { uint64_t key, pkey; } LEnt;
+static LEnt *ltab; static uint64_t ltmask; static uint64_t *lname; // lname[root slot] = name ref
+static int have_links;
+
+#define LINKED (1ull << 63)
+INL uint32_t qpart(uint64_t pkey) { return (uint32_t)((pkey >> 40) & (NQART - 1)); }
+
+INL uint64_t person_of(uint64_t uh) {
+  if (have_links) {
+    uint64_t i = uh & ltmask;
+    for (;;) {
+      const LEnt *e = &ltab[i];
+      if (e->key == uh) return e->pkey;
+      if (!e->key) break;
+      i = (i + 1) & ltmask;
+    }
+  }
+  return uh & ~LINKED;
+}
 
 // ---------- records ----------
-typedef struct {
-  uint64_t h;
-  const char *eid;
-  const char *uid;
-  int64_t ingest;
-  int64_t ts;
-  uint32_t price;
-  uint16_t eidn, uidn;
-  uint8_t valid, type, cat;
-} ERec;
-typedef struct {
-  uint64_t ph;
-  const char *name;
-  int64_t ts;
-  uint32_t namen;
-  uint32_t price;
-  uint8_t type, cat;
-} PRec;
-typedef struct {
-  uint64_t ph;
-  const char *name;
-  const char *cid;
-  int64_t ts;
-  uint32_t namen;
-  uint32_t camp;
-  uint32_t cidn;
-} CRec;
+typedef struct { uint64_t h; uint32_t ingest; uint32_t loc; } KRec;     // dedup key, per eid partition
+typedef struct { uint64_t pkey; uint64_t uref; uint32_t ts; uint32_t x; } PRec; // event payload, per person partition
+typedef struct { uint64_t pkey; uint64_t cref; uint32_t ts; uint32_t camp; } CRec; // click, per person partition
+// PRec.x: price (24 bits) | cat (5 bits) << 24 | purchase << 29 | dead << 31
+#define X_PURCH (1u << 29)
+#define X_DEAD (1u << 31)
+#define LOC_NONE 0x0FFFFFFFu
 
-#define P1B 10
-#define P1 (1 << P1B)
-#define P2B 10
-#define P2 (1 << P2B)
+static Bkt *kb; // [NT][NPART]
+static Bkt *pb; // [NT][NQART]
+static Bkt *cb; // [NT][NQART]
+static uint32_t kcap0, pcap0, ccap0;
 
-typedef VEC(ERec) EVec;
-typedef VEC(PRec) PVec;
-typedef VEC(CRec) CVec;
-static EVec *ebuf;  // [NT][P1]
-static PVec *pbuf;  // [NT][P2]
-static CVec *cbuf;  // [NT][P2]
-
-// ---------- chunk tasks ----------
+// ---------- chunks ----------
 typedef struct { const char *base; size_t start, end, fsize; int kind; } Chunk;
-static VEC(Chunk) chunks;
-#define CHUNK_SZ (4u << 20)
-
-static void add_chunks(MFile f, int kind) {
+static Chunk *chunks; static long nchunks, chcap;
+static void add_chunks(MFile f, int kind, size_t csz) {
   if (!f.n) return;
-  for (size_t s = 0; s < f.n; s += CHUNK_SZ) {
-    Chunk c = {f.p, s, s + CHUNK_SZ < f.n ? s + CHUNK_SZ : f.n, f.n, kind};
-    VPUSH(chunks, c);
+  for (size_t s = 0; s < f.n; s += csz) {
+    if (nchunks == chcap) { chcap = chcap ? chcap * 2 : 256; chunks = xrealloc(chunks, sizeof(Chunk) * chcap); }
+    Chunk c = {f.p, s, s + csz < f.n ? s + csz : f.n, f.n, kind};
+    chunks[nchunks++] = c;
   }
 }
-
-static inline const char *chunk_begin(const Chunk *c) {
+static const char *chunk_begin(const Chunk *c) {
   const char *b = c->base;
   const char *fend = b + c->fsize;
   const char *p;
-  if (c->start == 0) {
-    p = memchr(b, '\n', c->fsize); // skip header
-    return p ? p + 1 : fend;
-  }
+  if (c->start == 0) { p = memchr(b, '\n', c->fsize); return p ? p + 1 : fend; } // skip header
   p = memchr(b + c->start - 1, '\n', c->fsize - (c->start - 1));
   return p ? p + 1 : fend;
 }
 
-static void parse_event_line(int tid, const char *l, size_t n) {
-  const char *f[7]; uint32_t fl[7];
-  if (!split_fields(l, n, 7, f, fl)) return;
-  if (fl[0] == 0) return;
-  ERec r;
-  r.h = hstr(f[0], fl[0]);
-  r.eid = f[0]; r.eidn = (uint16_t)fl[0];
-  r.uid = f[1]; r.uidn = (uint16_t)fl[1];
-  int64_t ing = parse_ts(f[3], fl[3]);
-  r.ingest = ing;
-  int64_t ts = parse_ts(f[2], fl[2]);
-  r.ts = ts;
-  r.price = 0; r.type = 0; r.cat = 0;
-  int ok = fl[1] > 0 && ts != BADTS && ts >= WS && ts < WE && fl[5] > 0;
-  if (ok) {
-    if (fl[4] == 4 && memcmp(f[4], "view", 4) == 0) r.type = 0;
-    else if (fl[4] == 4 && memcmp(f[4], "cart", 4) == 0) r.type = 1;
-    else if (fl[4] == 8 && memcmp(f[4], "purchase", 8) == 0) r.type = 2;
-    else ok = 0;
+// Tokenizer: calls LINE(ls, sep, nsep, nq) for each line starting in [begin, cend).
+// sep[k] = position of the k-th separator (',' or the line end), nq = quotes in the line.
+#define MAXF 8
+#define TOKENIZE(c, LINE)                                                                         \
+  do {                                                                                            \
+    const char *fend_ = (c)->base + (c)->fsize;                                                   \
+    const char *cend_ = (c)->base + (c)->end;                                                     \
+    const char *ls_ = chunk_begin(c);                                                             \
+    if (ls_ >= cend_) break;                                                                      \
+    const char *sep_[MAXF + 1]; int ns_ = 0; uint32_t qacc_ = 0;                                  \
+    const char *blk_ = ls_;                                                                       \
+    int done_ = 0;                                                                                \
+    while (!done_) {                                                                              \
+      Blk64 x_ = blk_load(blk_);                                                                  \
+      uint64_t nl_ = blk_eq(x_, '\n'), cm_ = blk_eq(x_, ','), q_ = blk_eq(x_, '"');               \
+      uint64_t lim_ = (blk_ + 64 <= fend_) ? ~0ull : ((fend_ - blk_) > 0 ? (~0ull >> (64 - (fend_ - blk_))) : 0); \
+      uint64_t st_ = (nl_ | cm_) & lim_;                                                          \
+      q_ &= lim_;                                                                                 \
+      while (st_) {                                                                               \
+        int i_ = __builtin_ctzll(st_);                                                            \
+        uint64_t bit_ = 1ull << i_;                                                               \
+        st_ &= st_ - 1;                                                                           \
+        if (ns_ < MAXF) sep_[ns_] = blk_ + i_;                                                    \
+        ns_++;                                                                                    \
+        if (nl_ & bit_) {                                                                         \
+          uint64_t below_ = bit_ | (bit_ - 1);                                                    \
+          uint32_t nq_ = qacc_ + (uint32_t)__builtin_popcountll(q_ & below_);                     \
+          q_ &= ~below_; qacc_ = 0;                                                               \
+          LINE(ls_, sep_, ns_, nq_);                                                              \
+          ls_ = blk_ + i_ + 1; ns_ = 0;                                                           \
+          if (ls_ >= cend_) { done_ = 1; break; }                                                 \
+        }                                                                                         \
+      }                                                                                           \
+      if (done_) break;                                                                           \
+      qacc_ += (uint32_t)__builtin_popcountll(q_);                                                \
+      blk_ += 64;                                                                                 \
+      if (blk_ >= fend_) {                                                                        \
+        if (ls_ < fend_) { if (ns_ < MAXF) sep_[ns_] = fend_; ns_++; LINE(ls_, sep_, ns_, qacc_); } \
+        break;                                                                                    \
+      }                                                                                           \
+    }                                                                                             \
+  } while (0)
+
+// Field k of a line: [fs, fe). Strips quotes; returns 0 if a quote is misplaced. nqf counts quotes used.
+INL int field(const char *ls, const char *const *sep, int k, const char **fp, uint32_t *fl, uint32_t *nqf, uint32_t nq) {
+  const char *s = k ? sep[k - 1] + 1 : ls;
+  const char *e = sep[k];
+  if (nq && e > s && *s == '"') {
+    if (e - s < 2 || e[-1] != '"') return 0;
+    s++; e--; *nqf += 2;
   }
-  if (ok && r.type == 2) {
-    r.price = parse_price(f[6], fl[6]);
-    if (!r.price) ok = 0;
-  }
-  if (ok && ing - ts > 86400000LL) ok = 0;
-  if (ok) {
-    int32_t c = smap_get(&prodmap, f[5], fl[5]);
-    r.cat = (uint8_t)(c < 0 ? unknown_cat : c);
-  }
-  r.valid = (uint8_t)ok;
-  EVec *v = &ebuf[(size_t)tid * P1 + (r.h >> (64 - P1B))];
-  VPUSH(*v, r);
+  *fp = s; *fl = (uint32_t)(e - s);
+  return 1;
 }
 
-static void parse_click_line(int tid, const char *l, size_t n) {
-  const char *f[4]; uint32_t fl[4];
-  if (!split_fields(l, n, 4, f, fl)) return;
+// Delay line: person lookups miss cache, so each is resolved RING lines after its prefetch.
+#define RING 32
+typedef struct { uint64_t uh, uref; uint32_t ts, x; KRec *k; } EPend;
+typedef struct { uint64_t uh, cref; uint32_t ts, camp; } CPend;
+typedef struct { EPend e[RING]; CPend c[RING]; uint32_t ne, nc; char pad[56]; } Pend;
+static Pend *pend; // [NT]
+INL void ev_emit(int tid, const EPend *p) {
+  uint64_t pk = person_of(p->uh);
+  Bkt *b = &pb[(size_t)tid * NQART + qpart(pk)];
+  if (UNLIKELY(b->cur == b->end)) bkt_grow(&arenas[tid], b, sizeof(PRec), b->tail ? b->tail->cap : pcap0);
+  PRec *r = (PRec *)b->cur; b->cur += sizeof(PRec);
+  r->pkey = pk; r->uref = p->uref; r->ts = p->ts; r->x = p->x;
+  p->k->loc = (uint32_t)(((char *)r - arenas[tid].base) >> 3);
+}
+INL void cl_emit(int tid, const CPend *p) {
+  uint64_t pk = person_of(p->uh);
+  Bkt *b = &cb[(size_t)tid * NQART + qpart(pk)];
+  if (UNLIKELY(b->cur == b->end)) bkt_grow(&arenas[tid], b, sizeof(CRec), b->tail ? b->tail->cap : ccap0);
+  CRec *r = (CRec *)b->cur; b->cur += sizeof(CRec);
+  r->pkey = pk; r->cref = p->cref; r->ts = p->ts; r->camp = p->camp;
+}
+static void pend_flush(int tid) {
+  Pend *P = &pend[tid];
+  uint32_t lo = P->ne > RING ? P->ne - RING : 0;
+  for (uint32_t i = lo; i < P->ne; i++) ev_emit(tid, &P->e[i % RING]);
+  lo = P->nc > RING ? P->nc - RING : 0;
+  for (uint32_t i = lo; i < P->nc; i++) cl_emit(tid, &P->c[i % RING]);
+  P->ne = P->nc = 0;
+}
+
+static inline void ev_line(int tid, const char *ls, const char *const *sep, int ns, uint32_t nq) {
+  if (ns != 7) return;
+  const char *f[7]; uint32_t fl[7]; uint32_t nqf = 0;
+  for (int k = 0; k < 7; k++) if (!field(ls, sep, k, &f[k], &fl[k], &nqf, nq)) return;
+  if (nqf != nq) return;
+  if (fl[0] == 0) return;
+  uint64_t eh = hstr(f[0], fl[0]);
+  uint64_t uh = 0;
+  if (fl[1]) {
+    uh = hstr(f[1], fl[1]);
+    if (have_links) __builtin_prefetch(&ltab[uh & ltmask]);
+  }
+  int64_t ing = parse_ts(f[3], fl[3]);
+  int64_t ts = parse_ts(f[2], fl[2]);
+  uint32_t x = 0;
+  int ok = fl[1] > 0 && ts != BADTS && ts >= WS && ts < WE && fl[5] > 0;
+  if (ok) {
+    if (fl[4] == 4 && memcmp(f[4], "view", 4) == 0) {}
+    else if (fl[4] == 4 && memcmp(f[4], "cart", 4) == 0) {}
+    else if (fl[4] == 8 && memcmp(f[4], "purchase", 8) == 0) {
+      uint32_t pr = parse_price(f[6], fl[6]);
+      if (!pr) ok = 0;
+      else {
+        int32_t c = smap_get(&prodmap, f[5], fl[5]);
+        x = pr | ((uint32_t)(c < 0 ? unknown_cat : c) << 24) | X_PURCH;
+      }
+    } else ok = 0;
+  }
+  if (ok && ing != BADTS && ing - ts > 86400000LL) ok = 0;
+  int64_t is = ing == BADTS ? 0xFFFFFFFFll : ing / 1000;
+  if (is < 0) is = 0;
+  if (is > 0xFFFFFFFFll) is = 0xFFFFFFFFll;
+  Bkt *b = &kb[(size_t)tid * NPART + (eh >> (64 - PB))];
+  if (UNLIKELY(b->cur == b->end)) bkt_grow(&arenas[tid], b, sizeof(KRec), b->tail ? b->tail->cap : kcap0);
+  KRec *k = (KRec *)b->cur; b->cur += sizeof(KRec);
+  k->h = eh; k->ingest = (uint32_t)is; k->loc = LOC_NONE;
+  if (ok) {
+    Pend *P = &pend[tid];
+    EPend *e = &P->e[P->ne % RING];
+    if (P->ne >= RING) ev_emit(tid, e);
+    e->uh = uh; e->uref = mkref(f[1], fl[1]); e->ts = (uint32_t)(ts - CWS); e->x = x; e->k = k;
+    P->ne++;
+  }
+}
+
+static inline void cl_line(int tid, const char *ls, const char *const *sep, int ns, uint32_t nq) {
+  if (ns != 4) return;
+  const char *f[4]; uint32_t fl[4]; uint32_t nqf = 0;
+  for (int k = 0; k < 4; k++) if (!field(ls, sep, k, &f[k], &fl[k], &nqf, nq)) return;
+  if (nqf != nq) return;
   if (fl[0] == 0 || fl[1] == 0) return;
+  uint64_t uh = hstr(f[1], fl[1]);
+  if (have_links) __builtin_prefetch(&ltab[uh & ltmask]);
   int64_t ts = parse_ts(f[3], fl[3]);
   if (ts == BADTS || ts < CWS || ts >= WE) return;
   int32_t c = smap_get(&campmap, f[2], fl[2]);
   if (c < 0) return;
-  CRec r;
-  resolve_person(f[1], fl[1], &r.name, &r.namen);
-  r.ph = hstr(r.name, r.namen);
-  r.cid = f[0]; r.cidn = fl[0];
-  r.ts = ts; r.camp = (uint32_t)c;
-  CVec *v = &cbuf[(size_t)tid * P2 + (r.ph >> (64 - P2B))];
-  VPUSH(*v, r);
+  Pend *P = &pend[tid];
+  CPend *e = &P->c[P->nc % RING];
+  if (P->nc >= RING) cl_emit(tid, e);
+  e->uh = uh; e->cref = mkref(f[0], fl[0]); e->ts = (uint32_t)(ts - CWS); e->camp = (uint32_t)c;
+  P->nc++;
 }
 
+#define EVL(ls, sep, ns, nq) ev_line(tid, ls, sep, ns, nq)
+#define CLL(ls, sep, ns, nq) cl_line(tid, ls, sep, ns, nq)
 static void parse_task(int tid, long t, void *ctx) {
   (void)ctx;
-  const Chunk *c = &chunks.a[t];
-  const char *p = chunk_begin(c);
-  const char *end = c->base + c->end;
-  const char *fend = c->base + c->fsize;
-  while (p < end) {
-    const char *nl = memchr(p, '\n', (size_t)(fend - p));
-    const char *le = nl ? nl : fend;
-    if (c->kind == 0) parse_event_line(tid, p, (size_t)(le - p));
-    else parse_click_line(tid, p, (size_t)(le - p));
-    p = le + 1;
-  }
+  const Chunk *c = &chunks[t];
+  if (c->kind == 0) { TOKENIZE(c, EVL); }
+  else { TOKENIZE(c, CLL); }
+  pend_flush(tid);
 }
 
-// ---------- dedup stage ----------
-typedef struct { uint64_t h; ERec *r; } DSlot;
+// ---------- links ----------
+typedef struct { uint32_t a, b; } Edge;
+typedef struct { Edge *e; size_t n, cap; } EVec;
+static EVec *ledges; // [NT]
+static Chunk *lchunks; static long nlchunks;
+
+INL uint32_t lt_insert(uint64_t h, const char *p, uint32_t n) {
+  uint64_t i = h & lmask_b;
+  for (;;) {
+    uint64_t k = atomic_load_explicit(&lkey[i], memory_order_acquire);
+    if (k == h) return (uint32_t)i;
+    if (k == 0) {
+      uint64_t z = 0;
+      if (atomic_compare_exchange_strong(&lkey[i], &z, h)) { lref[i] = mkref(p, n); return (uint32_t)i; }
+      if (z == h) return (uint32_t)i;
+    }
+    i = (i + 1) & lmask_b;
+  }
+}
+static inline void lk_line(int tid, const char *ls, const char *const *sep, int ns, uint32_t nq) {
+  if (ns != 2) return;
+  const char *f[2]; uint32_t fl[2]; uint32_t nqf = 0;
+  for (int k = 0; k < 2; k++) if (!field(ls, sep, k, &f[k], &fl[k], &nqf, nq)) return;
+  if (nqf != nq) return;
+  if (fl[0] == 0 || fl[1] == 0) return;
+  uint32_t a = lt_insert(hstr(f[0], fl[0]), f[0], fl[0]);
+  uint32_t b = lt_insert(hstr(f[1], fl[1]), f[1], fl[1]);
+  if (a == b) return;
+  EVec *v = &ledges[tid];
+  if (v->n == v->cap) { v->cap = v->cap ? v->cap * 2 : 4096; v->e = xrealloc(v->e, v->cap * sizeof(Edge)); }
+  v->e[v->n].a = a; v->e[v->n].b = b; v->n++;
+}
+#define LKL(ls, sep, ns, nq) lk_line(tid, ls, sep, ns, nq)
+static void link_parse_task(int tid, long t, void *ctx) { (void)ctx; const Chunk *c = &lchunks[t]; TOKENIZE(c, LKL); }
+
+INL uint32_t uf_find(uint32_t x) {
+  for (;;) {
+    uint32_t p = atomic_load_explicit(&lpar[x], memory_order_relaxed);
+    if (p == x) return x;
+    uint32_t g = atomic_load_explicit(&lpar[p], memory_order_relaxed);
+    if (g != p) atomic_compare_exchange_weak_explicit(&lpar[x], &p, g, memory_order_relaxed, memory_order_relaxed);
+    x = g;
+  }
+}
+static void uf_task(int tid, long t, void *ctx) {
+  (void)tid; (void)ctx;
+  EVec *v = &ledges[t];
+  for (size_t i = 0; i < v->n; i++) {
+    uint32_t a = v->e[i].a, b = v->e[i].b;
+    for (;;) {
+      a = uf_find(a); b = uf_find(b);
+      if (a == b) break;
+      if (a < b) { uint32_t s = a; a = b; b = s; } // link larger root under smaller
+      uint32_t exp = a;
+      if (atomic_compare_exchange_strong(&lpar[a], &exp, b)) break;
+    }
+  }
+}
+#define LSPAN 65536
+static void init_task(int tid, long t, void *ctx) {
+  (void)tid; (void)ctx;
+  uint64_t lo = (uint64_t)t * LSPAN, hi = lo + LSPAN; if (hi > lcap) hi = lcap;
+  for (uint64_t i = lo; i < hi; i++) { atomic_store_explicit(&lpar[i], (uint32_t)i, memory_order_relaxed); atomic_store_explicit(&lbest[i], UINT32_MAX, memory_order_relaxed); }
+}
+static void best_task(int tid, long t, void *ctx) {
+  (void)tid; (void)ctx;
+  uint64_t lo = (uint64_t)t * LSPAN, hi = lo + LSPAN; if (hi > lcap) hi = lcap;
+  for (uint64_t i = lo; i < hi; i++) {
+    if (!atomic_load_explicit(&lkey[i], memory_order_relaxed)) continue;
+    uint32_t r = uf_find((uint32_t)i);
+    uint64_t me = lref[i];
+    uint32_t cur = atomic_load(&lbest[r]);
+    for (;;) {
+      if (cur != UINT32_MAX) {
+        uint64_t o = lref[cur];
+        if (str_cmp(refp(me), refn(me), refp(o), refn(o)) >= 0) break;
+      }
+      if (atomic_compare_exchange_weak(&lbest[r], &cur, (uint32_t)i)) break;
+    }
+  }
+}
+INL uint64_t mix64(uint64_t x) { x ^= x >> 33; x *= 0xff51afd7ed558ccdull; x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ull; x ^= x >> 33; return x; }
+static _Atomic uint64_t lt_count;
+static void fill_task(int tid, long t, void *ctx) {
+  (void)tid; (void)ctx;
+  uint64_t lo = (uint64_t)t * LSPAN, hi = lo + LSPAN; if (hi > lcap) hi = lcap;
+  uint64_t cnt = 0;
+  for (uint64_t i = lo; i < hi; i++) {
+    uint64_t k = atomic_load_explicit(&lkey[i], memory_order_relaxed);
+    if (!k) continue;
+    uint32_t r = uf_find((uint32_t)i);
+    uint64_t pk = LINKED | (mix64(r) & 0x7FFFFFFF00000000ull) | r;
+    if ((uint32_t)i == r) lname[r] = lref[atomic_load(&lbest[r])];
+    // insert into lookup table (unique keys; CAS on key)
+    uint64_t j = k & ltmask;
+    for (;;) {
+      _Atomic uint64_t *kp = (_Atomic uint64_t *)&ltab[j].key;
+      uint64_t z = 0;
+      if (atomic_compare_exchange_strong(kp, &z, k)) { ltab[j].pkey = pk; break; }
+      j = (j + 1) & ltmask;
+    }
+    cnt++;
+  }
+  atomic_fetch_add(&lt_count, cnt);
+}
+
+static void load_links(const char *dd) {
+  char dir[4096]; snprintf(dir, sizeof dir, "%s/links", dd);
+  char **paths; int nf = list_csv(dir, &paths);
+  size_t bytes = 0;
+  MFile *fs = xmalloc(sizeof(MFile) * (nf ? nf : 1));
+  for (int i = 0; i < nf; i++) { fs[i] = map_file(paths[i]); bytes += fs[i].n; }
+  if (bytes == 0) return;
+  uint64_t lines = nf;
+  for (int i = 0; i < nf; i++) { const char *p = fs[i].p, *e = p + fs[i].n; while ((p = memchr(p, '\n', (size_t)(e - p)))) { lines++; p++; } }
+  uint64_t est = 2 * lines + lines / 2 + 1024; // distinct IDs <= 2 * lines
+  lcap = 1024; while (lcap < est) lcap <<= 1;
+  lmask_b = lcap - 1;
+  lkey = xcalloc(lcap, 8); lref = xmalloc(lcap * 8);
+  lpar = xmalloc(lcap * 4); lbest = xmalloc(lcap * 4);
+  ledges = xcalloc(NT, sizeof(EVec));
+  // chunks
+  Chunk *save = chunks; long sn = nchunks, sc = chcap;
+  chunks = NULL; nchunks = 0; chcap = 0;
+  for (int i = 0; i < nf; i++) add_chunks(fs[i], 2, 1 << 20);
+  lchunks = chunks; nlchunks = nchunks;
+  chunks = save; nchunks = sn; chcap = sc;
+  long nspan = (long)((lcap + LSPAN - 1) / LSPAN);
+  run_par(nspan, init_task, NULL);
+  run_par(nlchunks, link_parse_task, NULL);
+  run_par(NT, uf_task, NULL);
+  run_par(nspan, best_task, NULL);
+  // count ids
+  uint64_t nid = 0;
+  for (uint64_t i = 0; i < lcap; i++) nid += lkey[i] != 0;
+  uint64_t tc = 1024; while (tc < nid + nid / 2) tc <<= 1;
+  ltab = xcalloc(tc, sizeof(LEnt)); ltmask = tc - 1;
+  lname = xmalloc(lcap * 8);
+  run_par(nspan, fill_task, NULL);
+  have_links = nid > 0;
+}
+
+// ---------- dedup ----------
+typedef struct { uint64_t h; uint32_t ingest; uint32_t loc; } DSlot; // loc: thread << 28 | loc
+INL void kill_loc(uint32_t tl) {
+  uint32_t l = tl & 0x0FFFFFFFu;
+  if (l == LOC_NONE) return;
+  PRec *r = (PRec *)(arenas[tl >> 28].base + ((size_t)l << 3));
+  r->x |= X_DEAD;
+}
 static void dedup_task(int tid, long q, void *ctx) {
   (void)ctx;
   size_t cnt = 0;
-  for (int t = 0; t < NT; t++) cnt += ebuf[(size_t)t * P1 + q].n;
+  for (int t = 0; t < NT; t++) for (Blk *k = kb[(size_t)t * NPART + q].head; k; k = k->next) cnt += k->n;
   if (!cnt) return;
-  size_t cap = 16;
-  while (cap < cnt * 2) cap <<= 1;
-  DSlot *tab = xcalloc(cap, sizeof(DSlot));
+  size_t cap = 64; while (cap < cnt * 2) cap <<= 1;
+  Arena *s = &scratch[tid]; s->cur = s->base;
+  DSlot *tab = aalloc(s, cap * sizeof(DSlot));
+  memset(tab, 0, cap * sizeof(DSlot));
   uint64_t mask = cap - 1;
   for (int t = 0; t < NT; t++) {
-    EVec *v = &ebuf[(size_t)t * P1 + q];
-    for (size_t k = 0; k < v->n; k++) {
-      ERec *r = &v->a[k];
-      uint64_t i = (r->h >> 3) & mask;
-      for (;;) {
-        DSlot *s = &tab[i];
-        if (!s->r) { s->h = r->h; s->r = r; break; }
-        if (s->h == r->h && str_eq(s->r->eid, s->r->eidn, r->eid, r->eidn)) {
-          if (r->ingest < s->r->ingest) s->r = r;
-          break;
+    for (Blk *k = kb[(size_t)t * NPART + q].head; k; k = k->next) {
+      KRec *r = (KRec *)(k + 1);
+      for (uint32_t j = 0; j < k->n; j++) {
+        uint64_t h = r[j].h;
+        uint32_t tl = ((uint32_t)t << 28) | r[j].loc;
+        uint64_t i = h & mask;
+        for (;;) {
+          DSlot *d = &tab[i];
+          if (!d->h) { d->h = h; d->ingest = r[j].ingest; d->loc = tl; break; }
+          if (d->h == h) {
+            if (r[j].ingest < d->ingest) { kill_loc(d->loc); d->ingest = r[j].ingest; d->loc = tl; }
+            else kill_loc(tl);
+            break;
+          }
+          i = (i + 1) & mask;
         }
-        i = (i + 1) & mask;
       }
     }
   }
-  for (size_t i = 0; i < cap; i++) {
-    ERec *r = tab[i].r;
-    if (!r || !r->valid) continue;
-    PRec p;
-    resolve_person(r->uid, r->uidn, &p.name, &p.namen);
-    p.ph = hstr(p.name, p.namen);
-    p.ts = r->ts; p.price = r->price; p.type = r->type; p.cat = r->cat;
-    PVec *v = &pbuf[(size_t)tid * P2 + (p.ph >> (64 - P2B))];
-    VPUSH(*v, p);
-  }
-  free(tab);
 }
 
-// ---------- sessionize stage ----------
-typedef struct { const char *name; uint32_t namen; int32_t day; int64_t sessions, events, revenue; int32_t top; } URow;
-typedef VEC(URow) UVec;
+// ---------- sessionize ----------
+typedef struct { uint64_t name; int32_t day; uint32_t sessions, events; int32_t top; int64_t revenue; } URow;
+typedef struct { URow *a; size_t n, cap; } UVec;
 static UVec *urows; // [NT]
 typedef struct { int64_t sessions, purch, revenue, assisted; } CAgg;
 static CAgg *cagg; // [NT][(ncamp+1)*NDAYS]
-static uint32_t **stamp; // [NT][ncamp]
-static uint32_t *stampv; // [NT]
+static uint32_t **stamp; static uint32_t *stampv;
 
-typedef struct { uint64_t ph; const char *p; uint32_t n; uint32_t idx; } NSlot;
-typedef struct { int64_t ts; uint32_t price; uint8_t type, cat; } LEv;
-typedef struct { int64_t ts; const char *cid; uint32_t cidn; uint32_t camp; } LCl;
+typedef struct { uint64_t pkey; uint64_t name; uint32_t idx; uint32_t _p; } PSlot;
+typedef struct { uint64_t cref; uint32_t ts; uint32_t camp; } LCl;
 
-static int cmp_lev(const void *a, const void *b) {
-  int64_t x = ((const LEv *)a)->ts, y = ((const LEv *)b)->ts;
-  return x < y ? -1 : x > y;
+static void sort_u64(uint64_t *a, uint64_t *tmp, uint32_t n) {
+  if (n < 2) return;
+  if (n <= 48) {
+    for (uint32_t i = 1; i < n; i++) { uint64_t x = a[i]; uint32_t j = i; while (j && a[j - 1] > x) { a[j] = a[j - 1]; j--; } a[j] = x; }
+    return;
+  }
+  if (n <= 8192) { // 4 passes of 8 bits over ts
+    uint32_t c[4][256];
+    memset(c, 0, sizeof c);
+    for (uint32_t i = 0; i < n; i++) { uint32_t k = (uint32_t)(a[i] >> 32); c[0][k & 255]++; c[1][(k >> 8) & 255]++; c[2][(k >> 16) & 255]++; c[3][k >> 24]++; }
+    uint64_t *src = a, *dst = tmp;
+    for (int p = 0; p < 4; p++) {
+      uint32_t s = 0;
+      for (int b = 0; b < 256; b++) { uint32_t v = c[p][b]; c[p][b] = s; s += v; }
+      int sh = 32 + 8 * p;
+      for (uint32_t i = 0; i < n; i++) { uint32_t k = (uint32_t)(src[i] >> sh) & 255; dst[c[p][k]++] = src[i]; }
+      uint64_t *t = src; src = dst; dst = t;
+    }
+    if (src != a) memcpy(a, src, (size_t)n * 8);
+    return;
+  }
+  // LSD radix on bits 32..63 (ts), 3 passes of 11 bits
+  uint32_t c[3][2048];
+  memset(c, 0, sizeof c);
+  for (uint32_t i = 0; i < n; i++) { uint32_t k = (uint32_t)(a[i] >> 32); c[0][k & 2047]++; c[1][(k >> 11) & 2047]++; c[2][k >> 22]++; }
+  uint64_t *src = a, *dst = tmp;
+  for (int p = 0; p < 3; p++) {
+    uint32_t s = 0;
+    for (int b = 0; b < 2048; b++) { uint32_t v = c[p][b]; c[p][b] = s; s += v; }
+    int sh = 32 + 11 * p;
+    for (uint32_t i = 0; i < n; i++) { uint32_t k = (uint32_t)(src[i] >> sh) & 2047; dst[c[p][k]++] = src[i]; }
+    uint64_t *t = src; src = dst; dst = t;
+  }
+  if (src != a) memcpy(a, src, (size_t)n * 8);
 }
 static int cmp_lcl(const void *a, const void *b) {
   const LCl *x = a, *y = b;
   if (x->ts != y->ts) return x->ts < y->ts ? -1 : 1;
-  return -str_cmp(x->cid, x->cidn, y->cid, y->cidn); // desc by click id
+  return -str_cmp(refp(x->cref), refn(x->cref), refp(y->cref), refn(y->cref)); // desc by click id
+}
+
+static uint64_t name_of(const PSlot *s) {
+  if (s->pkey & LINKED) return lname[(uint32_t)s->pkey];
+  return s->name;
+}
+
+static void flush_row(UVec *ur, URow *row, int64_t *catsum) {
+  int best = -1; int64_t bv = 0;
+  for (int z = 0; z < ncat; z++) if (catsum[z] > bv) { bv = catsum[z]; best = z; }
+  row->top = best;
+  if (ur->n == ur->cap) { ur->cap = ur->cap ? ur->cap * 2 : 65536; ur->a = xrealloc(ur->a, ur->cap * sizeof(URow)); }
+  ur->a[ur->n++] = *row;
 }
 
 static void sess_task(int tid, long q, void *ctx) {
   (void)ctx;
+  Arena *S = &scratch[tid]; S->cur = S->base;
   size_t ne = 0, nc = 0;
-  for (int t = 0; t < NT; t++) { ne += pbuf[(size_t)t * P2 + q].n; nc += cbuf[(size_t)t * P2 + q].n; }
+  for (int t = 0; t < NT; t++) {
+    for (Blk *k = pb[(size_t)t * NQART + q].head; k; k = k->next) ne += k->n;
+    for (Blk *k = cb[(size_t)t * NQART + q].head; k; k = k->next) nc += k->n;
+  }
   if (!ne) return;
-  size_t cap = 16;
-  while (cap < (ne + nc) * 2) cap <<= 1;
-  NSlot *tab = xcalloc(cap, sizeof(NSlot));
-  uint64_t mask = cap - 1;
-  uint32_t np = 0;
-  uint32_t *epid = xmalloc(ne * sizeof(uint32_t));
-  // persons are named by their events; clicks of persons with no events are irrelevant
-  const char **pname = xmalloc(ne * sizeof(char *));
-  uint32_t *pnamen = xmalloc(ne * sizeof(uint32_t));
+  // person table
+  uint32_t pcap = 256; while (pcap < ne / 4) pcap <<= 1; if (pcap > (1u << 20)) pcap = 1u << 20;
+  PSlot *tab = aalloc(S, (size_t)pcap * sizeof(PSlot)); memset(tab, 0, (size_t)pcap * sizeof(PSlot));
+  uint32_t pmask = pcap - 1, np = 0;
+  uint32_t *pid = aalloc(S, ne * 4);
   size_t k = 0;
   for (int t = 0; t < NT; t++) {
-    PVec *v = &pbuf[(size_t)t * P2 + q];
-    for (size_t j = 0; j < v->n; j++, k++) {
-      PRec *r = &v->a[j];
-      uint64_t i = (r->ph >> 3) & mask;
-      for (;;) {
-        NSlot *s = &tab[i];
-        if (!s->p) { s->ph = r->ph; s->p = r->name; s->n = r->namen; s->idx = np; pname[np] = r->name; pnamen[np] = r->namen; np++; break; }
-        if (s->ph == r->ph && str_eq(s->p, s->n, r->name, r->namen)) break;
-        i = (i + 1) & mask;
+    for (Blk *bk = pb[(size_t)t * NQART + q].head; bk; bk = bk->next) {
+      PRec *r = (PRec *)(bk + 1);
+      for (uint32_t j = 0; j < bk->n; j++) {
+        if (r[j].x & X_DEAD) continue;
+        uint64_t pk = r[j].pkey;
+        uint32_t i = (uint32_t)pk & pmask;
+        for (;;) {
+          PSlot *s = &tab[i];
+          if (!s->pkey) {
+            if (UNLIKELY((np + 1) * 2 > pcap)) { // grow
+              uint32_t ncap = pcap * 2; PSlot *nt = aalloc(S, (size_t)ncap * sizeof(PSlot)); memset(nt, 0, (size_t)ncap * sizeof(PSlot));
+              for (uint32_t z = 0; z < pcap; z++) if (tab[z].pkey) { uint32_t y = (uint32_t)tab[z].pkey & (ncap - 1); while (nt[y].pkey) y = (y + 1) & (ncap - 1); nt[y] = tab[z]; }
+              tab = nt; pcap = ncap; pmask = ncap - 1; i = (uint32_t)pk & pmask; continue;
+            }
+            s->pkey = pk; s->name = r[j].uref; s->idx = np++; break;
+          }
+          if (s->pkey == pk) break;
+          i = (i + 1) & pmask;
+        }
+        pid[k++] = tab[i].idx;
       }
-      epid[k] = tab[i].idx;
     }
   }
-  uint32_t *eoff = xcalloc(np + 1, sizeof(uint32_t));
-  for (size_t i = 0; i < ne; i++) eoff[epid[i] + 1]++;
+  size_t nalive = k;
+  uint32_t *eoff = aalloc(S, ((size_t)np + 1) * 4); memset(eoff, 0, ((size_t)np + 1) * 4);
+  for (size_t i = 0; i < nalive; i++) eoff[pid[i] + 1]++;
   for (uint32_t i = 0; i < np; i++) eoff[i + 1] += eoff[i];
-  uint32_t *pos = xmalloc((np + 1) * sizeof(uint32_t));
-  memcpy(pos, eoff, (np + 1) * sizeof(uint32_t));
-  LEv *ev = xmalloc(ne * sizeof(LEv));
+  uint32_t *pos = aalloc(S, ((size_t)np + 1) * 4); memcpy(pos, eoff, ((size_t)np + 1) * 4);
+  uint64_t *ev = aalloc(S, nalive * 8 + 8);
+  uint64_t *tmp = aalloc(S, nalive * 8 + 8);
+  uint64_t *names = aalloc(S, ((size_t)np + 1) * 8);
+  for (uint32_t z = 0; z < pcap; z++) if (tab[z].pkey) names[tab[z].idx] = name_of(&tab[z]);
   k = 0;
   for (int t = 0; t < NT; t++) {
-    PVec *v = &pbuf[(size_t)t * P2 + q];
-    for (size_t j = 0; j < v->n; j++, k++) {
-      PRec *r = &v->a[j];
-      LEv e = {r->ts, r->price, r->type, r->cat};
-      ev[pos[epid[k]]++] = e;
+    for (Blk *bk = pb[(size_t)t * NQART + q].head; bk; bk = bk->next) {
+      PRec *r = (PRec *)(bk + 1);
+      for (uint32_t j = 0; j < bk->n; j++) {
+        if (r[j].x & X_DEAD) continue;
+        ev[pos[pid[k++]]++] = ((uint64_t)r[j].ts << 32) | r[j].x;
+      }
     }
   }
   // clicks
-  uint32_t *cpid = xmalloc((nc ? nc : 1) * sizeof(uint32_t));
+  uint32_t *cpid = aalloc(S, (nc + 1) * 4);
+  uint32_t *coff = aalloc(S, ((size_t)np + 2) * 4); memset(coff, 0, ((size_t)np + 2) * 4);
   k = 0;
   for (int t = 0; t < NT; t++) {
-    CVec *v = &cbuf[(size_t)t * P2 + q];
-    for (size_t j = 0; j < v->n; j++, k++) {
-      CRec *r = &v->a[j];
-      uint64_t i = (r->ph >> 3) & mask;
-      uint32_t id = UINT32_MAX;
-      for (;;) {
-        NSlot *s = &tab[i];
-        if (!s->p) break;
-        if (s->ph == r->ph && str_eq(s->p, s->n, r->name, r->namen)) { id = s->idx; break; }
-        i = (i + 1) & mask;
+    for (Blk *bk = cb[(size_t)t * NQART + q].head; bk; bk = bk->next) {
+      CRec *r = (CRec *)(bk + 1);
+      for (uint32_t j = 0; j < bk->n; j++) {
+        uint64_t pk = r[j].pkey;
+        uint32_t i = (uint32_t)pk & pmask, id = UINT32_MAX;
+        for (;;) {
+          PSlot *s = &tab[i];
+          if (!s->pkey) break;
+          if (s->pkey == pk) { id = s->idx; break; }
+          i = (i + 1) & pmask;
+        }
+        cpid[k++] = id;
+        if (id != UINT32_MAX) coff[id + 1]++;
       }
-      cpid[k] = id;
     }
   }
-  uint32_t *coff = xcalloc(np + 2, sizeof(uint32_t));
-  for (size_t i = 0; i < nc; i++) if (cpid[i] != UINT32_MAX) coff[cpid[i] + 1]++;
   for (uint32_t i = 0; i < np; i++) coff[i + 1] += coff[i];
-  memcpy(pos, coff, (np + 1) * sizeof(uint32_t));
-  LCl *cl = xmalloc((coff[np] ? coff[np] : 1) * sizeof(LCl));
+  memcpy(pos, coff, ((size_t)np + 1) * 4);
+  LCl *cl = aalloc(S, ((size_t)coff[np] + 1) * sizeof(LCl));
   k = 0;
   for (int t = 0; t < NT; t++) {
-    CVec *v = &cbuf[(size_t)t * P2 + q];
-    for (size_t j = 0; j < v->n; j++, k++) {
-      if (cpid[k] == UINT32_MAX) continue;
-      CRec *r = &v->a[j];
-      LCl c = {r->ts, r->cid, r->cidn, r->camp};
-      cl[pos[cpid[k]]++] = c;
+    for (Blk *bk = cb[(size_t)t * NQART + q].head; bk; bk = bk->next) {
+      CRec *r = (CRec *)(bk + 1);
+      for (uint32_t j = 0; j < bk->n; j++) {
+        uint32_t id = cpid[k++];
+        if (id == UINT32_MAX) continue;
+        LCl c = {r[j].cref, r[j].ts, r[j].camp};
+        cl[pos[id]++] = c;
+      }
     }
   }
   UVec *ur = &urows[tid];
   CAgg *ca = &cagg[(size_t)tid * (ncamp + 1) * NDAYS];
   uint32_t *st = stamp[tid];
-  int64_t catsum[256];
+  int64_t catsum[32];
+  const int64_t c0day = CWS / 86400000LL; // CWS is a midnight in practice; keep general below
+  (void)c0day;
   for (uint32_t p = 0; p < np; p++) {
-    LEv *e = ev + eoff[p];
+    uint64_t *e = ev + eoff[p];
     uint32_t n = eoff[p + 1] - eoff[p];
     LCl *c = cl + coff[p];
     uint32_t m = coff[p + 1] - coff[p];
-    if (n > 1) {
-      if (n < 24) {
-        for (uint32_t i = 1; i < n; i++) { LEv x = e[i]; uint32_t j = i; while (j > 0 && e[j - 1].ts > x.ts) { e[j] = e[j - 1]; j--; } e[j] = x; }
-      } else qsort(e, n, sizeof(LEv), cmp_lev);
+    sort_u64(e, tmp, n);
+    if (m > 1) {
+      // insertion sort for small, qsort otherwise
+      if (m <= 16) {
+        for (uint32_t i = 1; i < m; i++) { LCl x = c[i]; uint32_t j = i; while (j > 0 && cmp_lcl(&c[j - 1], &x) > 0) { c[j] = c[j - 1]; j--; } c[j] = x; }
+      } else qsort(c, m, sizeof(LCl), cmp_lcl);
     }
-    if (m > 1) qsort(c, m, sizeof(LCl), cmp_lcl);
-    // walk sessions
     uint32_t lo = 0, hi = 0;
-    int32_t curday = INT32_MIN;
-    URow row = {0};
+    int64_t curday = INT64_MIN;
+    URow row; memset(&row, 0, sizeof row);
     uint32_t i = 0;
     while (i < n) {
-      int64_t s0 = e[i].ts;
-      int64_t last = s0;
-      int64_t rev = 0; int64_t cnt = 0; int purch = 0;
-      int32_t day = (int32_t)(s0 / 86400000LL);
+      uint32_t s0 = (uint32_t)(e[i] >> 32);
+      uint32_t last = s0;
+      int64_t rev = 0; uint32_t cnt = 0; int purch = 0;
+      int64_t day = (CWS + (int64_t)s0) / 86400000LL;
       if (day != curday) {
-        if (curday != INT32_MIN) {
-          int best = -1; int64_t bv = 0;
-          for (int z = 0; z < ncat; z++) if (catsum[z] > bv) { bv = catsum[z]; best = z; }
-          row.top = best;
-          VPUSH(*ur, row);
-        }
+        if (curday != INT64_MIN) flush_row(ur, &row, catsum);
         curday = day;
-        row.name = pname[p]; row.namen = pnamen[p]; row.day = day; row.sessions = 0; row.events = 0; row.revenue = 0;
+        row.name = names[p]; row.day = (int32_t)day; row.sessions = 0; row.events = 0; row.revenue = 0;
         for (int z = 0; z < ncat; z++) catsum[z] = 0;
       }
-      while (i < n && e[i].ts - last <= 1800000LL) {
-        last = e[i].ts;
+      while (i < n) {
+        uint32_t t = (uint32_t)(e[i] >> 32);
+        if (t - last > 1800000u) break;
+        last = t;
+        uint32_t x = (uint32_t)e[i];
         cnt++;
-        if (e[i].type == 2) { rev += e[i].price; purch = 1; catsum[e[i].cat] += e[i].price; }
+        if (x & X_PURCH) { uint32_t pr = x & 0xFFFFFF; rev += pr; purch = 1; catsum[(x >> 24) & 31] += pr; }
         i++;
       }
       row.sessions++; row.events += cnt; row.revenue += rev;
-      // attribution
       while (hi < m && c[hi].ts <= s0) hi++;
-      while (lo < hi && c[lo].ts < s0 - 604800000LL) lo++;
-      int di = day - DAY0;
+      while (lo < hi && (int64_t)c[lo].ts < (int64_t)s0 - 604800000LL) lo++;
+      int di = (int)(day - DAY0);
       uint32_t credited = (uint32_t)ncamp;
       if (hi > lo) {
         credited = c[hi - 1].camp;
@@ -610,14 +940,8 @@ static void sess_task(int tid, long q, void *ctx) {
       CAgg *a = &ca[(size_t)credited * NDAYS + di];
       a->sessions++; a->purch += purch; a->revenue += rev;
     }
-    if (curday != INT32_MIN) {
-      int best = -1; int64_t bv = 0;
-      for (int z = 0; z < ncat; z++) if (catsum[z] > bv) { bv = catsum[z]; best = z; }
-      row.top = best;
-      VPUSH(*ur, row);
-    }
+    if (curday != INT64_MIN) flush_row(ur, &row, catsum);
   }
-  free(tab); free(epid); free(pname); free(pnamen); free(eoff); free(pos); free(ev); free(cpid); free(coff); free(cl);
 }
 
 // ---------- parquet writer ----------
@@ -645,7 +969,7 @@ static void tw_bin(TW *w, int id, const char *s, size_t n) { tw_fh(w, id, 8); bv
 static void tw_sbeg(TW *w, int id) { tw_fh(w, id, 12); w->d++; w->last[w->d] = 0; }
 static void tw_send(TW *w) { bbyte(w->b, 0); w->d--; }
 static void tw_lbeg(TW *w, int id, int et, int n) { tw_fh(w, id, 9); if (n < 15) bbyte(w->b, (uint8_t)((n << 4) | et)); else { bbyte(w->b, (uint8_t)(0xF0 | et)); bvar(w->b, (uint64_t)n); } }
-static void tw_ebeg(TW *w) { w->d++; w->last[w->d] = 0; } // struct element in list
+static void tw_ebeg(TW *w) { w->d++; w->last[w->d] = 0; }
 static void tw_eend(TW *w) { bbyte(w->b, 0); w->d--; }
 
 enum { PT_INT32 = 1, PT_INT64 = 2, PT_BYTES = 6 };
@@ -653,8 +977,7 @@ enum { LT_NONE = 0, LT_STRING = 1, LT_DATE = 6 };
 typedef struct { const char *name; int type; int logical; int optional; } ColDef;
 typedef struct { Buf data; int64_t nvals; int64_t off; int64_t size; } ColOut;
 
-static void write_page(Buf *file, ColOut *co, const ColDef *cd, Buf *levels, int64_t nvals) {
-  // levels: already-encoded def levels (with 4-byte length prefix) or NULL
+static void write_page(Buf *file, ColOut *co, Buf *levels, int64_t nvals) {
   Buf hdr = {0};
   TW w = {&hdr, {0}, 0};
   size_t body = co->data.n + (levels ? levels->n : 0);
@@ -674,7 +997,6 @@ static void write_page(Buf *file, ColOut *co, const ColDef *cd, Buf *levels, int
   bput(file, co->data.b, co->data.n);
   co->size = (int64_t)(file->n) - co->off;
   co->nvals = nvals;
-  (void)cd;
   free(hdr.b);
 }
 
@@ -743,8 +1065,8 @@ static void write_file(const char *path, Buf *file) {
 }
 
 static const ColDef UCOLS[6] = {
-  {"user_id", PT_BYTES, LT_STRING, 0}, {"day", PT_INT32, LT_DATE, 0}, {"sessions", PT_INT64, 0, 0},
-  {"events", PT_INT64, 0, 0}, {"revenue_cents", PT_INT64, 0, 0}, {"top_category", PT_BYTES, LT_STRING, 1}};
+  {"user_id", PT_BYTES, LT_STRING, 0}, {"day", PT_INT32, LT_DATE, 0}, {"sessions", PT_INT32, 0, 0},
+  {"events", PT_INT32, 0, 0}, {"revenue_cents", PT_INT64, 0, 0}, {"top_category", PT_BYTES, LT_STRING, 1}};
 static const ColDef CCOLS[7] = {
   {"campaign_id", PT_BYTES, LT_STRING, 0}, {"channel", PT_BYTES, LT_STRING, 0}, {"day", PT_INT32, LT_DATE, 0},
   {"sessions", PT_INT64, 0, 0}, {"purchasing_sessions", PT_INT64, 0, 0}, {"revenue_cents", PT_INT64, 0, 0},
@@ -756,19 +1078,23 @@ static void write_user_task(int tid, long t, void *ctx) {
   (void)tid; (void)ctx;
   UVec *v = &urows[t];
   if (!v->n && t != 0) return;
-  ColOut co[6]; memset(co, 0, sizeof co);
-  Buf lev = {0};
   size_t n = v->n;
+  ColOut co[6]; memset(co, 0, sizeof co);
+  size_t sbytes = 0;
+  for (size_t i = 0; i < n; i++) sbytes += refn(v->a[i].name) + 4;
+  bres(&co[0].data, sbytes); bres(&co[1].data, n * 4); bres(&co[2].data, n * 4); bres(&co[3].data, n * 4);
+  bres(&co[4].data, n * 8); bres(&co[5].data, n * 16 + 16);
   for (size_t i = 0; i < n; i++) {
     URow *r = &v->a[i];
-    bu32(&co[0].data, r->namen); bput(&co[0].data, r->name, r->namen);
-    int32_t d = r->day; bput(&co[1].data, &d, 4);
-    bi64(&co[2].data, r->sessions);
-    bi64(&co[3].data, r->events);
-    bi64(&co[4].data, r->revenue);
+    uint32_t nn = refn(r->name);
+    memcpy(co[0].data.b + co[0].data.n, &nn, 4); memcpy(co[0].data.b + co[0].data.n + 4, refp(r->name), nn); co[0].data.n += 4 + nn;
+    int32_t d = r->day; memcpy(co[1].data.b + co[1].data.n, &d, 4); co[1].data.n += 4;
+    memcpy(co[2].data.b + co[2].data.n, &r->sessions, 4); co[2].data.n += 4;
+    memcpy(co[3].data.b + co[3].data.n, &r->events, 4); co[3].data.n += 4;
+    memcpy(co[4].data.b + co[4].data.n, &r->revenue, 8); co[4].data.n += 8;
     if (r->top >= 0) { bu32(&co[5].data, catn[r->top]); bput(&co[5].data, catp[r->top], catn[r->top]); }
   }
-  // def levels: bit-packed run
+  Buf lev = {0};
   size_t groups = (n + 7) / 8;
   Buf enc = {0};
   bvar(&enc, (groups << 1) | 1);
@@ -778,10 +1104,10 @@ static void write_user_task(int tid, long t, void *ctx) {
   enc.n += groups;
   bu32(&lev, (uint32_t)enc.n); bput(&lev, enc.b, enc.n);
   Buf file = {0};
+  size_t tot = 64 + lev.n; for (int c = 0; c < 6; c++) tot += co[c].data.n + 64;
+  bres(&file, tot + 4096);
   bput(&file, "PAR1", 4);
-  if (n) {
-    for (int c = 0; c < 6; c++) write_page(&file, &co[c], &UCOLS[c], c == 5 ? &lev : NULL, (int64_t)n);
-  }
+  if (n) for (int c = 0; c < 6; c++) write_page(&file, &co[c], c == 5 ? &lev : NULL, (int64_t)n);
   write_footer(&file, UCOLS, 6, co, (int64_t)n);
   char path[4096];
   snprintf(path, sizeof path, "%s/user_daily/part-%03ld.parquet", OUTDIR, t);
@@ -806,7 +1132,7 @@ static void write_campaign(void) {
       uint32_t chn = c == ncamp ? 7 : chann[c];
       bu32(&co[0].data, idn); bput(&co[0].data, id, idn);
       bu32(&co[1].data, chn); bput(&co[1].data, ch, chn);
-      int32_t day = DAY0 + d; bput(&co[2].data, &day, 4);
+      int32_t day = (int32_t)(DAY0 + d); bput(&co[2].data, &day, 4);
       bi64(&co[3].data, a.sessions);
       bi64(&co[4].data, a.purch);
       bi64(&co[5].data, a.revenue);
@@ -816,7 +1142,7 @@ static void write_campaign(void) {
   }
   Buf file = {0};
   bput(&file, "PAR1", 4);
-  if (n) for (int c = 0; c < 7; c++) write_page(&file, &co[c], &CCOLS[c], NULL, n);
+  if (n) for (int c = 0; c < 7; c++) write_page(&file, &co[c], NULL, n);
   write_footer(&file, CCOLS, 7, co, n);
   char path[4096];
   snprintf(path, sizeof path, "%s/campaign_daily/part-000.parquet", OUTDIR);
@@ -844,65 +1170,77 @@ static int64_t manifest_ts(const char *s, size_t n, const char *key) {
 typedef struct { const char *p; uint32_t n; } Str;
 static int cmp_str(const void *a, const void *b) { const Str *x = a, *y = b; return str_cmp(x->p, x->n, y->p, y->n); }
 
+// simple scalar CSV split for the small clean files
+static int split2(const char *p, size_t n, const char **fp, uint32_t *fl) {
+  const char *end = p + n; const char *s = p; int k = 0;
+  for (;;) {
+    const char *c = memchr(s, ',', (size_t)(end - s));
+    const char *fe = c ? c : end;
+    if (k >= 2) return 0;
+    size_t l = (size_t)(fe - s);
+    if (l && s[0] == '"') { if (l < 2 || s[l - 1] != '"') return 0; if (l > 2 && memchr(s + 1, '"', l - 2)) return 0; fp[k] = s + 1; fl[k] = (uint32_t)(l - 2); }
+    else { if (l && memchr(s, '"', l)) return 0; fp[k] = s; fl[k] = (uint32_t)l; }
+    k++;
+    if (!c) break;
+    s = c + 1;
+  }
+  return k == 2;
+}
+
 static void load_products(const char *dd) {
   char path[4096]; snprintf(path, sizeof path, "%s/products.csv", dd);
   MFile f = map_file(path);
-  // first pass: categories
-  VEC(Str) cats = {0};
+  Str *cats = xmalloc(sizeof(Str) * 64); int nc = 0, ccap = 64;
   SMap cm; smap_init(&cm, 1024);
-  size_t lines = 0;
-  for (size_t i = 0; i < f.n; i++) lines += f.p[i] == '\n';
-  smap_init(&prodmap, lines + 16);
+  size_t lines = f.n / 8 + 16;
+  smap_init(&prodmap, lines);
   const char *p = f.p, *end = f.p + f.n;
   const char *nl = memchr(p, '\n', f.n); p = nl ? nl + 1 : end;
-  VEC(Str) prods = {0}; VEC(Str) pcat = {0};
+  Str *prods = xmalloc(sizeof(Str) * lines), *pcat = xmalloc(sizeof(Str) * lines); size_t npd = 0;
   while (p < end) {
     nl = memchr(p, '\n', (size_t)(end - p));
     const char *le = nl ? nl : end;
     const char *fp[2]; uint32_t fl[2];
-    if (split_fields(p, (size_t)(le - p), 2, fp, fl)) {
+    if (le > p && split2(p, (size_t)(le - p), fp, fl)) {
       int cr;
       smap_put(&cm, fp[1], fl[1], 0, &cr);
-      if (cr) { Str s = {fp[1], fl[1]}; VPUSH(cats, s); }
-      Str a = {fp[0], fl[0]}, b = {fp[1], fl[1]};
-      VPUSH(prods, a); VPUSH(pcat, b);
+      if (cr) { if (nc == ccap) { ccap *= 2; cats = xrealloc(cats, sizeof(Str) * ccap); } cats[nc].p = fp[1]; cats[nc].n = fl[1]; nc++; }
+      prods[npd].p = fp[0]; prods[npd].n = fl[0]; pcat[npd].p = fp[1]; pcat[npd].n = fl[1]; npd++;
     }
     p = le + 1;
   }
   int cr;
   smap_put(&cm, "unknown", 7, 0, &cr);
-  if (cr) { Str s = {"unknown", 7}; VPUSH(cats, s); }
-  qsort(cats.a, cats.n, sizeof(Str), cmp_str);
-  ncat = (int)cats.n;
-  if (ncat > 255) die("too many categories");
+  if (cr) { if (nc == ccap) { ccap *= 2; cats = xrealloc(cats, sizeof(Str) * ccap); } cats[nc].p = "unknown"; cats[nc].n = 7; nc++; }
+  qsort(cats, nc, sizeof(Str), cmp_str);
+  ncat = nc;
+  if (ncat > 31) die("too many categories");
   catp = xmalloc(sizeof(char *) * ncat); catn = xmalloc(sizeof(uint32_t) * ncat);
   for (int i = 0; i < ncat; i++) {
-    catp[i] = cats.a[i].p; catn[i] = cats.a[i].n;
-    SSlot *s = smap_put(&cm, cats.a[i].p, cats.a[i].n, 0, &cr); s->v = i;
-    if (str_eq(cats.a[i].p, cats.a[i].n, "unknown", 7)) unknown_cat = i;
+    catp[i] = cats[i].p; catn[i] = cats[i].n;
+    SSlot *s = smap_put(&cm, cats[i].p, cats[i].n, 0, &cr); s->v = i;
+    if (str_eq(cats[i].p, cats[i].n, "unknown", 7)) unknown_cat = i;
   }
-  for (size_t i = 0; i < prods.n; i++) {
-    int32_t ci = smap_get(&cm, pcat.a[i].p, pcat.a[i].n);
-    SSlot *s = smap_put(&prodmap, prods.a[i].p, prods.a[i].n, ci, &cr);
-    (void)s;
+  for (size_t i = 0; i < npd; i++) {
+    int32_t ci = smap_get(&cm, pcat[i].p, pcat[i].n);
+    smap_put(&prodmap, prods[i].p, prods[i].n, ci, &cr);
   }
 }
 
 static void load_campaigns(const char *dd) {
   char path[4096]; snprintf(path, sizeof path, "%s/campaigns.csv", dd);
   MFile f = map_file(path);
-  size_t lines = 0;
-  for (size_t i = 0; i < f.n; i++) lines += f.p[i] == '\n';
-  smap_init(&campmap, lines + 16);
-  camp_id = xmalloc(sizeof(char *) * (lines + 2)); camp_idn = xmalloc(4 * (lines + 2));
-  chan = xmalloc(sizeof(char *) * (lines + 2)); chann = xmalloc(4 * (lines + 2));
+  size_t lines = f.n / 4 + 16;
+  smap_init(&campmap, lines);
+  camp_id = xmalloc(sizeof(char *) * lines); camp_idn = xmalloc(4 * lines);
+  chan = xmalloc(sizeof(char *) * lines); chann = xmalloc(4 * lines);
   const char *p = f.p, *end = f.p + f.n;
   const char *nl = memchr(p, '\n', f.n); p = nl ? nl + 1 : end;
   while (p < end) {
     nl = memchr(p, '\n', (size_t)(end - p));
     const char *le = nl ? nl : end;
     const char *fp[2]; uint32_t fl[2];
-    if (split_fields(p, (size_t)(le - p), 2, fp, fl) && fl[0]) {
+    if (le > p && split2(p, (size_t)(le - p), fp, fl) && fl[0]) {
       int cr;
       smap_put(&campmap, fp[0], fl[0], ncamp, &cr);
       if (cr) { camp_id[ncamp] = fp[0]; camp_idn[ncamp] = fl[0]; chan[ncamp] = fp[1]; chann[ncamp] = fl[1]; ncamp++; }
@@ -911,78 +1249,18 @@ static void load_campaigns(const char *dd) {
   }
 }
 
-static uint32_t *ufp;
-static uint32_t uf_find(uint32_t x) {
-  while (ufp[x] != x) { ufp[x] = ufp[ufp[x]]; x = ufp[x]; }
-  return x;
+static uint64_t *qsize;
+static int cmp_q(const void *a, const void *b) {
+  uint64_t x = qsize[*(const long *)a], y = qsize[*(const long *)b];
+  return x > y ? -1 : (x < y ? 1 : 0);
 }
 
-static void load_links(const char *dd) {
-  char dir[4096]; snprintf(dir, sizeof dir, "%s/links", dd);
-  char **paths; int nf = list_csv(dir, &paths);
-  MFile *fs = xmalloc(sizeof(MFile) * (nf ? nf : 1));
-  size_t bytes = 0;
-  for (int i = 0; i < nf; i++) { fs[i] = map_file(paths[i]); bytes += fs[i].n; }
-  size_t est = bytes / 6 + 64;
-  size_t cap = 16; while (cap < est) cap <<= 1;
-  lmap = xcalloc(cap, sizeof(LSlot)); lmask = cap - 1;
-  size_t ucap = 1024, nid = 0;
-  ufp = xmalloc(sizeof(uint32_t) * ucap);
-  uint32_t *slotof = xmalloc(sizeof(uint32_t) * ucap);
-  for (int fi = 0; fi < nf; fi++) {
-    const char *p = fs[fi].p, *end = p + fs[fi].n;
-    if (!fs[fi].n) continue;
-    const char *nl = memchr(p, '\n', fs[fi].n); p = nl ? nl + 1 : end;
-    while (p < end) {
-      nl = memchr(p, '\n', (size_t)(end - p));
-      const char *le = nl ? nl : end;
-      const char *fp[2]; uint32_t fl[2];
-      if (split_fields(p, (size_t)(le - p), 2, fp, fl) && fl[0] && fl[1]) {
-        uint32_t ids[2];
-        for (int s = 0; s < 2; s++) {
-          uint64_t h = hstr(fp[s], fl[s]);
-          uint64_t i = h & lmask;
-          for (;;) {
-            LSlot *sl = &lmap[i];
-            if (!sl->p) {
-              if (nid == ucap) { ucap *= 2; ufp = xrealloc(ufp, 4 * ucap); slotof = xrealloc(slotof, 4 * ucap); }
-              sl->h = h; sl->p = fp[s]; sl->n = fl[s]; sl->idx = (uint32_t)nid; ufp[nid] = (uint32_t)nid; slotof[nid] = (uint32_t)i; nid++;
-              if (nid * 2 > cap) die("link table full");
-              break;
-            }
-            if (sl->h == h && str_eq(sl->p, sl->n, fp[s], fl[s])) break;
-            i = (i + 1) & lmask;
-          }
-          ids[s] = lmap[i].idx;
-        }
-        uint32_t a = uf_find(ids[0]), b = uf_find(ids[1]);
-        if (a != b) { if (a < b) ufp[b] = a; else ufp[a] = b; }
-      }
-      p = le + 1;
-    }
-  }
-  // name each root by smallest id
-  uint32_t *best = xmalloc(sizeof(uint32_t) * (nid ? nid : 1));
-  for (size_t i = 0; i < nid; i++) best[i] = UINT32_MAX;
-  for (size_t i = 0; i < nid; i++) {
-    uint32_t r = uf_find((uint32_t)i);
-    LSlot *s = &lmap[slotof[i]];
-    if (best[r] == UINT32_MAX) best[r] = (uint32_t)i;
-    else { LSlot *b = &lmap[slotof[best[r]]]; if (str_cmp(s->p, s->n, b->p, b->n) < 0) best[r] = (uint32_t)i; }
-  }
-  for (size_t i = 0; i < nid; i++) {
-    uint32_t r = uf_find((uint32_t)i);
-    LSlot *b = &lmap[slotof[best[r]]];
-    LSlot *s = &lmap[slotof[i]];
-    s->np = b->p; s->nn = b->n;
-  }
-  if (nid == 0) { lmap = NULL; }
+static void close_task(int tid, long t, void *ctx) {
+  (void)tid; (void)ctx;
+  for (uint32_t i = 0; i < NPART; i++) bkt_close(&kb[(size_t)t * NPART + i], sizeof(KRec));
+  for (uint32_t i = 0; i < NQART; i++) { bkt_close(&pb[(size_t)t * NQART + i], sizeof(PRec)); bkt_close(&cb[(size_t)t * NQART + i], sizeof(CRec)); }
 }
 
-#include <time.h>
-static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
-static int PROF; static double T0;
-#define PH(name) do { if (PROF) fprintf(stderr, "%-10s %7.1f ms\n", name, (now_s() - T0) * 1e3); } while (0)
 int main(void) {
   PROF = getenv("SESS_PROF") != NULL; T0 = now_s();
   const char *dd = getenv("DATA_DIR"); if (!dd) dd = "/data";
@@ -990,40 +1268,65 @@ int main(void) {
   OUTDIR = (char *)od;
   const char *nc = getenv("NCPU");
   if (nc && atoi(nc) > 0) NT = atoi(nc);
-  if (NT > 64) NT = 64;
+  if (NT > 16) NT = 16;
   char path[4096];
   snprintf(path, sizeof path, "%s/manifest.json", dd);
   MFile mf = map_file(path);
   WS = manifest_ts(mf.p, mf.n, "\"window_start\"");
   WE = manifest_ts(mf.p, mf.n, "\"window_end\"");
   CWS = WS - 604800000LL;
-  DAY0 = (int32_t)(WS / 86400000LL);
+  DAY0 = WS / 86400000LL; if (WS < 0 && WS % 86400000LL) DAY0--;
   NDAYS = (int32_t)((WE - 1) / 86400000LL - DAY0 + 1);
   load_products(dd);
   load_campaigns(dd);
+  PH("small");
   load_links(dd);
-  PH("setup");
+  PH("links");
 
   char dir[4096];
   char **ep, **cp;
   snprintf(dir, sizeof dir, "%s/events", dd); int ne = list_csv(dir, &ep);
   snprintf(dir, sizeof dir, "%s/clicks", dd); int ncl = list_csv(dir, &cp);
-  for (int i = 0; i < ne; i++) add_chunks(map_file(ep[i]), 0);
-  for (int i = 0; i < ncl; i++) add_chunks(map_file(cp[i]), 1);
+  size_t ebytes = 0, cbytes = 0;
+  MFile *ef = xmalloc(sizeof(MFile) * (ne + 1)), *cf = xmalloc(sizeof(MFile) * (ncl + 1));
+  for (int i = 0; i < ne; i++) { ef[i] = map_file(ep[i]); ebytes += ef[i].n; }
+  for (int i = 0; i < ncl; i++) { cf[i] = map_file(cp[i]); cbytes += cf[i].n; }
+  size_t csz = 1u << 20;
+  for (int i = 0; i < ne; i++) add_chunks(ef[i], 0, csz);
+  for (int i = 0; i < ncl; i++) add_chunks(cf[i], 1, csz);
+  // partition sizing
+  uint64_t eest = ebytes / 60 + 1024, cest = cbytes / 45 + 1024;
+  PB = 6; while (PB < 14 && (eest >> PB) > 6000) PB++;
+  QB = 6; while (QB < 13 && (eest >> QB) > 10000) QB++;
+  NPART = 1u << PB; NQART = 1u << QB;
+  uint64_t per_t = eest / NT;
+  kcap0 = (uint32_t)(per_t / NPART); kcap0 = kcap0 + kcap0 / 4 + 32;
+  pcap0 = (uint32_t)(per_t / NQART); pcap0 = pcap0 + pcap0 / 4 + 32;
+  ccap0 = (uint32_t)(cest / NT / NQART); ccap0 = ccap0 / 2 + 32;
+  arenas = xcalloc(NT, sizeof(Arena)); scratch = xcalloc(NT, sizeof(Arena));
+  for (int t = 0; t < NT; t++) { arena_init(&arenas[t], ARENA_SZ); arena_init(&scratch[t], 1ull << 30); }
+  pend = xcalloc(NT, sizeof(Pend));
+  kb = xcalloc((size_t)NT * NPART, sizeof(Bkt));
+  pb = xcalloc((size_t)NT * NQART, sizeof(Bkt));
+  cb = xcalloc((size_t)NT * NQART, sizeof(Bkt));
   PH("map");
-  ebuf = xcalloc((size_t)NT * P1, sizeof(EVec));
-  pbuf = xcalloc((size_t)NT * P2, sizeof(PVec));
-  cbuf = xcalloc((size_t)NT * P2, sizeof(CVec));
-  run_par((long)chunks.n, parse_task, NULL);
+  run_par(nchunks, parse_task, NULL);
+  run_par(NT, close_task, NULL);
   PH("parse");
-  run_par(P1, dedup_task, NULL);
+  run_par(NPART, dedup_task, NULL);
   PH("dedup");
   urows = xcalloc(NT, sizeof(UVec));
   cagg = xcalloc((size_t)NT * (ncamp + 1) * NDAYS, sizeof(CAgg));
   stamp = xmalloc(sizeof(uint32_t *) * NT);
   stampv = xcalloc(NT, sizeof(uint32_t));
   for (int t = 0; t < NT; t++) stamp[t] = xcalloc(ncamp + 1, sizeof(uint32_t));
-  run_par(P2, sess_task, NULL);
+  // largest person partitions first
+  qsize = xcalloc(NQART, 8);
+  for (int t = 0; t < NT; t++) for (uint32_t q = 0; q < NQART; q++) for (Blk *k = pb[(size_t)t * NQART + q].head; k; k = k->next) qsize[q] += k->n;
+  long *order = xmalloc(sizeof(long) * NQART);
+  for (uint32_t q = 0; q < NQART; q++) order[q] = q;
+  qsort(order, NQART, sizeof(long), cmp_q);
+  run_par_o(NQART, order, sess_task, NULL);
   PH("sess");
   snprintf(dir, sizeof dir, "%s/user_daily", od); if (mkdir(dir, 0777) && errno != EEXIST) die(dir);
   snprintf(dir, sizeof dir, "%s/campaign_daily", od); if (mkdir(dir, 0777) && errno != EEXIST) die(dir);
