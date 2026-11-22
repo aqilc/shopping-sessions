@@ -912,8 +912,10 @@ static inline void ev_line(int tid, const char *ls, const char *const *sep, int 
   uint32_t x = 0;
   int ok = fl[1] > 0 && ts != BADTS && ts >= WS && ts < WE && fl[5] > 0;
   if (ok) {
-    if (fl[4] == 4 && memcmp(f[4], "view", 4) == 0) {}
-    else if (fl[4] == 4 && memcmp(f[4], "cart", 4) == 0) {}
+    // view and cart take one branch: which of the two a line is would mispredict
+    uint32_t t4;
+    memcpy(&t4, f[4], 4);
+    if (LIKELY((fl[4] == 4) & ((t4 == 0x77656976U) | (t4 == 0x74726163U)))) {}
     else if (fl[4] == 8 && memcmp(f[4], "purchase", 8) == 0) {
       uint32_t pr = parse_price(f[6], fl[6]);
       if (!pr) ok = 0;
