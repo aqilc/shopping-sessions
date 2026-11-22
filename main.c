@@ -292,6 +292,17 @@ static void arena_init(Arena *a, size_t sz) {
 #endif
   a->base = a->cur = m; a->end = m + sz;
 }
+// Zeroed anonymous memory on huge pages (random-access tables: avoids a TLB miss per probe).
+static void *hcalloc(size_t n) {
+  n = (n + (2u << 20) - 1) & ~(size_t)((2u << 20) - 1);
+  char *m = mmap(NULL, n + (2u << 20), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+  if (m == MAP_FAILED) die("hcalloc");
+  m = (char *)(((uintptr_t)m + (2u << 20) - 1) & ~(uintptr_t)((2u << 20) - 1));
+#ifdef MADV_HUGEPAGE
+  madvise(m, n, MADV_HUGEPAGE);
+#endif
+  return m;
+}
 INL void *aalloc(Arena *a, size_t n) {
   n = (n + 63) & ~(size_t)63;
   if (UNLIKELY(a->cur + n > a->end)) die("arena full");
@@ -659,8 +670,8 @@ static void load_links(const char *dd) {
   uint64_t est = 2 * lines + lines / 2 + 1024; // distinct IDs <= 2 * lines
   lcap = 1024; while (lcap < est) lcap <<= 1;
   lmask_b = lcap - 1;
-  lkey = xcalloc(lcap, 8); lref = xmalloc(lcap * 8);
-  lpar = xmalloc(lcap * 4); lbest = xmalloc(lcap * 4);
+  lkey = hcalloc(lcap * 8); lref = hcalloc(lcap * 8);
+  lpar = hcalloc(lcap * 4); lbest = hcalloc(lcap * 4);
   ledges = xcalloc(NT, sizeof(EVec));
   // chunks
   Chunk *save = chunks; long sn = nchunks, sc = chcap;
@@ -676,9 +687,9 @@ static void load_links(const char *dd) {
   // count ids
   uint64_t nid = 0;
   for (uint64_t i = 0; i < lcap; i++) nid += lkey[i] != 0;
-  uint64_t tc = 1024; while (tc < nid + nid / 2) tc <<= 1;
-  ltab = xcalloc(tc, sizeof(LEnt)); ltmask = tc - 1;
-  lname = xmalloc(lcap * 8);
+  uint64_t tc = 1024; while (tc < 4 * nid) tc <<= 1; // low load: a miss (unlinked ID) usually ends at the first slot
+  ltab = hcalloc(tc * sizeof(LEnt)); ltmask = tc - 1;
+  lname = hcalloc(lcap * 8);
   run_par(nspan, fill_task, NULL);
   have_links = nid > 0;
 }
