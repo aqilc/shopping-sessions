@@ -561,27 +561,28 @@ static int ncamp; static const char **camp_id; static uint32_t *camp_idn; static
 static uint32_t PB, QB; static uint32_t NPART, NQART; // eid partitions 2^PB, person partitions 2^QB
 
 // ---------- linked IDs ----------
-// build table: key hash, string ref, union-find parent, best (name) slot
-static _Atomic uint32_t *lpar; static _Atomic uint32_t *lbest;
-static uint64_t lcap, lmask_b;
-// lookup table: id hash -> person key
-// Link ID table, open addressing on the ID hash: val is the ID's string ref while links load, its person key after.
-typedef struct { _Atomic uint64_t key; uint64_t val; } LEnt;
-static LEnt *ltab; static uint64_t *lname; // lname[root slot] = name ref
+// Link ID table, open addressing on the ID hash in 2^LRB-slot regions (a region per hash partition, probes wrap
+// inside it): lkey[slot] = hash, lval[slot] = the ID's dense id (from 1) while links load, its root's after.
+// The dense arrays (by id): string ref, union-find parent, best (name) id, and lname[root] = name ref.
+static uint64_t *lkey; static uint32_t *lval;
+static uint64_t *lref; static _Atomic uint32_t *lpar; static _Atomic uint32_t *lbest; static uint64_t *lname;
+static uint64_t lcap; static uint32_t lshift, lrmask; static uint32_t lnid; // ids < lnid
 static int have_links;
 
 #define LINKED (1ull << 63)
 INL uint32_t qpart(uint64_t pkey) { return (uint32_t)((pkey >> 40) & (NQART - 1)); }
+INL uint64_t linked_key(uint32_t r) { return LINKED | (((uint64_t)r * 0x9E3779B97F4A7C15ull) & 0x7FFFFFFF00000000ull) | r; }
+INL uint64_t lhome(uint64_t h) { return h >> lshift; }
+INL uint64_t lnext_slot(uint64_t i) { return (i & ~(uint64_t)lrmask) | ((i + 1) & lrmask); }
 
 INL uint64_t person_of(uint64_t uh) {
   if (have_links) {
-    uint64_t i = uh & lmask_b;
+    uint64_t i = lhome(uh);
     for (;;) {
-      const LEnt *e = &ltab[i];
-      uint64_t k = atomic_load_explicit(&e->key, memory_order_relaxed);
-      if (k == uh) return e->val;
+      uint64_t k = lkey[i];
+      if (k == uh) return linked_key(lval[i]);
       if (!k) break;
-      i = (i + 1) & lmask_b;
+      i = lnext_slot(i);
     }
   }
   return uh & ~LINKED;
@@ -783,7 +784,7 @@ static inline void ev_line(int tid, const char *ls, const char *const *sep, int 
   uint64_t uh = 0;
   if (fl[1]) {
     uh = hstr(f[1], fl[1]);
-    if (have_links) __builtin_prefetch(&ltab[uh & lmask_b]);
+    if (have_links) { __builtin_prefetch(&lkey[lhome(uh)]); __builtin_prefetch(&lval[lhome(uh)]); }
   }
   int64_t is, ing;
   if (LIKELY(fl[3] == 20)) {
@@ -833,7 +834,7 @@ static inline void cl_line(int tid, const char *ls, const char *const *sep, int 
   if (nqf != nq) return;
   if (fl[0] == 0 || fl[1] == 0) return;
   uint64_t uh = hstr(f[1], fl[1]);
-  if (have_links) __builtin_prefetch(&ltab[uh & lmask_b]);
+  if (have_links) { __builtin_prefetch(&lkey[lhome(uh)]); __builtin_prefetch(&lval[lhome(uh)]); }
   int64_t ts = parse_ts(f[3], fl[3]);
   if (ts == BADTS || ts < CWS || ts >= WE) return;
   int32_t c = smap_get(&campmap, f[2], fl[2]);
@@ -908,31 +909,26 @@ typedef struct { Edge *e; size_t n, cap; } EVec;
 static EVec *ledges; // [NT]
 static Chunk *lchunks; static long nlchunks;
 
-INL uint32_t lt_insert(uint64_t h, const char *p, uint32_t n) {
-  uint64_t i = h & lmask_b;
-  for (;;) {
-    uint64_t k = atomic_load_explicit(&ltab[i].key, memory_order_acquire);
-    if (k == h) return (uint32_t)i;
-    if (k == 0) {
-      uint64_t z = 0;
-      if (atomic_compare_exchange_strong(&ltab[i].key, &z, h)) { ltab[i].val = mkref(p, n); return (uint32_t)i; }
-      if (z == h) return (uint32_t)i;
-    }
-    i = (i + 1) & lmask_b;
+// The parse writes each ID occurrence to a bucket by the top LPB hash bits; a task per bucket then inserts its IDs
+// into its own table region (L2-sized, no atomics) and writes the dense ids into the edges.
+typedef struct { uint64_t h, ref; uint32_t tid, pos; } LRec; // pos: edge index * 2 + side
+#define LBLK 256
+typedef struct LBlk { struct LBlk *next; uint32_t n; LRec r[LBLK]; } LBlk;
+typedef struct { LBlk *head; uint32_t n; } LBkt;
+static LBkt *lbkt; // [NT][LP]
+static uint32_t LPB, LP;
+static uint32_t *lbase; // [LP] first dense id of each bucket
+INL void lrec_put(int tid, uint64_t h, const char *p, uint32_t n, uint32_t pos) {
+  LBkt *b = &lbkt[(size_t)tid * LP + (LPB ? h >> (64 - LPB) : 0)];
+  LBlk *k = b->head;
+  if (UNLIKELY(!k || k->n == LBLK)) {
+    k = xmalloc(sizeof(LBlk));
+    k->next = b->head; k->n = 0;
+    b->head = k;
   }
-}
-// Link lines go through a delay line too: prefetch both slots, insert LRING lines later.
-#define LRING 16
-typedef struct { uint64_t ha, hb; const char *pa, *pb; uint32_t na, nb; } LPend;
-typedef struct { LPend e[LRING]; uint32_t n; char pad[60]; } LRing;
-static LRing *lring; // [NT]
-INL void lk_emit(int tid, const LPend *p) {
-  uint32_t a = lt_insert(p->ha, p->pa, p->na);
-  uint32_t b = lt_insert(p->hb, p->pb, p->nb);
-  if (a == b) return;
-  EVec *v = &ledges[tid];
-  if (v->n == v->cap) { v->cap = v->cap ? v->cap * 2 : 4096; v->e = xrealloc(v->e, v->cap * sizeof(Edge)); }
-  v->e[v->n].a = a; v->e[v->n].b = b; v->n++;
+  LRec *r = &k->r[k->n++];
+  r->h = h; r->ref = mkref(p, n); r->tid = (uint32_t)tid; r->pos = pos;
+  b->n++;
 }
 static inline void lk_line(int tid, const char *ls, const char *const *sep, int ns, uint32_t nq) {
   if (ns != 2) return;
@@ -940,21 +936,48 @@ static inline void lk_line(int tid, const char *ls, const char *const *sep, int 
   for (int k = 0; k < 2; k++) if (!field(ls, sep, k, &f[k], &fl[k], &nqf, nq)) return;
   if (nqf != nq) return;
   if (fl[0] == 0 || fl[1] == 0) return;
-  uint64_t ha = hstr(f[0], fl[0]), hb = hstr(f[1], fl[1]);
-  __builtin_prefetch(&ltab[ha & lmask_b], 1); __builtin_prefetch(&ltab[hb & lmask_b], 1);
-  LRing *R = &lring[tid];
-  LPend *e = &R->e[R->n % LRING];
-  if (R->n >= LRING) lk_emit(tid, e);
-  e->ha = ha; e->hb = hb; e->pa = f[0]; e->pb = f[1]; e->na = fl[0]; e->nb = fl[1];
-  R->n++;
-}
-static void lring_flush(int tid) {
-  LRing *R = &lring[tid];
-  for (uint32_t i = R->n > LRING ? R->n - LRING : 0; i < R->n; i++) lk_emit(tid, &R->e[i % LRING]);
-  R->n = 0;
+  EVec *v = &ledges[tid];
+  if (v->n == v->cap) { v->cap = v->cap ? v->cap * 2 : 4096; v->e = xrealloc(v->e, v->cap * sizeof(Edge)); }
+  uint32_t pos = (uint32_t)v->n++ * 2;
+  lrec_put(tid, hstr(f[0], fl[0]), f[0], fl[0], pos);
+  lrec_put(tid, hstr(f[1], fl[1]), f[1], fl[1], pos + 1);
 }
 #define LKL(ls, sep, ns, nq) lk_line(tid, ls, sep, ns, nq)
-static void link_parse_task(int tid, long t, void *ctx) { (void)ctx; const Chunk *c = &lchunks[t]; TOKENIZE(c, LKL); lring_flush(tid); }
+static void link_parse_task(int tid, long t, void *ctx) { (void)ctx; const Chunk *c = &lchunks[t]; TOKENIZE(c, LKL); }
+static void link_insert_task(int tid, long p, void *ctx) {
+  (void)tid; (void)ctx;
+  uint64_t lo = (uint64_t)p * (lrmask + 1ull);
+  lkey[lo] = 0; // a store first: lands on a real huge page, not the zero page a load would map
+  lval[lo] = 0;
+  uint32_t id = lbase[p];
+  for (int t = 0; t < NT; t++) {
+    for (LBlk *k = lbkt[(size_t)t * LP + p].head; k;) {
+      for (uint32_t j = 0; j < k->n; j++) {
+        const LRec *r = &k->r[j];
+        uint64_t i = lhome(r->h);
+        uint32_t d;
+        for (;;) {
+          uint64_t key = lkey[i];
+          if (key == r->h) { d = lval[i]; break; }
+          if (!key) {
+            d = id++;
+            lkey[i] = r->h; lval[i] = d;
+            lref[d] = r->ref;
+            atomic_store_explicit(&lpar[d], d, memory_order_relaxed);
+            atomic_store_explicit(&lbest[d], 0, memory_order_relaxed);
+            break;
+          }
+          i = lnext_slot(i);
+        }
+        Edge *e = &ledges[r->tid].e[r->pos >> 1];
+        if (r->pos & 1) e->b = d; else e->a = d;
+      }
+      LBlk *nx = k->next;
+      free(k);
+      k = nx;
+    }
+  }
+}
 
 INL uint32_t uf_find(uint32_t x) {
   for (;;) {
@@ -980,56 +1003,36 @@ static void uf_task(int tid, long t, void *ctx) {
   }
 }
 #define LSPAN 65536
-static void init_task(int tid, long t, void *ctx) {
+static void best_task(int tid, long t, void *ctx) { // lbest[root] = the id with the smallest string
   (void)tid; (void)ctx;
-  uint64_t lo = (uint64_t)t * LSPAN, hi = lo + LSPAN; if (hi > lcap) hi = lcap;
-  for (uint64_t i = lo; i < hi; i++) { atomic_store_explicit(&lpar[i], (uint32_t)i, memory_order_relaxed); atomic_store_explicit(&lbest[i], UINT32_MAX, memory_order_relaxed); }
-  // A span of ltab is 1 MB, so this writes every 2 MB page first: lt_insert's first touch is a load, which maps the
-  // huge zero page, and the store after it splits that into 4 KB pages (a fault per page, a TLB miss per lookup).
-  atomic_store_explicit(&ltab[lo].key, 0, memory_order_relaxed);
-}
-static void best_task(int tid, long t, void *ctx) {
-  (void)tid; (void)ctx;
-  uint64_t lo = (uint64_t)t * LSPAN, hi = lo + LSPAN; if (hi > lcap) hi = lcap;
-  for (uint64_t i = lo; i < hi; i++) {
-    if (!atomic_load_explicit(&ltab[i].key, memory_order_relaxed)) continue;
-    uint32_t r = uf_find((uint32_t)i);
-    uint64_t me = ltab[i].val;
+  uint32_t lo = (uint32_t)t * LSPAN, hi = lo + LSPAN;
+  if (lo == 0) lo = 1;
+  if (hi > lnid) hi = lnid;
+  for (uint32_t i = lo; i < hi; i++) {
+    uint64_t me = lref[i];
+    if (!me) continue; // a bucket's ids past its distinct IDs
+    uint32_t r = uf_find(i);
     uint32_t cur = atomic_load(&lbest[r]);
     for (;;) {
-      if (cur != UINT32_MAX) {
-        uint64_t o = ltab[cur].val;
+      if (cur) {
+        uint64_t o = lref[cur];
         if (str_cmp(refp(me), refn(me), refp(o), refn(o)) >= 0) break;
       }
-      if (atomic_compare_exchange_weak(&lbest[r], &cur, (uint32_t)i)) break;
+      if (atomic_compare_exchange_weak(&lbest[r], &cur, i)) break;
     }
   }
 }
-INL uint64_t mix64(uint64_t x) { x ^= x >> 33; x *= 0xff51afd7ed558ccdull; x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ull; x ^= x >> 33; return x; }
-static void name_task(int tid, long t, void *ctx) { // lname[root] = smallest ID's ref
-  (void)tid; (void)ctx;
-  uint64_t lo = (uint64_t)t * LSPAN, hi = lo + LSPAN; if (hi > lcap) hi = lcap;
-  for (uint64_t i = lo; i < hi; i++)
-    if (atomic_load_explicit(&ltab[i].key, memory_order_relaxed) && atomic_load_explicit(&lpar[i], memory_order_relaxed) == (uint32_t)i)
-      lname[i] = ltab[atomic_load(&lbest[i])].val;
-}
-static void pkey_task(int tid, long t, void *ctx) { // val: string ref -> person key
+static void pkey_task(int tid, long t, void *ctx) { // lval: id -> root id; lname[root] = its best id's string
   (void)tid; (void)ctx;
   uint64_t lo = (uint64_t)t * LSPAN, hi = lo + LSPAN; if (hi > lcap) hi = lcap;
   for (uint64_t i = lo; i < hi; i++) {
-    if (!atomic_load_explicit(&ltab[i].key, memory_order_relaxed)) continue;
-    uint32_t r = uf_find((uint32_t)i);
-    ltab[i].val = LINKED | (mix64(r) & 0x7FFFFFFF00000000ull) | r;
+    if (!lkey[i]) continue;
+    uint32_t id = lval[i];
+    uint32_t r = uf_find(id);
+    lval[i] = r;
+    if (r == id) lname[r] = lref[atomic_load_explicit(&lbest[r], memory_order_relaxed)];
   }
 }
-static _Atomic uint64_t nl_count;
-static void nl_task(int tid, long t, void *ctx) {
-  (void)tid; (void)ctx;
-  const Chunk *c = &lchunks[t]; const char *p = c->base + c->start, *e = c->base + c->end; uint64_t n = 0;
-  while ((p = memchr(p, '\n', (size_t)(e - p)))) { n++; p++; }
-  atomic_fetch_add(&nl_count, n);
-}
-
 static void load_links(const char *dd) {
   char dir[4096]; snprintf(dir, sizeof dir, "%s/links", dd);
   char **paths; int nf = list_csv(dir, &paths);
@@ -1037,35 +1040,43 @@ static void load_links(const char *dd) {
   MFile *fs = xmalloc(sizeof(MFile) * (nf ? nf : 1));
   for (int i = 0; i < nf; i++) { fs[i] = map_file(paths[i]); bytes += fs[i].n; }
   if (bytes == 0) return;
-  // chunks
   Chunk *save = chunks; long sn = nchunks, sc = chcap;
   chunks = NULL; nchunks = 0; chcap = 0;
   for (int i = 0; i < nf; i++) add_chunks(fs[i].p, paths[i], fs[i].n, 2, 1 << 18);
   lchunks = chunks; nlchunks = nchunks;
   chunks = save; nchunks = sn; chcap = sc;
-  run_par(nlchunks, nl_task, NULL);
-  PH(" l.count");
-  uint64_t lines = nf + nl_count;
-  uint64_t est = 2 * lines + lines / 2 + 1024; // distinct IDs <= 2 * lines
-  lcap = 1024; while (lcap < est) lcap <<= 1;
-  lmask_b = lcap - 1;
-  ltab = hcalloc(lcap * sizeof(LEnt));
-  lpar = hcalloc(lcap * 4); lbest = hcalloc(lcap * 4);
+  // ~2^13 ID occurrences per bucket at ~16 bytes of file per occurrence
+  LPB = 0; while (LPB < 20 && (bytes >> (17 + LPB))) LPB++;
+  LP = 1u << LPB;
+  lbkt = xcalloc((size_t)NT * LP, sizeof(LBkt));
   ledges = xcalloc(NT, sizeof(EVec));
-  lring = xcalloc(NT, sizeof(LRing));
-  long nspan = (long)((lcap + LSPAN - 1) / LSPAN);
-  run_par(nspan, init_task, NULL);
-  PH(" l.init");
   run_par(nlchunks, link_parse_task, NULL);
   PH(" l.parse");
+  // region = 2^LRB slots >= 1.1 x the largest bucket's occurrences (its distinct IDs, at most)
+  lbase = xmalloc(LP * sizeof(uint32_t));
+  uint64_t most = 0, nid = 1;
+  for (uint32_t p = 0; p < LP; p++) {
+    uint64_t n = 0;
+    for (int t = 0; t < NT; t++) n += lbkt[(size_t)t * LP + p].n;
+    lbase[p] = (uint32_t)nid;
+    nid += n;
+    if (n > most) most = n;
+  }
+  if (nid >= (1ull << 31)) die("links: too many IDs");
+  lnid = (uint32_t)nid;
+  uint32_t lrb = 4; while ((1ull << lrb) < most + most / 10 + 1) lrb++;
+  lrmask = (1u << lrb) - 1;
+  lcap = (uint64_t)LP << lrb;
+  lshift = 64 - LPB - lrb;
+  lkey = hcalloc(lcap * 8); lval = hcalloc(lcap * 4);
+  lref = hcalloc(nid * 8); lpar = hcalloc(nid * 4); lbest = hcalloc(nid * 4); lname = hcalloc(nid * 8);
+  run_par(LP, link_insert_task, NULL);
+  PH(" l.insert");
   run_par(NT, uf_task, NULL);
   PH(" l.uf");
-  run_par(nspan, best_task, NULL);
+  run_par((long)((lnid + LSPAN - 1) / LSPAN), best_task, NULL);
   PH(" l.best");
-  lname = hcalloc(lcap * 8);
-  run_par(nspan, name_task, NULL);
-  PH(" l.name");
-  run_par(nspan, pkey_task, NULL);
+  run_par((long)((lcap + LSPAN - 1) / LSPAN), pkey_task, NULL);
   have_links = 1;
 }
 
