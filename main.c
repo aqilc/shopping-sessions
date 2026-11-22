@@ -224,6 +224,7 @@ INL int64_t ts_cal(const char *p, unsigned ss, uint64_t bad) {
 }
 
 // ingest_ts is always valid F1 (rules.md), so it needs no checks: "YYYY-MM-DDTHH:MM:SSZ" -> epoch seconds.
+#if !defined(__AVX2__)
 INL int64_t ingest_s(const char *p) {
   uint64_t q0 = ts_pairs(ld8(p) ^ 0x2D30302D30303030ULL), q1 = ts_pairs(ld8(p + 8) ^ 0x30303A3030543030ULL);
   unsigned y = LANE(q0, 0) * 100 + LANE(q0, 2), mo = LANE(q0, 5);
@@ -237,6 +238,7 @@ INL int64_t ingest_s(const char *p) {
   } else days = days_from_civil(y, mo, da);
   return days * 86400 + hh * 3600 + mi * 60 + ss;
 }
+#endif
 
 // Lemire: 8 ASCII digits (first digit in the low byte) -> value. Zero bytes count as '0'.
 INL uint64_t ts_parse8(uint64_t w) {
@@ -377,6 +379,27 @@ INL int64_t parse_ts(const char *p, uint32_t n) {
   int64_t km = (int32_t)cm, bm = -(int64_t)bad;
   int64_t r = (cal & km) | (f3 & ~km);
   return (r & ~bm) | (BADTS & bm);
+}
+
+// parse_ts's F1 lanes without its checks. Reads p[0..32].
+INL int64_t ingest_s(const char *p) {
+  const TsForm *f = &ts_form[1];
+  __m256i z = _mm256_set1_epi8('0');
+  __m256i x = _mm256_sub_epi8(_mm256_loadu_si256((const __m256i *)p), z);
+  __m256i y = _mm256_sub_epi8(_mm256_loadu_si256((const __m256i *)(p + 1)), z);
+  __m256i u = _mm256_add_epi16(_mm256_maddubs_epi16(x, _mm256_load_si256((const __m256i *)f->wa)),
+                               _mm256_maddubs_epi16(y, _mm256_load_si256((const __m256i *)f->wb)));
+  __m256i g = _mm256_madd_epi16(u, _mm256_load_si256((const __m256i *)f->m));
+  __m128i g0 = _mm256_castsi256_si128(g);
+  uint64_t a = (uint64_t)_mm_cvtsi128_si64(g0), b = (uint64_t)_mm_extract_epi64(g0, 1);
+  unsigned ss = (unsigned)_mm_cvtsi128_si32(_mm256_extracti128_si256(g, 1));
+  unsigned yr = (uint32_t)a, mo = (uint32_t)(a >> 32), yi = yr - TS_Y0;
+  int64_t days;
+  if (LIKELY(yi < TS_NY)) {
+    unsigned leap = (unsigned)(ts_ystart[yi + 1] - ts_ystart[yi]) - 365;
+    days = ts_ystart[yi] + ts_moff[leap][mo];
+  } else days = days_from_civil(yr, mo, 1);
+  return ((days - 1) * 24 + (uint32_t)b) * 3600 + (b >> 32) + ss;
 }
 #else
 #define parse_ts parse_ts_any
@@ -718,7 +741,14 @@ static inline void ev_line(int tid, const char *ls, const char *const *sep, int 
     uh = hstr(f[1], fl[1]);
     if (have_links) __builtin_prefetch(&ltab[uh & lmask_b]);
   }
-  int64_t ing = LIKELY(fl[3] == 20) ? ingest_s(f[3]) * 1000 : parse_ts(f[3], fl[3]);
+  int64_t is, ing;
+  if (LIKELY(fl[3] == 20)) {
+    is = ingest_s(f[3]);
+    ing = is * 1000;
+  } else {
+    ing = parse_ts(f[3], fl[3]);
+    is = ing == BADTS ? 0xFFFFFFFFll : ing / 1000;
+  }
   int64_t ts = parse_ts(f[2], fl[2]);
   uint32_t x = 0;
   int ok = fl[1] > 0 && ts != BADTS && ts >= WS && ts < WE && fl[5] > 0;
@@ -735,7 +765,6 @@ static inline void ev_line(int tid, const char *ls, const char *const *sep, int 
     } else ok = 0;
   }
   if (ok && ing != BADTS && ing - ts > 86400000LL) ok = 0;
-  int64_t is = ing == BADTS ? 0xFFFFFFFFll : ing / 1000;
   if (is < 0) is = 0;
   if (is > 0xFFFFFFFFll) is = 0xFFFFFFFFll;
   // A valid event's KRec is written by ev_emit once its payload loc is known; dedup does not depend on KRec order
