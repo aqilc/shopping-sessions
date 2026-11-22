@@ -775,7 +775,8 @@ static uint32_t kcap0, pcap0, ccap0;
 // its offset in the block mod the run size. Blocks start at a 64 B-aligned aalloc plus the 16 B Blk header, and a
 // run is a multiple of 16 B, so every run is 16 B-aligned for _mm_stream_si128.
 // Sweep knobs (-DNAME=value): STAGE 0/1, records per run STP/STK/STC (stage bytes per thread = NQART * STP * 24
-// + NPART * STK * 16 + NQART * STC * 24), STREAM 0 flushes a run with plain stores instead of streaming ones.
+// + NPART * STK * 16 + NQART * STC * 24), STREAM 0 flushes a run with plain stores instead of streaming ones,
+// STW the streaming store width.
 #ifndef STAGE
 #if defined(__AVX2__)
 #define STAGE 1
@@ -795,15 +796,21 @@ static uint32_t kcap0, pcap0, ccap0;
 #ifndef STREAM
 #define STREAM 1
 #endif
+#ifndef STW
+#define STW 16 // bytes per streaming store; 32 needs SALIGN 1 and runs that are multiples of 32 B
+#endif
 #define PRUN (STP * sizeof(PRec))
 #define KRUN (STK * sizeof(KRec))
 #define CRUN (STC * sizeof(CRec))
 _Static_assert(sizeof(Blk) == 16 && PRUN % 16 == 0 && KRUN % 16 == 0 && CRUN % 16 == 0, "stage runs must stay 16 B-aligned");
+_Static_assert(STW == 16 || (STW == 32 && SALIGN && PRUN % 32 == 0 && KRUN % 32 == 0 && CRUN % 32 == 0), "32 B stores need 32 B-aligned runs");
 static char *pst; // [NT][NQART] PRec runs
 static char *kst; // [NT][NPART] KRec runs
 static char *cst; // [NT][NQART] CRec runs
 INL void run_stream(char *d, const char *s, size_t n) {
-#if defined(__AVX2__) && STREAM
+#if defined(__AVX2__) && STREAM && STW == 32
+  for (size_t i = 0; i < n; i += 32) _mm256_stream_si256((__m256i *)(d + i), _mm256_loadu_si256((const __m256i *)(s + i)));
+#elif defined(__AVX2__) && STREAM
   for (size_t i = 0; i < n; i += 16) _mm_stream_si128((__m128i *)(d + i), _mm_loadu_si128((const __m128i *)(s + i)));
 #else
   memcpy(d, s, n);
