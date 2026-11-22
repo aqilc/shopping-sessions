@@ -563,10 +563,10 @@ static uint32_t PB, QB; static uint32_t NPART, NQART; // eid partitions 2^PB, pe
 // ---------- linked IDs ----------
 // Link ID table, open addressing on the ID hash in 2^LRB-slot regions (a region per hash partition, probes wrap
 // inside it): lkey[slot] = hash, lval[slot] = the ID's dense id (from 1) while links load, its root's after.
-// The dense arrays (by id): string ref, union-find parent, best (name) id, and lname[root] = name ref.
+// The dense arrays (by id): string ref, its first 8 bytes as a big-endian number, and union-find parent. A root is its set's smallest ID, the person's name.
 static uint64_t *lkey; static uint32_t *lval;
-static uint64_t *lref; static _Atomic uint32_t *lpar; static _Atomic uint32_t *lbest; static uint64_t *lname;
-static uint64_t lcap; static uint32_t lshift, lrmask; static uint32_t lnid; // ids < lnid
+static uint64_t *lref, *lpre; static _Atomic uint32_t *lpar;
+static uint64_t lcap; static uint32_t lshift, lrmask;
 static int have_links;
 
 #define LINKED (1ull << 63)
@@ -753,7 +753,7 @@ INL uint64_t keep_str(int tid, uint64_t r) {
 INL void ev_emit(int tid, const EPend *p) {
   uint64_t pk = person_of(p->uh);
   size_t bi = (size_t)tid * NQART + qpart(pk);
-  PRec r = {pk, pk & LINKED ? 0 : keep_str(tid, p->uref), p->ts, p->x}; // a linked person's name is lname's
+  PRec r = {pk, pk & LINKED ? 0 : keep_str(tid, p->uref), p->ts, p->x}; // a linked person's name is its root's lref
   char *d = rec_put(&arenas[tid], &pb[bi], pst + bi * (ST * sizeof(PRec)), &r, sizeof(PRec), pcap0);
   KRec k = {p->eh, p->ingest, (uint32_t)((d - arenas[tid].base) >> 3)};
   size_t ki = (size_t)tid * NPART + (p->eh >> (64 - PB));
@@ -911,7 +911,7 @@ static Chunk *lchunks; static long nlchunks;
 
 // The parse writes each ID occurrence to a bucket by the top LPB hash bits; a task per bucket then inserts its IDs
 // into its own table region (L2-sized, no atomics) and writes the dense ids into the edges.
-typedef struct { uint64_t h, ref; uint32_t tid, pos; } LRec; // pos: edge index * 2 + side
+typedef struct { uint64_t h, ref, pre; uint32_t tid, pos; } LRec; // pos: edge index * 2 + side
 #define LBLK 256
 typedef struct LBlk { struct LBlk *next; uint32_t n; LRec r[LBLK]; } LBlk;
 typedef struct { LBlk *head; uint32_t n; } LBkt;
@@ -927,7 +927,10 @@ INL void lrec_put(int tid, uint64_t h, const char *p, uint32_t n, uint32_t pos) 
     b->head = k;
   }
   LRec *r = &k->r[k->n++];
-  r->h = h; r->ref = mkref(p, n); r->tid = (uint32_t)tid; r->pos = pos;
+  uint64_t w;
+  memcpy(&w, p, 8); // the read buffer has PAD readable bytes past every line
+  if (n < 8) w &= (1ull << (8 * n)) - 1;
+  r->h = h; r->ref = mkref(p, n); r->pre = __builtin_bswap64(w); r->tid = (uint32_t)tid; r->pos = pos;
   b->n++;
 }
 static inline void lk_line(int tid, const char *ls, const char *const *sep, int ns, uint32_t nq) {
@@ -963,8 +966,8 @@ static void link_insert_task(int tid, long p, void *ctx) {
             d = id++;
             lkey[i] = r->h; lval[i] = d;
             lref[d] = r->ref;
+            lpre[d] = r->pre;
             atomic_store_explicit(&lpar[d], d, memory_order_relaxed);
-            atomic_store_explicit(&lbest[d], 0, memory_order_relaxed);
             break;
           }
           i = lnext_slot(i);
@@ -992,45 +995,30 @@ static void uf_task(int tid, long t, void *ctx) {
   (void)tid; (void)ctx;
   EVec *v = &ledges[t];
   for (size_t i = 0; i < v->n; i++) {
+    if (i + 16 < v->n) {
+      __builtin_prefetch(&lpar[v->e[i + 16].a]); __builtin_prefetch(&lpar[v->e[i + 16].b]);
+      __builtin_prefetch(&lpre[v->e[i + 16].a]); __builtin_prefetch(&lpre[v->e[i + 16].b]);
+    }
     uint32_t a = v->e[i].a, b = v->e[i].b;
     for (;;) {
       a = uf_find(a); b = uf_find(b);
       if (a == b) break;
-      if (a < b) { uint32_t s = a; a = b; b = s; } // link larger root under smaller
+      // link the root with the larger string under the smaller (ids break ties: equal hashes are one id)
+      uint64_t pa = lpre[a], pb = lpre[b];
+      int c = pa != pb ? (pa < pb ? -1 : 1) : str_cmp(refp(lref[a]), refn(lref[a]), refp(lref[b]), refn(lref[b]));
+      if (c < 0 || (c == 0 && a < b)) { uint32_t s = a; a = b; b = s; }
       uint32_t exp = a;
       if (atomic_compare_exchange_strong(&lpar[a], &exp, b)) break;
     }
   }
 }
 #define LSPAN 65536
-static void best_task(int tid, long t, void *ctx) { // lbest[root] = the id with the smallest string
-  (void)tid; (void)ctx;
-  uint32_t lo = (uint32_t)t * LSPAN, hi = lo + LSPAN;
-  if (lo == 0) lo = 1;
-  if (hi > lnid) hi = lnid;
-  for (uint32_t i = lo; i < hi; i++) {
-    uint64_t me = lref[i];
-    if (!me) continue; // a bucket's ids past its distinct IDs
-    uint32_t r = uf_find(i);
-    uint32_t cur = atomic_load(&lbest[r]);
-    for (;;) {
-      if (cur) {
-        uint64_t o = lref[cur];
-        if (str_cmp(refp(me), refn(me), refp(o), refn(o)) >= 0) break;
-      }
-      if (atomic_compare_exchange_weak(&lbest[r], &cur, i)) break;
-    }
-  }
-}
-static void pkey_task(int tid, long t, void *ctx) { // lval: id -> root id; lname[root] = its best id's string
+static void pkey_task(int tid, long t, void *ctx) { // lval: id -> root id
   (void)tid; (void)ctx;
   uint64_t lo = (uint64_t)t * LSPAN, hi = lo + LSPAN; if (hi > lcap) hi = lcap;
   for (uint64_t i = lo; i < hi; i++) {
     if (!lkey[i]) continue;
-    uint32_t id = lval[i];
-    uint32_t r = uf_find(id);
-    lval[i] = r;
-    if (r == id) lname[r] = lref[atomic_load_explicit(&lbest[r], memory_order_relaxed)];
+    lval[i] = uf_find(lval[i]);
   }
 }
 static void load_links(const char *dd) {
@@ -1063,19 +1051,16 @@ static void load_links(const char *dd) {
     if (n > most) most = n;
   }
   if (nid >= (1ull << 31)) die("links: too many IDs");
-  lnid = (uint32_t)nid;
   uint32_t lrb = 4; while ((1ull << lrb) < most + most / 10 + 1) lrb++;
   lrmask = (1u << lrb) - 1;
   lcap = (uint64_t)LP << lrb;
   lshift = 64 - LPB - lrb;
   lkey = hcalloc(lcap * 8); lval = hcalloc(lcap * 4);
-  lref = hcalloc(nid * 8); lpar = hcalloc(nid * 4); lbest = hcalloc(nid * 4); lname = hcalloc(nid * 8);
+  lref = hcalloc(nid * 8); lpre = hcalloc(nid * 8); lpar = hcalloc(nid * 4);
   run_par(LP, link_insert_task, NULL);
   PH(" l.insert");
   run_par(NT, uf_task, NULL);
   PH(" l.uf");
-  run_par((long)((lnid + LSPAN - 1) / LSPAN), best_task, NULL);
-  PH(" l.best");
   run_par((long)((lcap + LSPAN - 1) / LSPAN), pkey_task, NULL);
   have_links = 1;
 }
@@ -1330,7 +1315,7 @@ static void sess_task(int tid, long q, void *ctx) {
           }
           pt.key[i] = pk; pt.id[i] = np;
           pkeys[np] = pk;
-          names[np] = pk & LINKED ? lname[(uint32_t)pk] : r[j].uref;
+          names[np] = pk & LINKED ? lref[(uint32_t)pk] : r[j].uref;
           np++;
           eoff[np] = 0;
         }
