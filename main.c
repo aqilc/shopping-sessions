@@ -1510,8 +1510,46 @@ INL uint32_t pt_find(const PTab *t, uint64_t pk) {
 #define BSH 20
 typedef struct { uint32_t mn, mx, cnt, day; uint64_t rev; } TBkt; // day: index of the session's day, set by the walk
 
-static void sess_task(int tid, long q, void *ctx) {
-  (void)ctx;
+// A partition's records are cold when its task starts, and reading them is most of gather: every thread streams
+// from memory at once. So a thread claims its next partition one task early and fetches that partition's blocks
+// during the walk of the current one, which computes on cached data and leaves the memory bus idle.
+static uint64_t *qsize; // [NQART] events per person partition
+#ifndef AHEAD
+#define AHEAD 1
+#endif
+typedef struct { const Blk *k; const char *p, *end; long q; int c; } Ahead; // c: next chain, events then clicks
+static void ahead_init(Ahead *a, long q) {
+  a->k = NULL; a->p = a->end = NULL; a->q = AHEAD ? q : -1; a->c = 0;
+  if (a->q < 0) return;
+  for (int t = 0; t < NT; t++) {
+    __builtin_prefetch(pb[(size_t)t * NQART + q].head, 0, 2);
+    __builtin_prefetch(cb[(size_t)t * NQART + q].head, 0, 2);
+  }
+}
+// Fetches the next `lines` cache lines of the partition's blocks.
+INL void ahead_step(Ahead *a, uint32_t lines) {
+  if (a->q < 0) return;
+  for (; lines; lines--) {
+    if (a->p >= a->end) {
+      const Blk *k = a->k ? a->k->next : NULL;
+      while (!k) {
+        if (a->c == 2 * NT) { a->q = -1; return; }
+        int c = a->c++;
+        k = c < NT ? pb[(size_t)c * NQART + a->q].head : cb[(size_t)(c - NT) * NQART + a->q].head;
+      }
+      __builtin_prefetch(k->next, 0, 2);
+      a->k = k;
+      a->p = (const char *)k + 64;
+      a->end = (const char *)(k + 1) + (size_t)k->n * sizeof(PRec);
+      continue;
+    }
+    __builtin_prefetch(a->p, 0, 2);
+    a->p += 64;
+  }
+}
+_Static_assert(sizeof(PRec) == sizeof(CRec), "ahead_step sizes both kinds of block alike");
+
+static void sess_task(int tid, long q, long nq) {
   Arena *S = &scratch[tid]; S->cur = S->base;
   size_t ne = 0, nc = 0;
   for (int t = 0; t < NT; t++) {
@@ -1648,7 +1686,13 @@ static void sess_task(int tid, long q, void *ctx) {
   uint32_t *scnt = aalloc(S, nalive * 4);
   int64_t *srev = aalloc(S, nalive * 8);
   uint32_t so = 0;
+  Ahead ah;
+  ahead_init(&ah, nq);
+  // lines per person so the walk covers the next partition: its events and about a quarter as many clicks
+  uint64_t ahl = nq < 0 ? 0 : qsize[nq] * (sizeof(PRec) * 5 / 4) / 64 / np + 2;
+  uint32_t ahn = ahl < 512 ? (uint32_t)ahl : 512;
   for (uint32_t p = 0; p < np; p++) {
+    ahead_step(&ah, ahn);
     const uint64_t *e = ev + eoff[p];
     uint32_t n = eoff[p + 1] - eoff[p];
     uint64_t *c = cl + coff[p];
@@ -2204,7 +2248,18 @@ static void load_campaigns(const char *dd) {
   }
 }
 
-static uint64_t *qsize;
+// A sess thread: partitions in `sess_order`, each claimed one task before its turn so sess_task knows which
+// comes next, then the thread's user_daily file.
+static const long *sess_order; static atomic_long sess_next;
+static void sess_thread(int tid, long t, void *ctx) {
+  long cur = atomic_fetch_add_explicit(&sess_next, 1, memory_order_relaxed);
+  while (cur < (long)NQART) {
+    long nxt = atomic_fetch_add_explicit(&sess_next, 1, memory_order_relaxed);
+    sess_task(tid, sess_order[cur], nxt < (long)NQART ? sess_order[nxt] : -1);
+    cur = nxt;
+  }
+  write_user_task(tid, t, ctx);
+}
 static int cmp_q(const void *a, const void *b) {
   uint64_t x = qsize[*(const long *)a], y = qsize[*(const long *)b];
   return x > y ? -1 : (x < y ? 1 : 0);
@@ -2329,7 +2384,9 @@ int main(void) {
   snprintf(dir, sizeof dir, "%s/user_daily", od); if (mkdir(dir, 0777) && errno != EEXIST) die(dir);
   snprintf(dir, sizeof dir, "%s/campaign_daily", od); if (mkdir(dir, 0777) && errno != EEXIST) die(dir);
   // each thread writes its user_daily file the moment the queue runs dry, while the others finish their partitions
-  run_par_f(NQART, order, sess_task, write_user_task, NULL);
+  sess_order = order;
+  atomic_init(&sess_next, 0);
+  run_par_f(0, NULL, NULL, sess_thread, NULL);
   PH("sess");
   {
     static const char *const sn[] = {" d.split", " d.probe", " s.gather", " s.sort", " s.clicks", " s.walk", " s.assist"};
