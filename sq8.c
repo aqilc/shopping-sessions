@@ -1286,13 +1286,8 @@ static void load_links(const char *dd) {
 }
 
 // ---------- dedup ----------
-#define DSUB 1024 // most entries per dedup sub-table, so its 2^11-2^12 slots (16-32 KB) stay in L1 (Mac: 1024 beat 512, 2048, 4096)
-INL void kill_loc(uint32_t tl) {
-  uint32_t l = tl & 0x0FFFFFFFu;
-  if (l == LOC_NONE) return;
-  PRec *r = (PRec *)(arenas[tl >> 28].base + ((size_t)l << 3));
-  r->x |= X_DEAD;
-}
+#define DPF 8 // records ahead whose table slot is prefetched
+INL PRec *kill_rec(uint32_t tl) { return (PRec *)(arenas[tl >> 28].base + ((size_t)(tl & 0x0FFFFFFFu) << 3)); }
 static void dedup_task(int tid, long q, void *ctx) {
   (void)ctx;
   size_t cnt = 0;
@@ -1302,55 +1297,52 @@ static void dedup_task(int tid, long q, void *ctx) {
   uint64_t t0 = PROF ? ticks() : 0;
   // 8-byte entry: 32 hash bits as a fingerprint << 32 | the record's ref (thread << 28 | arena offset / 16, never 0
   // since a block header comes first); a fingerprint match is confirmed on the records.
-  // The entries go to sub-tables by low hash bits first, each small enough to probe in L1.
-  uint32_t nsub = 1;
-  while (cnt / nsub > DSUB) nsub <<= 1;
-  uint64_t *ent = aalloc(s, (size_t)nsub * cnt * 8); // sub-table i fills from ent + i * cnt
-  uint32_t *fill = aalloc(s, (size_t)nsub * 4); memset(fill, 0, (size_t)nsub * 4);
+  // One table per partition, probed straight off the records: it sits in L2, and the slot of the record DPF ahead
+  // is prefetched, so no split pass copies the keys first.
+  uint32_t cap = 64; while (cap < cnt * 2) cap <<= 1;
+  uint32_t mask = cap - 1;
+  uint64_t *tab = aalloc(s, (size_t)cap * 8);
+  memset(tab, 0, (size_t)cap * 8);
+  // A losing copy's payload is a cold line anywhere in the arenas: it is prefetched when found and marked dead
+  // after the pass, so those misses overlap instead of each stalling the probe loop.
+  uint32_t *kl = aalloc(s, cnt * 4);
+  size_t nk = 0;
+  SP_ADD(tid, SP_DSPLIT, t0);
   for (int t = 0; t < NT; t++) {
     const char *ab = arenas[t].base;
     for (Blk *k = kb[(size_t)t * NPART + q].head; k; k = k->next) {
       KRec *r = (KRec *)(k + 1);
+      if (k->next) __builtin_prefetch(k->next);
       uint64_t ref0 = ((uint64_t)t << 28) | (uint64_t)(((const char *)r - ab) >> 4);
-      for (uint32_t j = 0; j < k->n; j++) {
+      uint32_t n = k->n;
+      for (uint32_t j = 0; j < n; j++) {
+        if (j + DPF < n) __builtin_prefetch(&tab[(uint32_t)(r[j + DPF].h >> 24) & mask], 1);
         uint64_t h = r[j].h;
-        uint32_t b = (uint32_t)(h >> 1) & (nsub - 1); // hstr sets bit 0
-        ent[(size_t)b * cnt + fill[b]++] = ((h >> 24) << 32) | (ref0 + j);
-      }
-    }
-  }
-  uint32_t most = 0;
-  for (uint32_t b = 0; b < nsub; b++) most = fill[b] > most ? fill[b] : most;
-  uint32_t cap = 64; while (cap < most * 2) cap <<= 1;
-  uint64_t *tab = aalloc(s, (size_t)cap * 8);
-  SP_ADD(tid, SP_DSPLIT, t0);
-  for (uint32_t b = 0; b < nsub; b++) {
-    const uint64_t *e = ent + (size_t)b * cnt;
-    uint32_t n = fill[b];
-    cap = 64; while (cap < n * 2) cap <<= 1;
-    uint32_t mask = cap - 1;
-    memset(tab, 0, (size_t)cap * 8);
-    for (uint32_t j = 0; j < n; j++) {
-      uint64_t v = e[j];
-      uint64_t fp = v & 0xFFFFFFFF00000000ull;
-      uint32_t i = (uint32_t)(v >> 32) & mask;
-      for (;;) {
-        uint64_t d = tab[i];
-        if (!d) { tab[i] = v; break; }
-        if ((d & 0xFFFFFFFF00000000ull) == fp) {
-          uint32_t dr = (uint32_t)d, vr = (uint32_t)v;
-          KRec *o = (KRec *)(arenas[dr >> 28].base + ((size_t)(dr & 0x0FFFFFFFu) << 4));
-          KRec *r = (KRec *)(arenas[vr >> 28].base + ((size_t)(vr & 0x0FFFFFFFu) << 4));
-          if (o->h == r->h) {
-            if (r->ingest < o->ingest) { kill_loc((dr & 0xF0000000u) | o->loc); tab[i] = v; }
-            else kill_loc((vr & 0xF0000000u) | r->loc);
-            break;
+        uint64_t v = ((h >> 24) << 32) | (ref0 + j);
+        uint64_t fp = v & 0xFFFFFFFF00000000ull;
+        uint32_t i = (uint32_t)(h >> 24) & mask;
+        for (;;) {
+          uint64_t d = tab[i];
+          if (!d) { tab[i] = v; break; }
+          if ((d & 0xFFFFFFFF00000000ull) == fp) {
+            uint32_t dr = (uint32_t)d;
+            KRec *o = (KRec *)(arenas[dr >> 28].base + ((size_t)(dr & 0x0FFFFFFFu) << 4));
+            if (o->h == h) {
+              uint32_t dead = ((uint32_t)t << 28) | r[j].loc;
+              if (r[j].ingest < o->ingest) { dead = (dr & 0xF0000000u) | o->loc; tab[i] = v; }
+              if ((dead & 0x0FFFFFFFu) != LOC_NONE) {
+                __builtin_prefetch(kill_rec(dead), 1);
+                kl[nk++] = dead;
+              }
+              break;
+            }
           }
+          i = (i + 1) & mask;
         }
-        i = (i + 1) & mask;
       }
     }
   }
+  for (size_t j = 0; j < nk; j++) kill_rec(kl[j])->x |= X_DEAD;
   SP_ADD(tid, SP_DPROBE, t0);
 }
 
@@ -1678,14 +1670,13 @@ static void sess_task(int tid, long q, long nq) {
   uint64_t *bits = aalloc(S, 64 * 8); memset(bits, 0, 64 * 8);
   int64_t *catd = aalloc(S, (size_t)NDAYS * 32 * 8); memset(catd, 0, (size_t)NDAYS * 32 * 8);
   uint32_t *dmask = aalloc(S, (size_t)NDAYS * 4); memset(dmask, 0, (size_t)NDAYS * 4);
-  uint64_t *pur = aalloc(S, nalive * 8 + 8); // the person's purchases, ts << 32 | x
+  uint64_t *pur = aalloc(S, nalive * 8); // the person's purchases, ts << 32 | x
   // sessions, person after person from soff[p]: start ts, day index, events, revenue
   uint32_t *soff = aalloc(S, ((size_t)np + 1) * 4);
-  uint32_t *sst0 = aalloc(S, nalive * 4 + 4); // the click merges read one past a person's sessions
+  uint32_t *sst0 = aalloc(S, nalive * 4);
   uint32_t *sdi0 = aalloc(S, nalive * 4);
   uint32_t *scnt = aalloc(S, nalive * 4);
   int64_t *srev = aalloc(S, nalive * 8);
-  uint32_t *shi = aalloc(S, ((size_t)nb + 1) * 4); // per session of the person: clicks at or before its start
   uint32_t so = 0;
   Ahead ah;
   ahead_init(&ah, nq);
@@ -1717,7 +1708,6 @@ static void sess_task(int tid, long q, long nq) {
       B->mn = t < B->mn ? t : B->mn;
       B->mx = t > B->mx ? t : B->mx;
       B->cnt++;
-      // branch-free: whether an event is a purchase is not predictable
       if (x & X_PURCH) { B->rev += x & 0xFFFFFF; pur[npur++] = e[i]; }
     }
     // The non-empty buckets go to a bitmap here, not per event: an event's update of a bitmap word waits for the
@@ -1730,10 +1720,7 @@ static void sess_task(int tid, long q, long nq) {
     }
     // buckets in ts order -> sessions. One loop over the nbk set bits, the next word picked by selects: a loop
     // per word leaves it after 1 or 2 buckets, a mispredicted exit for about every session.
-    // A session break is a coin flip per bucket, so the session's start, day and sums are carried in selects and
-    // stored for every bucket.
-    uint32_t ns = 0, last = 0, w = 0, scur = 0, dcur = 0, ccur = 0;
-    int64_t rcur = 0;
+    uint32_t ns = 0, last = 0, w = 0;
     uint64_t bw = 0;
     for (uint32_t k = nbk; k; k--) {
       uint32_t wn = (uint32_t)__builtin_ctzll(wmask | 1ull << 63);
@@ -1745,20 +1732,17 @@ static void sess_task(int tid, long q, long nq) {
       bits[w] = 0;
       TBkt *B = &tb[w * 64 + (uint32_t)__builtin_ctzll(bw)];
       bw &= bw - 1;
-      uint32_t mn = B->mn;
-      int brk = !ns | (mn - last > 1800000u);
-      uint32_t dnew = (uint32_t)((CWS + (int64_t)mn) / 86400000LL - DAY0);
-      scur = brk ? mn : scur;
-      dcur = brk ? dnew : dcur;
-      ccur = (brk ? 0 : ccur) + B->cnt;
-      rcur = (brk ? 0 : rcur) + (int64_t)B->rev;
-      ns += (uint32_t)brk;
+      if (!ns || B->mn - last > 1800000u) {
+        sst[ns] = B->mn;
+        sdi[ns] = (uint32_t)((CWS + (int64_t)B->mn) / 86400000LL - DAY0);
+        scnt[so + ns] = 0;
+        srev[so + ns] = 0;
+        ns++;
+      }
       last = B->mx;
-      sst[ns - 1] = scur;
-      sdi[ns - 1] = dcur;
-      scnt[so + ns - 1] = ccur;
-      srev[so + ns - 1] = rcur;
-      B->day = dcur;
+      scnt[so + ns - 1] += B->cnt;
+      srev[so + ns - 1] += (int64_t)B->rev;
+      B->day = sdi[ns - 1];
       B->mn = UINT32_MAX; B->mx = 0; B->cnt = 0; B->rev = 0;
     }
     // purchases count for the category of their session's day
@@ -1771,15 +1755,7 @@ static void sess_task(int tid, long q, long nq) {
       dmask[d] |= 1u << cat;
     }
     // sessions -> credited click, campaign aggregates, one row per day
-    // The clicks at or before each session start come from one select-driven merge: a scan per session ends on
-    // a mispredicted exit. c[m] is readable (the click array is allocated one longer).
-    for (uint32_t z = 0, h = 0; z < ns;) {
-      uint32_t adv = (uint32_t)(h < m) & (uint32_t)((uint32_t)(c[h] >> 32) <= sst[z]);
-      shi[z] = h;
-      h += adv;
-      z += adv ^ 1;
-    }
-    uint32_t rses = 0, revs = 0;
+    uint32_t hi = 0, rses = 0, revs = 0;
     int64_t rrev = 0;
     for (uint32_t z = 0; z < ns; z++) {
       uint32_t s0 = sst[z], di = sdi[z];
@@ -1797,7 +1773,7 @@ static void sess_task(int tid, long q, long nq) {
       rses++;
       revs += scnt[so + z];
       rrev += srev[so + z];
-      uint32_t hi = shi[z];
+      while (hi < m && (uint32_t)(c[hi] >> 32) <= s0) hi++;
       // latest ts wins; among equal ts the smallest click_id. Branch-free but for ties: whether a session has a
       // qualifying click is a coin flip. c[0] is readable even for m == 0 (the click run is allocated one longer).
       uint32_t y = hi - (hi != 0);
@@ -1832,7 +1808,6 @@ static void sess_task(int tid, long q, long nq) {
   SP_ADD(tid, SP_WALK, t0);
   uint32_t *drun = aalloc(S, (size_t)so * 4);
   uint32_t *jprev = aalloc(S, ((size_t)ncamp + 1) * 4); // valid where st[] carries this person's stamp
-  uint32_t *cip = aalloc(S, (nlive + 1) * 4), *cjp = aalloc(S, (nlive + 1) * 4); // per click of the person: its session range
   for (uint32_t p = 0; p < np; p++) {
     const uint64_t *c = cl + coff[p];
     uint32_t m = coff[p + 1] - coff[p];
@@ -1844,22 +1819,13 @@ static void sess_task(int tid, long q, long nq) {
     drun[ns - 1] = ns;
     for (uint32_t z = ns - 1; z-- > 0;) drun[z] = sdi[z] == sdi[z + 1] ? drun[z + 1] : z + 1;
     uint32_t sv = ++stampv[tid];
-    // each click's sessions [ip, jp) from two select-driven merges, as for the credited click
-    for (uint32_t z = 0, ip = 0; z < m;) {
-      uint32_t adv = (uint32_t)(ip < ns) & (uint32_t)(sst[ip] < (uint32_t)(c[z] >> 32));
-      cip[z] = ip;
-      ip += adv;
-      z += adv ^ 1;
-    }
-    for (uint32_t z = 0, jp = 0; z < m;) {
-      uint32_t adv = (uint32_t)(jp < ns) & (uint32_t)(sst[jp] <= (int64_t)(c[z] >> 32) + 604800000LL);
-      cjp[z] = jp;
-      jp += adv;
-      z += adv ^ 1;
-    }
+    uint32_t ip = 0, jp = 0;
     for (uint32_t z = 0; z < m; z++) {
+      int64_t t = (int64_t)(c[z] >> 32);
       uint32_t cc = ccamp[(uint32_t)c[z]];
-      uint32_t from = cip[z], jp = cjp[z];
+      while (ip < ns && sst[ip] < t) ip++;
+      while (jp < ns && sst[jp] <= t + 604800000LL) jp++;
+      uint32_t from = ip;
       if (st[cc] != sv) st[cc] = sv;
       else if (jprev[cc] > from) from = jprev[cc];
       jprev[cc] = jp;
@@ -2366,7 +2332,7 @@ int main(void) {
   // eest runs ~1.4x the real event count, so 48000 here is ~30-35K events per partition: 2^10 at 20M, 2^11 at
   // 40-64M. Board, 64M-event replica: PB=QB 11 2975 ms, 10 3020, 12 3172, 13 3490 (diag a2e7094).
   PB = 6; while (PB < 14 && (eest >> PB) > 48000) PB++;
-  QB = 6; while (QB < 13 && (eest >> QB) > 48000) QB++;
+  QB = 6; while (QB < 13 && (eest >> QB) > 128000) QB++;
   NPART = 1u << PB; NQART = 1u << QB;
   uint64_t per_t = eest / NT;
   // Blocks of an eighth of a bucket's expected share: a bucket's last block is the only unused memory (and the
