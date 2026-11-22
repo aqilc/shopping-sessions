@@ -83,6 +83,13 @@ INL uint64_t hstr(const char *p, uint32_t n) {
     else { a = n ? ld8(p) & (~0ull >> (64 - 8 * n)) : 0; b = 0; }
     return mum(a ^ HS1, b ^ HSN[n]) | 1; // one round: the product's two halves folded together mix every output bit
   }
+  if (LIKELY(n <= 48)) {
+    // two lanes over the first 32 bytes (the second slides back when the string is shorter), then the last 16
+    uint32_t o = n < 32 ? n - 16 : 16;
+    uint64_t h = mum(ld8(p) ^ HS1, ld8(p + 8) ^ HS0 ^ n);
+    uint64_t g = mum(ld8(p + o) ^ HS2, ld8(p + o + 8) ^ HS3);
+    return mum(ld8(p + n - 16) ^ h, ld8(p + n - 8) ^ g) | 1;
+  }
   uint64_t h = HS0 ^ n;
   while (n > 16) { h = mum(ld8(p) ^ HS1, ld8(p + 8) ^ h); p += 16; n -= 16; }
   a = ld8(p + n - 16 + 0); b = ld8(p + n - 8);
@@ -1119,7 +1126,12 @@ static Chunk *lchunks; static long nlchunks;
 // into its own table region (L2-sized, no atomics) and writes the dense ids into the edges.
 typedef struct { uint64_t h, ref, pre; uint32_t tid, pos; } LRec; // pos: edge index * 2 + side
 #define LBLK 256
-typedef struct LBlk { struct LBlk *next; uint32_t n; char pad[52]; LRec r[LBLK]; } LBlk; // a cache-line header
+// A cache-line header: at 8 KB + 64 the blocks sit at different page offsets, so the write heads of a thread's
+// buckets do not share cache sets (blocks of exactly 8 KB were slower on x86).
+typedef struct LBlk { struct LBlk *next; uint32_t n; char pad[52]; LRec r[LBLK]; } LBlk;
+#define LCH 254 // blocks a thread takes from the pool at a time, ~2 MB: each thread faults in its own pages
+typedef struct { uint64_t cur, end; char pad[48]; } LTake;
+static LTake *ltake; // [NT]
 typedef struct { LBlk *head; uint32_t n; } LBkt;
 static LBkt *lbkt; // [NT][LP]
 static uint32_t LPB, LP;
@@ -1129,9 +1141,13 @@ INL void lrec_put(int tid, uint64_t h, const char *p, uint32_t n, uint32_t pos) 
   LBkt *b = &lbkt[(size_t)tid * LP + (LPB ? h >> (64 - LPB) : 0)];
   LBlk *k = b->head;
   if (UNLIKELY(!k || k->n == LBLK)) {
-    uint64_t q = atomic_fetch_add_explicit(&lpool_n, 1, memory_order_relaxed);
-    if (UNLIKELY(q >= lpool_cap)) die("links: block pool full");
-    k = &lpool[q];
+    LTake *tk = &ltake[tid];
+    if (UNLIKELY(tk->cur == tk->end)) {
+      tk->cur = atomic_fetch_add_explicit(&lpool_n, LCH, memory_order_relaxed);
+      tk->end = tk->cur + LCH;
+      if (UNLIKELY(tk->end > lpool_cap)) die("links: block pool full");
+    }
+    k = &lpool[tk->cur++];
     k->next = b->head; k->n = 0;
     b->head = k;
   }
@@ -1221,8 +1237,8 @@ static void pkey_task(int tid, long t, void *ctx) { // lval: id -> root id
   (void)tid; (void)ctx;
   uint64_t lo = (uint64_t)t * LSPAN, hi = lo + LSPAN; if (hi > lcap) hi = lcap;
   for (uint64_t i = lo; i < hi; i++) {
-    if (!lkey[i]) continue;
-    lval[i] = uf_find(lval[i]);
+    uint32_t d = lval[i]; // dense ids start at 1: 0 is an empty slot
+    if (d) lval[i] = uf_find(d);
   }
 }
 static void load_links(const char *dd) {
@@ -1241,8 +1257,9 @@ static void load_links(const char *dd) {
   LPB = 0; while (LPB < 20 && (bytes >> (17 + LPB))) LPB++;
   LP = 1u << LPB;
   lbkt = xcalloc((size_t)NT * LP, sizeof(LBkt));
-  // a line is >= 4 bytes ("a,b\n") with two IDs, plus a part-full block per bucket
-  lpool_cap = bytes / 2 / LBLK + 1 + (uint64_t)NT * LP;
+  // a line is >= 4 bytes ("a,b\n") with two IDs, plus a part-full block per bucket and a part-used take per thread
+  lpool_cap = bytes / 2 / LBLK + 1 + (uint64_t)NT * LP + (uint64_t)NT * LCH;
+  ltake = xcalloc(NT, sizeof(LTake));
   lpool = hcalloc(lpool_cap * sizeof(LBlk)); // NORESERVE: only the blocks used are mapped
   ledges = xcalloc(NT, sizeof(EVec));
   run_par(nlchunks, link_parse_task, NULL);
