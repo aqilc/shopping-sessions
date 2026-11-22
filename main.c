@@ -434,6 +434,100 @@ INL int64_t ingest_s(const char *p) {
 #define parse_ts parse_ts_any
 #endif
 
+// ---------- window-month timestamp path ----------
+// Nearly every timestamp falls in the window's month or the next one, so "YYYY-MM-" is matched whole against those
+// two prefixes and the rest is one word of SWAR: no year/month tables, and far fewer uops than the vector path.
+// Anything else (other months, other lengths) goes to parse_ts, which is exact for every form.
+typedef struct {
+  uint64_t pre[2]; // "YYYY-MM-" as loaded by ld8; 0 = unused
+  int64_t base[2]; // epoch seconds of the month's day 0 (its first day minus one)
+  uint64_t lim[2]; // days in the month * 1440
+} MoWin;
+static MoWin mw_ev, mw_cl; // months from WS (events, ingest) and from CWS (clicks)
+static void mowin_init(MoWin *w, int64_t ms) {
+  int64_t d = ms / 86400000LL;
+  if (ms < 0 && ms % 86400000LL) d--;
+  // civil from days (Hinnant)
+  int64_t z = d + 719468, era = (z >= 0 ? z : z - 146096) / 146097;
+  unsigned doe = (unsigned)(z - era * 146097), yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100), mp = (5 * doy + 2) / 153;
+  unsigned mo = mp < 10 ? mp + 3 : mp - 9;
+  int64_t y = (int64_t)yoe + era * 400 + (mo <= 2);
+  for (int i = 0; i < 2; i++) {
+    w->pre[i] = 0;
+    if (y >= 0 && y <= 9999) {
+      char b[16];
+      snprintf(b, sizeof b, "%04d-%02u-", (int)y, mo);
+      w->pre[i] = ld8(b);
+      int leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+      w->base[i] = (days_from_civil(y, mo, 1) - 1) * 86400;
+      w->lim[i] = (uint64_t)ts_mdays[leap][mo] * 1440;
+    }
+    if (++mo == 13) { mo = 1; y++; }
+  }
+}
+// "DDTHH:MM" (x = the 8 bytes ^ "00T00:00") -> lanes 0, 3, 6 of the pair word hold day, hour, minute, and one
+// multiply folds them to day * 1440 + hour * 60 + minute in the top 16 bits (exact while day <= 45).
+#define MW_E1 0x30303A3030543030ULL
+#define MW_KM ((1440ULL << 48) + (60ULL << 24) + 1)
+INL uint64_t mw_minutes(uint64_t q) { return ((q & 0x00FF0000FF0000FFULL) * MW_KM) >> 48; }
+// ingest_ts is always valid F1 (rules.md): epoch seconds, no checks.
+INL int64_t ingest_w(const char *p, const MoWin *w) {
+  uint64_t w0 = ld8(p);
+  unsigned i = w0 != w->pre[0]; // an index, not a branch: a window over two months makes the month a coin flip
+  if (UNLIKELY(w0 != w->pre[i])) return ingest_s(p);
+  int64_t base = w->base[i];
+  uint64_t x = ld8(p + 8) ^ MW_E1;
+  uint64_t m = mw_minutes(ts_pairs(x));
+  unsigned ss = (unsigned)(uint8_t)p[17] * 10 + (uint8_t)p[18] - 528;
+  return base + (int64_t)(m * 60 + ss);
+}
+// Any form -> ms or BADTS, same result as parse_ts. Reads p[0..32].
+// The form mix (F1 57%, F3 33%, F2 10% in generator data) makes the length branch mispredict, but each path is
+// under half the vector path's uops.
+INL int64_t parse_ts_w(const char *p, uint32_t n, const MoWin *w) {
+  const uint64_t H = 0x80 * ONES;
+  if (n == 13) {
+    // F3, 13 digits: digits 0..7 and 5..12; the low 3 bytes of the second word are dropped (zero bytes count as '0').
+    uint64_t a = ld8(p) ^ 0x30 * ONES, b = ld8(p + 5) ^ 0x30 * ONES;
+    if (UNLIKELY((((a + 0x76 * ONES) | a | (b + 0x76 * ONES) | b) & H) != 0)) return BADTS;
+    return (int64_t)(ts_parse8(a) * 100000 + ts_parse8(b & 0xFFFFFFFFFF000000ULL));
+  }
+  if (UNLIKELY(n != 20 && n != 25)) return parse_ts(p, n);
+  uint64_t w0 = ld8(p);
+  unsigned i = w0 != w->pre[0];
+  if (UNLIKELY(w0 != w->pre[i])) return parse_ts(p, n);
+  // "DDTHH:MM". Adding to a lane sets its high bit when the lane is over its limit: a digit above 9 (+0x76), a
+  // minute tens digit above 5 (+0x7A), a separator that is not the expected one (+0x7F).
+  uint64_t x1 = ld8(p + 8) ^ MW_E1;
+  uint64_t bad = (x1 + 0x767A7F76767F7676ULL) | x1;
+  uint64_t q1 = ts_pairs(x1);
+  bad |= q1 + 0x0000000068000060ULL; // day <= 31, hour <= 23 (pairs are <= 99, so no carry)
+  uint64_t m = mw_minutes(q1);
+  // day 0 and days past the month's end show in the minute count once hour and minute are in range
+  if (UNLIKELY(m - 1440 >= w->lim[i])) return BADTS;
+  int64_t s = w->base[i] + (int64_t)(m * 60);
+  if (n == 20) {
+    // ":SSZ"
+    uint32_t t;
+    memcpy(&t, p + 16, 4);
+    t ^= 0x5A30303AU;
+    bad |= (t + 0x7F767A7FU) | t;
+    if (UNLIKELY((bad & H) != 0)) return BADTS;
+    return (s + (uint8_t)p[17] * 10 + (uint8_t)p[18] - 528) * 1000;
+  }
+  // "SS+HH:MM" at 17; the sign lane is 0 for '+', 6 for '-'.
+  uint64_t x2 = ld8(p + 17) ^ 0x30303A30302B3030ULL;
+  bad |= (x2 + 0x767A7F767600767AULL) | x2;
+  uint64_t q2 = ts_pairs(x2);
+  bad |= q2 + 0x0000000068000000ULL; // offset hour <= 23
+  unsigned sx = (unsigned)(x2 >> 16) & 0xFF;
+  if (UNLIKELY(((bad & H) != 0) | ((sx != 0) & (sx != 6)) | (p[16] != ':'))) return BADTS;
+  int64_t off = (int64_t)(((q2 & 0x00FF0000FF000000ULL) * ((60ULL << 24) + 1)) >> 48) * 60;
+  s += (unsigned)q2 & 0xFF;
+  return (sx ? s + off : s - off) * 1000; // '+' is subtracted, '-' added
+}
+
 // price: digits only, 1..10,000,000; returns 0 if bad
 INL uint32_t parse_price(const char *p, uint32_t n) {
   if (n == 0) return 0;
@@ -475,6 +569,45 @@ INL int32_t smap_get(const SMap *m, const char *p, uint32_t n) {
     if (s->h == h && str_eq(s->p, s->n, p, n)) return s->v;
     i = (i + 1) & m->mask;
   }
+}
+
+// Product and campaign IDs are a short prefix and a number ("p123", "c_123"), so the canonical ones (no leading
+// zero) are looked up by value: no hash, probe or string compare, and the product table stays in L2 where the
+// string map is megabytes. dir[number] = index + 1; 0 sends the lookup to the string map.
+#define CDIR_N 100000
+#define PDIR_N 1000000
+static uint16_t *cdir; // campaign index + 1
+static uint8_t *pdir;  // category index + 1
+// The number in a canonical ID of n bytes (nmin..7: the prefix, then digits, the first not '0'), or -1.
+// e holds the prefix and '0' on the digit lanes, c 0x7F on the prefix lanes and 0x76 on the digit lanes, first
+// masks the first digit's lane. Reads p[0..7].
+INL int32_t id_num(const char *p, uint32_t n, uint32_t nmin, uint64_t e, uint64_t c, uint64_t first) {
+  if (UNLIKELY(n - nmin > 7 - nmin)) return -1;
+  uint64_t x = (ld8(p) ^ e) & (~0ULL >> (64 - 8 * n));
+  if (UNLIKELY((((x + c) | x) & (0x80 * ONES)) != 0 || (x & first) == 0)) return -1;
+  return (int32_t)ts_parse8(x << (64 - 8 * n));
+}
+// "c_" + 1..5 digits
+INL int32_t camp_num(const char *p, uint32_t n) { return id_num(p, n, 3, 0x3030303030305F63ULL, 0x7676767676767F7FULL, 0xFF0000); }
+// "p" + 1..6 digits
+INL int32_t prod_num(const char *p, uint32_t n) { return id_num(p, n, 2, 0x3030303030303070ULL, 0x767676767676767FULL, 0xFF00); }
+static SMap prodmap; // product -> category index
+static SMap campmap; // campaign -> idx
+INL int32_t camp_get(const char *p, uint32_t n) {
+  int32_t k = camp_num(p, n);
+  if (LIKELY(k >= 0)) {
+    uint32_t v = cdir[k];
+    if (LIKELY(v)) return (int32_t)v - 1;
+  }
+  return smap_get(&campmap, p, n);
+}
+INL int32_t prod_get(const char *p, uint32_t n) {
+  int32_t k = prod_num(p, n);
+  if (LIKELY(k >= 0)) {
+    uint32_t v = pdir[k];
+    if (LIKELY(v)) return (int32_t)v - 1;
+  }
+  return smap_get(&prodmap, p, n);
 }
 
 // ---------- thread pool ----------
@@ -553,10 +686,8 @@ static void bkt_close(Bkt *b, uint32_t rs) {
 // ---------- globals ----------
 static int64_t WS, WE, CWS; // event window [WS,WE), click window [CWS,WE)
 static int64_t DAY0; static int32_t NDAYS;
-static SMap prodmap; // product -> category index
 static int unknown_cat;
 static int ncat; static const char **catp; static uint32_t *catn;
-static SMap campmap; // campaign -> idx
 static int ncamp; static const char **camp_id; static uint32_t *camp_idn; static const char **chan; static uint32_t *chann;
 static uint32_t PB, QB; static uint32_t NPART, NQART; // eid partitions 2^PB, person partitions 2^QB
 
@@ -788,23 +919,25 @@ static inline void ev_line(int tid, const char *ls, const char *const *sep, int 
   }
   int64_t is, ing;
   if (LIKELY(fl[3] == 20)) {
-    is = ingest_s(f[3]);
+    is = ingest_w(f[3], &mw_ev);
     ing = is * 1000;
   } else {
     ing = parse_ts(f[3], fl[3]);
     is = ing == BADTS ? 0xFFFFFFFFll : ing / 1000;
   }
-  int64_t ts = parse_ts(f[2], fl[2]);
+  int64_t ts = parse_ts_w(f[2], fl[2], &mw_ev);
   uint32_t x = 0;
   int ok = fl[1] > 0 && ts != BADTS && ts >= WS && ts < WE && fl[5] > 0;
   if (ok) {
-    if (fl[4] == 4 && memcmp(f[4], "view", 4) == 0) {}
-    else if (fl[4] == 4 && memcmp(f[4], "cart", 4) == 0) {}
+    // view and cart take one branch: which of the two a line is would mispredict
+    uint32_t t4;
+    memcpy(&t4, f[4], 4);
+    if (LIKELY((fl[4] == 4) & ((t4 == 0x77656976U) | (t4 == 0x74726163U)))) {}
     else if (fl[4] == 8 && memcmp(f[4], "purchase", 8) == 0) {
       uint32_t pr = parse_price(f[6], fl[6]);
       if (!pr) ok = 0;
       else {
-        int32_t c = smap_get(&prodmap, f[5], fl[5]);
+        int32_t c = prod_get(f[5], fl[5]);
         x = pr | ((uint32_t)(c < 0 ? unknown_cat : c) << 24) | X_PURCH;
       }
     } else ok = 0;
@@ -835,9 +968,9 @@ static inline void cl_line(int tid, const char *ls, const char *const *sep, int 
   if (fl[0] == 0 || fl[1] == 0) return;
   uint64_t uh = hstr(f[1], fl[1]);
   if (have_links) { __builtin_prefetch(&lkey[lhome(uh)]); __builtin_prefetch(&lval[lhome(uh)]); }
-  int64_t ts = parse_ts(f[3], fl[3]);
+  int64_t ts = parse_ts_w(f[3], fl[3], &mw_cl);
   if (ts == BADTS || ts < CWS || ts >= WE) return;
-  int32_t c = smap_get(&campmap, f[2], fl[2]);
+  int32_t c = camp_get(f[2], fl[2]);
   if (c < 0) return;
   Pend *P = &pend[tid];
   CPend *e = &P->c[P->nc % RING];
@@ -1862,6 +1995,7 @@ static void load_products(const char *dd) {
   SMap cm; smap_init(&cm, 1024);
   size_t lines = f.n / 8 + 16;
   smap_init(&prodmap, lines);
+  pdir = xcalloc(PDIR_N, 1);
   const char *p = f.p, *end = f.p + f.n;
   const char *nl = memchr(p, '\n', f.n); p = nl ? nl + 1 : end;
   Str *prods = xmalloc(sizeof(Str) * lines), *pcat = xmalloc(sizeof(Str) * lines); size_t npd = 0;
@@ -1892,6 +2026,8 @@ static void load_products(const char *dd) {
   for (size_t i = 0; i < npd; i++) {
     int32_t ci = smap_get(&cm, pcat[i].p, pcat[i].n);
     smap_put(&prodmap, prods[i].p, prods[i].n, ci, &cr);
+    int32_t k = prod_num(prods[i].p, prods[i].n);
+    if (cr && k >= 0 && ci >= 0) pdir[k] = (uint8_t)(ci + 1);
   }
 }
 
@@ -1900,6 +2036,7 @@ static void load_campaigns(const char *dd) {
   MFile f = map_file(path);
   size_t lines = f.n / 4 + 16;
   smap_init(&campmap, lines);
+  cdir = xcalloc(CDIR_N, sizeof *cdir);
   camp_id = xmalloc(sizeof(char *) * lines); camp_idn = xmalloc(4 * lines);
   chan = xmalloc(sizeof(char *) * lines); chann = xmalloc(4 * lines);
   const char *p = f.p, *end = f.p + f.n;
@@ -1911,6 +2048,8 @@ static void load_campaigns(const char *dd) {
     if (le > p && split2(p, (size_t)(le - p), fp, fl) && fl[0]) {
       int cr;
       smap_put(&campmap, fp[0], fl[0], ncamp, &cr);
+      int32_t k = camp_num(fp[0], fl[0]);
+      if (cr && k >= 0 && ncamp < 0xFFFF) cdir[k] = (uint16_t)(ncamp + 1);
       if (cr) { camp_id[ncamp] = fp[0]; camp_idn[ncamp] = fl[0]; chan[ncamp] = fp[1]; chann[ncamp] = fl[1]; ncamp++; }
     }
     p = le + 1;
@@ -1965,6 +2104,8 @@ int main(void) {
   WS = manifest_ts(mf.p, mf.n, "\"window_start\"");
   WE = manifest_ts(mf.p, mf.n, "\"window_end\"");
   CWS = WS - 604800000LL;
+  mowin_init(&mw_ev, WS);
+  mowin_init(&mw_cl, CWS);
   DAY0 = WS / 86400000LL; if (WS < 0 && WS % 86400000LL) DAY0--;
   NDAYS = (int32_t)((WE - 1) / 86400000LL - DAY0 + 1);
   load_products(dd);

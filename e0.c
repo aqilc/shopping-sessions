@@ -571,6 +571,45 @@ INL int32_t smap_get(const SMap *m, const char *p, uint32_t n) {
   }
 }
 
+// Product and campaign IDs are a short prefix and a number ("p123", "c_123"), so the canonical ones (no leading
+// zero) are looked up by value: no hash, probe or string compare, and the product table stays in L2 where the
+// string map is megabytes. dir[number] = index + 1; 0 sends the lookup to the string map.
+#define CDIR_N 100000
+#define PDIR_N 1000000
+static uint16_t *cdir; // campaign index + 1
+static uint8_t *pdir;  // category index + 1
+// The number in a canonical ID of n bytes (nmin..7: the prefix, then digits, the first not '0'), or -1.
+// e holds the prefix and '0' on the digit lanes, c 0x7F on the prefix lanes and 0x76 on the digit lanes, first
+// masks the first digit's lane. Reads p[0..7].
+INL int32_t id_num(const char *p, uint32_t n, uint32_t nmin, uint64_t e, uint64_t c, uint64_t first) {
+  if (UNLIKELY(n - nmin > 7 - nmin)) return -1;
+  uint64_t x = (ld8(p) ^ e) & (~0ULL >> (64 - 8 * n));
+  if (UNLIKELY((((x + c) | x) & (0x80 * ONES)) != 0 || (x & first) == 0)) return -1;
+  return (int32_t)ts_parse8(x << (64 - 8 * n));
+}
+// "c_" + 1..5 digits
+INL int32_t camp_num(const char *p, uint32_t n) { return id_num(p, n, 3, 0x3030303030305F63ULL, 0x7676767676767F7FULL, 0xFF0000); }
+// "p" + 1..6 digits
+INL int32_t prod_num(const char *p, uint32_t n) { return id_num(p, n, 2, 0x3030303030303070ULL, 0x767676767676767FULL, 0xFF00); }
+static SMap prodmap; // product -> category index
+static SMap campmap; // campaign -> idx
+INL int32_t camp_get(const char *p, uint32_t n) {
+  int32_t k = camp_num(p, n);
+  if (LIKELY(k >= 0)) {
+    uint32_t v = cdir[k];
+    if (LIKELY(v)) return (int32_t)v - 1;
+  }
+  return smap_get(&campmap, p, n);
+}
+INL int32_t prod_get(const char *p, uint32_t n) {
+  int32_t k = prod_num(p, n);
+  if (LIKELY(k >= 0)) {
+    uint32_t v = pdir[k];
+    if (LIKELY(v)) return (int32_t)v - 1;
+  }
+  return smap_get(&prodmap, p, n);
+}
+
 // ---------- thread pool ----------
 static int NT = 8;
 typedef void (*task_fn)(int tid, long task, void *ctx);
@@ -647,10 +686,8 @@ static void bkt_close(Bkt *b, uint32_t rs) {
 // ---------- globals ----------
 static int64_t WS, WE, CWS; // event window [WS,WE), click window [CWS,WE)
 static int64_t DAY0; static int32_t NDAYS;
-static SMap prodmap; // product -> category index
 static int unknown_cat;
 static int ncat; static const char **catp; static uint32_t *catn;
-static SMap campmap; // campaign -> idx
 static int ncamp; static const char **camp_id; static uint32_t *camp_idn; static const char **chan; static uint32_t *chann;
 static uint32_t PB, QB; static uint32_t NPART, NQART; // eid partitions 2^PB, person partitions 2^QB
 
@@ -892,13 +929,15 @@ static inline void ev_line(int tid, const char *ls, const char *const *sep, int 
   uint32_t x = 0;
   int ok = fl[1] > 0 && ts != BADTS && ts >= WS && ts < WE && fl[5] > 0;
   if (ok) {
-    if (fl[4] == 4 && memcmp(f[4], "view", 4) == 0) {}
-    else if (fl[4] == 4 && memcmp(f[4], "cart", 4) == 0) {}
+    // view and cart take one branch: which of the two a line is would mispredict
+    uint32_t t4;
+    memcpy(&t4, f[4], 4);
+    if (LIKELY((fl[4] == 4) & ((t4 == 0x77656976U) | (t4 == 0x74726163U)))) {}
     else if (fl[4] == 8 && memcmp(f[4], "purchase", 8) == 0) {
       uint32_t pr = parse_price(f[6], fl[6]);
       if (!pr) ok = 0;
       else {
-        int32_t c = smap_get(&prodmap, f[5], fl[5]);
+        int32_t c = prod_get(f[5], fl[5]);
         x = pr | ((uint32_t)(c < 0 ? unknown_cat : c) << 24) | X_PURCH;
       }
     } else ok = 0;
@@ -931,7 +970,7 @@ static inline void cl_line(int tid, const char *ls, const char *const *sep, int 
   if (have_links) { __builtin_prefetch(&lkey[lhome(uh)]); __builtin_prefetch(&lval[lhome(uh)]); }
   int64_t ts = parse_ts_w(f[3], fl[3], &mw_cl);
   if (ts == BADTS || ts < CWS || ts >= WE) return;
-  int32_t c = smap_get(&campmap, f[2], fl[2]);
+  int32_t c = camp_get(f[2], fl[2]);
   if (c < 0) return;
   Pend *P = &pend[tid];
   CPend *e = &P->c[P->nc % RING];
@@ -1956,6 +1995,7 @@ static void load_products(const char *dd) {
   SMap cm; smap_init(&cm, 1024);
   size_t lines = f.n / 8 + 16;
   smap_init(&prodmap, lines);
+  pdir = xcalloc(PDIR_N, 1);
   const char *p = f.p, *end = f.p + f.n;
   const char *nl = memchr(p, '\n', f.n); p = nl ? nl + 1 : end;
   Str *prods = xmalloc(sizeof(Str) * lines), *pcat = xmalloc(sizeof(Str) * lines); size_t npd = 0;
@@ -1986,6 +2026,8 @@ static void load_products(const char *dd) {
   for (size_t i = 0; i < npd; i++) {
     int32_t ci = smap_get(&cm, pcat[i].p, pcat[i].n);
     smap_put(&prodmap, prods[i].p, prods[i].n, ci, &cr);
+    int32_t k = prod_num(prods[i].p, prods[i].n);
+    if (cr && k >= 0 && ci >= 0) pdir[k] = (uint8_t)(ci + 1);
   }
 }
 
@@ -1994,6 +2036,7 @@ static void load_campaigns(const char *dd) {
   MFile f = map_file(path);
   size_t lines = f.n / 4 + 16;
   smap_init(&campmap, lines);
+  cdir = xcalloc(CDIR_N, sizeof *cdir);
   camp_id = xmalloc(sizeof(char *) * lines); camp_idn = xmalloc(4 * lines);
   chan = xmalloc(sizeof(char *) * lines); chann = xmalloc(4 * lines);
   const char *p = f.p, *end = f.p + f.n;
@@ -2005,10 +2048,18 @@ static void load_campaigns(const char *dd) {
     if (le > p && split2(p, (size_t)(le - p), fp, fl) && fl[0]) {
       int cr;
       smap_put(&campmap, fp[0], fl[0], ncamp, &cr);
+      int32_t k = camp_num(fp[0], fl[0]);
+      if (cr && k >= 0 && ncamp < 0xFFFF) cdir[k] = (uint16_t)(ncamp + 1);
       if (cr) { camp_id[ncamp] = fp[0]; camp_idn[ncamp] = fl[0]; chan[ncamp] = fp[1]; chann[ncamp] = fl[1]; ncamp++; }
     }
     p = le + 1;
   }
+}
+
+static void *small_main(void *dd) {
+  load_products(dd);
+  load_campaigns(dd);
+  return NULL;
 }
 
 static uint64_t *qsize;
@@ -2063,10 +2114,11 @@ int main(void) {
   mowin_init(&mw_cl, CWS);
   DAY0 = WS / 86400000LL; if (WS < 0 && WS % 86400000LL) DAY0--;
   NDAYS = (int32_t)((WE - 1) / 86400000LL - DAY0 + 1);
-  load_products(dd);
-  load_campaigns(dd);
-  PH("small");
+  // The two small files load beside the links: they share no state with load_links.
+  pthread_t small;
+  if (pthread_create(&small, NULL, small_main, (void *)dd)) die("pthread_create");
   load_links(dd);
+  pthread_join(small, NULL);
   PH("links");
 
   char dir[4096];

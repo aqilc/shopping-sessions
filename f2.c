@@ -571,17 +571,27 @@ INL int32_t smap_get(const SMap *m, const char *p, uint32_t n) {
   }
 }
 
-// Campaign IDs are "c_" + a number (rules.md), so those of 1..5 digits without a leading zero are looked up by
-// value: no hash, probe or string compare. cdir[number] = index + 1; 0 sends the lookup to the string map.
+// Product and campaign IDs are a short prefix and a number ("p123", "c_123"), so the canonical ones (no leading
+// zero) are looked up by value: no hash, probe or string compare, and the product table stays in L2 where the
+// string map is megabytes. dir[number] = index + 1; 0 sends the lookup to the string map.
 #define CDIR_N 100000
-static uint16_t *cdir;
-// The number in a canonical ID ("c_", then 1..5 digits, the first not '0'), or -1. Reads p[0..7].
-INL int32_t camp_num(const char *p, uint32_t n) {
-  if (UNLIKELY(n - 3 > 4)) return -1;
-  uint64_t x = (ld8(p) ^ 0x3030303030305F63ULL) & (~0ULL >> (64 - 8 * n));
-  if (UNLIKELY((((x + 0x7676767676767F7FULL) | x) & (0x80 * ONES)) != 0 || (x & 0xFF0000) == 0)) return -1;
+#define PDIR_N 1000000
+static uint16_t *cdir; // campaign index + 1
+static uint8_t *pdir;  // category index + 1
+// The number in a canonical ID of n bytes (nmin..7: the prefix, then digits, the first not '0'), or -1.
+// e holds the prefix and '0' on the digit lanes, c 0x7F on the prefix lanes and 0x76 on the digit lanes, first
+// masks the first digit's lane. Reads p[0..7].
+INL int32_t id_num(const char *p, uint32_t n, uint32_t nmin, uint64_t e, uint64_t c, uint64_t first) {
+  if (UNLIKELY(n - nmin > 7 - nmin)) return -1;
+  uint64_t x = (ld8(p) ^ e) & (~0ULL >> (64 - 8 * n));
+  if (UNLIKELY((((x + c) | x) & (0x80 * ONES)) != 0 || (x & first) == 0)) return -1;
   return (int32_t)ts_parse8(x << (64 - 8 * n));
 }
+// "c_" + 1..5 digits
+INL int32_t camp_num(const char *p, uint32_t n) { return id_num(p, n, 3, 0x3030303030305F63ULL, 0x7676767676767F7FULL, 0xFF0000); }
+// "p" + 1..6 digits
+INL int32_t prod_num(const char *p, uint32_t n) { return id_num(p, n, 2, 0x3030303030303070ULL, 0x767676767676767FULL, 0xFF00); }
+static SMap prodmap; // product -> category index
 static SMap campmap; // campaign -> idx
 INL int32_t camp_get(const char *p, uint32_t n) {
   int32_t k = camp_num(p, n);
@@ -590,6 +600,14 @@ INL int32_t camp_get(const char *p, uint32_t n) {
     if (LIKELY(v)) return (int32_t)v - 1;
   }
   return smap_get(&campmap, p, n);
+}
+INL int32_t prod_get(const char *p, uint32_t n) {
+  int32_t k = prod_num(p, n);
+  if (LIKELY(k >= 0)) {
+    uint32_t v = pdir[k];
+    if (LIKELY(v)) return (int32_t)v - 1;
+  }
+  return smap_get(&prodmap, p, n);
 }
 
 // ---------- thread pool ----------
@@ -668,7 +686,6 @@ static void bkt_close(Bkt *b, uint32_t rs) {
 // ---------- globals ----------
 static int64_t WS, WE, CWS; // event window [WS,WE), click window [CWS,WE)
 static int64_t DAY0; static int32_t NDAYS;
-static SMap prodmap; // product -> category index
 static int unknown_cat;
 static int ncat; static const char **catp; static uint32_t *catn;
 static int ncamp; static const char **camp_id; static uint32_t *camp_idn; static const char **chan; static uint32_t *chann;
@@ -782,67 +799,134 @@ static const char *chunk_begin(const Chunk *c) {
   return p ? p + 1 : fend;
 }
 
-// Tokenizer: calls LINE(ls, sep, nsep, nq) for each line starting in [begin, cend).
-// sep[k] = position of the k-th separator (',' or the line end), nq = quotes in the line.
-// Bytes past the file end are zero (map_file's PAD), so blocks need no end mask.
-// Commas go to sep_ SEPW at a time, unconditionally: slots past min(ns, MAXF) are scratch, so no per-field branch.
-// SEPW >= MAXF, so commas past the first SEPW of a block can only land past MAXF and need no store.
-#define MAXF 8
-#define SEPW 8
-INL int tk_commas(const char **sep, int ns, const char *blk, uint64_t m) {
-  int n = __builtin_popcountll(m);
-  const char **d = sep + (ns < MAXF ? ns : MAXF);
-  for (int j = 0; j < SEPW; j++) {
-    d[j] = blk + __builtin_ctzll(m | (1ull << 63));
-    m &= m - 1;
-  }
-  return ns + n;
+// Tokenizer: calls LINE(ob, ix, ns, nq, om, cm) for each line starting in [begin, cend).
+// ix[k] = offset from ob of the line's k-th separator (',' or the line end) and ix[-1] that of the newline before
+// the line; ns = separators, nq = quotes in the line; bit k of om / cm is set when field k starts / ends with a quote.
+// Bytes past the file end are zero (map_file's PAD), and the file end counts as a newline.
+// Each 64 B block's separators go to one flat index, 8 at a time (slots past the count are scratch), and the quote
+// bits next to them are packed in the same order (a_: the byte after separator i-1 is a quote, b_: the byte before
+// separator i is), so a line reads its fields with no byte loads and no branches.
+// The unfinished line's separators move to the front after each block: at most IXP stay stored, since a line with
+// more is malformed whatever they are (nx_ keeps its count right). A block with more than 56 separators is indexed
+// as two halves, so the bit queues never pass 64.
+#define IXP 7
+#define IXN (1 + IXP + 64 + 8 + 8)
+// SCALAR(x) hides x from the vectorizer: clang otherwise packs the 8 bit positions into vectors and counts trailing
+// zeros with a table-lookup popcount, several times the work of 8 tzcnt.
+#define SCALAR(x) __asm__("" : "+r"(x))
+#if defined(__BMI2__)
+#define PEXT64(v, m) _pext_u64(v, m)
+#define TZ64(m) ((uint32_t)_tzcnt_u64(m)) // 64 for an empty mask, which only a scratch slot gets
+#else
+INL uint64_t PEXT64(uint64_t v, uint64_t m) {
+  uint64_t r = 0;
+  for (int i = 0; m; i++, m &= m - 1) r |= ((v >> __builtin_ctzll(m)) & 1) << i;
+  return r;
 }
+#define TZ64(m) ((uint32_t)__builtin_ctzll((m) | (1ull << 63)))
+#endif
 #define TOKENIZE(c, LINE)                                                                         \
   do {                                                                                            \
     const char *fend_ = (c)->base + (c)->fsize;                                                   \
     const char *cend_ = (c)->base + (c)->end;                                                     \
     const char *ls_ = chunk_begin(c);                                                             \
     if (ls_ >= cend_) break;                                                                      \
-    const char *sep_[MAXF + SEPW]; int ns_ = 0; uint32_t qacc_ = 0;                               \
+    const char *ob_ = ls_ - 1;                                                                    \
+    uint32_t ixb_[IXN];                                                                           \
+    uint32_t *ix_ = ixb_ + 1;                                                                     \
+    ixb_[0] = 0;                                                                                  \
+    uint32_t np_ = 0, nx_ = 0, qacc_ = 0;                                                         \
+    uint64_t oq_ = *ls_ == '"', cq_ = 0, qc_ = 0;                                                 \
     const char *blk_ = ls_;                                                                       \
     int done_ = 0;                                                                                \
     while (!done_) {                                                                              \
       uint64_t nl_, cm_, q_;                                                                      \
       blk_masks(blk_, &nl_, &cm_, &q_);                                                           \
-      while (nl_) {                                                                               \
-        int i_ = __builtin_ctzll(nl_);                                                            \
-        uint64_t below_ = nl_ ^ (nl_ - 1);                                                        \
-        nl_ &= nl_ - 1;                                                                           \
-        ns_ = tk_commas(sep_, ns_, blk_, cm_ & below_);                                           \
-        sep_[ns_ < MAXF ? ns_ : MAXF] = blk_ + i_;                                                \
-        ns_++;                                                                                    \
-        uint32_t nq_ = qacc_ + (uint32_t)__builtin_popcountll(q_ & below_);                       \
-        cm_ &= ~below_; q_ &= ~below_; qacc_ = 0;                                                 \
-        LINE(ls_, sep_, ns_, nq_);                                                                \
-        ls_ = blk_ + i_ + 1; ns_ = 0;                                                             \
-        if (ls_ >= cend_) { done_ = 1; break; }                                                   \
+      if (UNLIKELY(blk_ + 64 > fend_)) nl_ |= 1ull << (fend_ - blk_);                             \
+      uint64_t qn_ = (q_ >> 1) | ((uint64_t)(blk_[64] == '"') << 63);                             \
+      uint64_t qp_ = (q_ << 1) | qc_;                                                             \
+      qc_ = q_ >> 63;                                                                             \
+      uint32_t bo_ = (uint32_t)(blk_ - ob_);                                                      \
+      uint64_t half_ = ~0ull;                                                                     \
+      if (UNLIKELY(__builtin_popcountll(cm_ | nl_) > 56)) half_ = 0xFFFFFFFFull;                  \
+      for (;;) {                                                                                  \
+        uint64_t s_ = (cm_ | nl_) & half_, n_ = nl_ & half_;                                      \
+        uint32_t cnt_ = (uint32_t)__builtin_popcountll(s_);                                       \
+        uint64_t a_ = oq_ | (PEXT64(qn_, s_) << (np_ + 1));                                       \
+        uint64_t b_ = cq_ | (PEXT64(qp_, s_) << np_);                                             \
+        uint32_t *d_ = ix_ + np_;                                                                 \
+        uint64_t m_ = s_;                                                                         \
+        for (uint32_t k_ = 0;;) {                                                                 \
+          for (int j_ = 0; j_ < 8; j_++) {                                                        \
+            uint32_t t_ = bo_ + TZ64(m_);                                                         \
+            SCALAR(t_);                                                                           \
+            d_[k_ + j_] = t_;                                                                     \
+            m_ &= m_ - 1;                                                                         \
+          }                                                                                       \
+          k_ += 8;                                                                                \
+          if (LIKELY(k_ >= cnt_)) break;                                                          \
+        }                                                                                         \
+        uint32_t l_ = 0;                                                                          \
+        while (n_) {                                                                              \
+          int i_ = __builtin_ctzll(n_);                                                           \
+          uint64_t below_ = n_ ^ (n_ - 1);                                                        \
+          n_ &= n_ - 1;                                                                           \
+          uint32_t r_ = np_ + (uint32_t)__builtin_popcountll(s_ & below_);                        \
+          uint32_t nq_ = qacc_ + (uint32_t)__builtin_popcountll(q_ & below_);                     \
+          q_ &= ~below_;                                                                          \
+          LINE(ob_, ix_ + l_, r_ - l_ + nx_, nq_, (uint32_t)(a_ >> l_), (uint32_t)(b_ >> l_));    \
+          l_ = r_; nx_ = 0; qacc_ = 0;                                                            \
+          if (blk_ + i_ + 1 >= cend_) { done_ = 1; break; }                                       \
+        }                                                                                         \
+        if (done_) break;                                                                         \
+        oq_ = a_ >> l_;                                                                           \
+        cq_ = b_ >> l_;                                                                           \
+        uint32_t keep_[8];                                                                        \
+        memcpy(keep_, ix_ + l_ - 1, sizeof keep_);                                                \
+        memcpy(ixb_, keep_, sizeof keep_);                                                        \
+        uint32_t p_ = np_ + cnt_ - l_;                                                            \
+        np_ = p_ < IXP ? p_ : IXP;                                                                \
+        nx_ += p_ - np_;                                                                          \
+        if (LIKELY(half_ >> 63)) break;                                                           \
+        half_ = ~half_;                                                                           \
       }                                                                                           \
       if (done_) break;                                                                           \
-      if (cm_) ns_ = tk_commas(sep_, ns_, blk_, cm_);                                             \
       qacc_ += (uint32_t)__builtin_popcountll(q_);                                                \
       blk_ += 64;                                                                                 \
-      if (blk_ >= fend_) {                                                                        \
-        if (ls_ < fend_) { sep_[ns_ < MAXF ? ns_ : MAXF] = fend_; ns_++; LINE(ls_, sep_, ns_, qacc_); } \
-        break;                                                                                    \
-      }                                                                                           \
+      if (blk_ > fend_) break;                                                                    \
     }                                                                                             \
   } while (0)
 
-// Field k of a line: [fs, fe). Strips quotes; returns 0 if a quote is misplaced. nqf counts quotes used.
-INL int field(const char *ls, const char *const *sep, int k, const char **fp, uint32_t *fl, uint32_t *nqf, uint32_t nq) {
-  const char *s = k ? sep[k - 1] + 1 : ls;
-  const char *e = sep[k];
-  if (nq && e > s && *s == '"') {
-    if (e - s < 2 || e[-1] != '"') return 0;
-    s++; e--; *nqf += 2;
+// The nf fields of a line from its separator index: f/fl get the bounds with quotes stripped. Returns 0 for a
+// malformed line: a wrong field count, a field quoted at one end only, a lone quote as a field, or a quote that
+// wraps no field (every wrapped field uses two, so the line's quote count gives the rest away).
+INL int line_fields(const char *ob, const uint32_t *ix, uint32_t ns, uint32_t nq, uint32_t om, uint32_t cm, uint32_t nf,
+                    const char **f, uint32_t *fl) {
+  if (ns != nf) return 0;
+  uint32_t fm = (1u << nf) - 1;
+  uint32_t st[8], ln[8], neg;
+#if defined(__AVX2__)
+  const __m256i bit = _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128);
+  __m256i q = _mm256_cmpeq_epi32(_mm256_and_si256(_mm256_set1_epi32((int)om), bit), bit); // -1 where quoted
+  __m256i s = _mm256_sub_epi32(_mm256_sub_epi32(_mm256_loadu_si256((const __m256i *)(ix - 1)), q), _mm256_set1_epi32(-1));
+  __m256i l = _mm256_sub_epi32(_mm256_add_epi32(_mm256_loadu_si256((const __m256i *)ix), q), s);
+  _mm256_storeu_si256((__m256i *)st, s);
+  _mm256_storeu_si256((__m256i *)ln, l);
+  neg = (uint32_t)_mm256_movemask_ps(_mm256_castsi256_ps(l));
+#else
+  neg = 0;
+  for (int k = 0; k < 8; k++) {
+    uint32_t q = (om >> k) & 1;
+    st[k] = ix[k - 1] + 1 + q;
+    ln[k] = ix[k] - q - st[k];
+    neg |= (ln[k] >> 31) << k;
   }
-  *fp = s; *fl = (uint32_t)(e - s);
+#endif
+  if ((((om ^ cm) | neg) & fm) | (nq ^ 2 * (uint32_t)__builtin_popcount(om & fm))) return 0;
+  for (uint32_t k = 0; k < nf; k++) {
+    f[k] = ob + st[k];
+    fl[k] = ln[k];
+  }
   return 1;
 }
 
@@ -888,11 +972,9 @@ static void pend_flush(int tid) {
   P->ne = P->nc = 0;
 }
 
-static inline void ev_line(int tid, const char *ls, const char *const *sep, int ns, uint32_t nq) {
-  if (ns != 7) return;
-  const char *f[7]; uint32_t fl[7]; uint32_t nqf = 0;
-  for (int k = 0; k < 7; k++) if (!field(ls, sep, k, &f[k], &fl[k], &nqf, nq)) return;
-  if (nqf != nq) return;
+static inline void ev_line(int tid, const char *ob, const uint32_t *ix, uint32_t ns, uint32_t nq, uint32_t om, uint32_t cm) {
+  const char *f[7]; uint32_t fl[7];
+  if (!line_fields(ob, ix, ns, nq, om, cm, 7, f, fl)) return;
   if (fl[0] == 0) return;
   uint64_t eh = hstr(f[0], fl[0]);
   uint64_t uh = 0;
@@ -912,13 +994,15 @@ static inline void ev_line(int tid, const char *ls, const char *const *sep, int 
   uint32_t x = 0;
   int ok = fl[1] > 0 && ts != BADTS && ts >= WS && ts < WE && fl[5] > 0;
   if (ok) {
-    if (fl[4] == 4 && memcmp(f[4], "view", 4) == 0) {}
-    else if (fl[4] == 4 && memcmp(f[4], "cart", 4) == 0) {}
+    // view and cart take one branch: which of the two a line is would mispredict
+    uint32_t t4;
+    memcpy(&t4, f[4], 4);
+    if (LIKELY((fl[4] == 4) & ((t4 == 0x77656976U) | (t4 == 0x74726163U)))) {}
     else if (fl[4] == 8 && memcmp(f[4], "purchase", 8) == 0) {
       uint32_t pr = parse_price(f[6], fl[6]);
       if (!pr) ok = 0;
       else {
-        int32_t c = smap_get(&prodmap, f[5], fl[5]);
+        int32_t c = prod_get(f[5], fl[5]);
         x = pr | ((uint32_t)(c < 0 ? unknown_cat : c) << 24) | X_PURCH;
       }
     } else ok = 0;
@@ -941,11 +1025,9 @@ static inline void ev_line(int tid, const char *ls, const char *const *sep, int 
   P->ne++;
 }
 
-static inline void cl_line(int tid, const char *ls, const char *const *sep, int ns, uint32_t nq) {
-  if (ns != 4) return;
-  const char *f[4]; uint32_t fl[4]; uint32_t nqf = 0;
-  for (int k = 0; k < 4; k++) if (!field(ls, sep, k, &f[k], &fl[k], &nqf, nq)) return;
-  if (nqf != nq) return;
+static inline void cl_line(int tid, const char *ob, const uint32_t *ix, uint32_t ns, uint32_t nq, uint32_t om, uint32_t cm) {
+  const char *f[4]; uint32_t fl[4];
+  if (!line_fields(ob, ix, ns, nq, om, cm, 4, f, fl)) return;
   if (fl[0] == 0 || fl[1] == 0) return;
   uint64_t uh = hstr(f[1], fl[1]);
   if (have_links) { __builtin_prefetch(&lkey[lhome(uh)]); __builtin_prefetch(&lval[lhome(uh)]); }
@@ -960,8 +1042,8 @@ static inline void cl_line(int tid, const char *ls, const char *const *sep, int 
   P->nc++;
 }
 
-#define EVL(ls, sep, ns, nq) ev_line(tid, ls, sep, ns, nq)
-#define CLL(ls, sep, ns, nq) cl_line(tid, ls, sep, ns, nq)
+#define EVL(ob, ix, ns, nq, om, cm) ev_line(tid, ob, ix, ns, nq, om, cm)
+#define CLL(ob, ix, ns, nq, om, cm) cl_line(tid, ob, ix, ns, nq, om, cm)
 // Input is read, not mapped: no file page faults or teardown, and each task's span stays in the thread's L2.
 #ifndef IN_CHUNK
 #define IN_CHUNK (256u << 10)
@@ -1050,11 +1132,9 @@ INL void lrec_put(int tid, uint64_t h, const char *p, uint32_t n, uint32_t pos) 
   r->h = h; r->ref = mkref(p, n); r->pre = __builtin_bswap64(w); r->tid = (uint32_t)tid; r->pos = pos;
   b->n++;
 }
-static inline void lk_line(int tid, const char *ls, const char *const *sep, int ns, uint32_t nq) {
-  if (ns != 2) return;
-  const char *f[2]; uint32_t fl[2]; uint32_t nqf = 0;
-  for (int k = 0; k < 2; k++) if (!field(ls, sep, k, &f[k], &fl[k], &nqf, nq)) return;
-  if (nqf != nq) return;
+static inline void lk_line(int tid, const char *ob, const uint32_t *ix, uint32_t ns, uint32_t nq, uint32_t om, uint32_t cm) {
+  const char *f[2]; uint32_t fl[2];
+  if (!line_fields(ob, ix, ns, nq, om, cm, 2, f, fl)) return;
   if (fl[0] == 0 || fl[1] == 0) return;
   EVec *v = &ledges[tid];
   if (v->n == v->cap) { v->cap = v->cap ? v->cap * 2 : 4096; v->e = xrealloc(v->e, v->cap * sizeof(Edge)); }
@@ -1062,7 +1142,7 @@ static inline void lk_line(int tid, const char *ls, const char *const *sep, int 
   lrec_put(tid, hstr(f[0], fl[0]), f[0], fl[0], pos);
   lrec_put(tid, hstr(f[1], fl[1]), f[1], fl[1], pos + 1);
 }
-#define LKL(ls, sep, ns, nq) lk_line(tid, ls, sep, ns, nq)
+#define LKL(ob, ix, ns, nq, om, cm) lk_line(tid, ob, ix, ns, nq, om, cm)
 static void link_parse_task(int tid, long t, void *ctx) { (void)ctx; const Chunk *c = &lchunks[t]; TOKENIZE(c, LKL); }
 static void link_insert_task(int tid, long p, void *ctx) {
   (void)tid; (void)ctx;
@@ -1976,6 +2056,7 @@ static void load_products(const char *dd) {
   SMap cm; smap_init(&cm, 1024);
   size_t lines = f.n / 8 + 16;
   smap_init(&prodmap, lines);
+  pdir = xcalloc(PDIR_N, 1);
   const char *p = f.p, *end = f.p + f.n;
   const char *nl = memchr(p, '\n', f.n); p = nl ? nl + 1 : end;
   Str *prods = xmalloc(sizeof(Str) * lines), *pcat = xmalloc(sizeof(Str) * lines); size_t npd = 0;
@@ -2006,6 +2087,8 @@ static void load_products(const char *dd) {
   for (size_t i = 0; i < npd; i++) {
     int32_t ci = smap_get(&cm, pcat[i].p, pcat[i].n);
     smap_put(&prodmap, prods[i].p, prods[i].n, ci, &cr);
+    int32_t k = prod_num(prods[i].p, prods[i].n);
+    if (cr && k >= 0 && ci >= 0) pdir[k] = (uint8_t)(ci + 1);
   }
 }
 
