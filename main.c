@@ -1374,6 +1374,8 @@ INL void bits_put(Bits *w, uint32_t v, uint32_t bw) {
     w->nb -= 32;
   }
 }
+// Room for n more values, so the puts that follow never grow the buffer.
+static void bits_res(Bits *w, size_t n, uint32_t bw) { bres(&w->b, n * bw / 8 + 16); }
 // Flushes the partial word and pads to whole groups of 8 values, the unit of a bit-packed run.
 static void bits_end(Bits *w, uint32_t bw) {
   size_t want = (size_t)(w->n + 7) / 8 * bw;
@@ -1387,14 +1389,38 @@ static void bits_end(Bits *w, uint32_t bw) {
 
 // user_daily rows, emitted by each sess thread as it walks: user_id, day, sessions and top_category are dictionary
 // encoded (a person's rows are adjacent, so user_id is one RLE run per person over a dictionary of names), events and
-// revenue_cents PLAIN.
+// revenue_cents PLAIN. The walk stores a row's three small fields as one word; write_user_task bit-packs them per
+// column in tight loops, far cheaper than four interleaved bit streams fed row by row.
 typedef struct {
   Buf names, uidx, ev, rev; // dictionary of person names, RLE runs of its index, events, revenue_cents
-  Bits day, ses, tdef, top; // day index, sessions, top_category definition bits, top_category index
+  Buf row;                  // per row: day index | sessions << 16 | top_category index << 24 (ROW_NOTOP: null)
   uint32_t np;
   char pad[60];
 } UCol;
+#define ROW_NOTOP 0xFFu
 static UCol *ucol; // [NT]
+// Bit-packs the field (row >> sh) & mask of n row words as one finished run.
+static void bits_field(Bits *w, const uint32_t *row, size_t n, uint32_t sh, uint32_t mask, uint32_t bw) {
+  bits_res(w, n, bw);
+  uint8_t *o = w->b.b;
+  uint64_t acc = 0;
+  uint32_t nb = 0;
+  for (size_t i = 0; i < n; i++) {
+    acc |= (uint64_t)((row[i] >> sh) & mask) << nb;
+    nb += bw;
+    if (nb >= 32) {
+      memcpy(o, &acc, 4);
+      o += 4;
+      acc >>= 32;
+      nb -= 32;
+    }
+  }
+  w->b.n = (size_t)(o - w->b.b);
+  w->acc = acc;
+  w->nb = nb;
+  w->n = (uint32_t)n;
+  bits_end(w, bw);
+}
 static uint32_t DBW, CBW; // bit widths of the day and category indexes
 // Sessions starting on one day are over 30 minutes apart, so a day holds at most 48: 6 bits.
 #define SBW 6
@@ -1453,19 +1479,15 @@ static uint64_t *sort_u64(uint64_t *a, uint64_t *tmp, uint32_t n) {
   for (uint32_t i = 0; i < n; i++) hist_add(c, (uint32_t)(a[i] >> 32));
   return radix3(a, tmp, n, c);
 }
-static void emit_row(UCol *U, uint32_t di, uint32_t sessions, uint32_t events, int64_t revenue, int64_t *catsum, uint32_t touched) {
-  int best = -1; int64_t bv = 0;
+// A row's day index, sessions and top category as one word of UCol.row.
+INL uint32_t row_word(uint32_t di, uint32_t sessions, int64_t *catsum, uint32_t touched) {
+  uint32_t best = ROW_NOTOP; int64_t bv = 0;
   for (; touched; touched &= touched - 1) { // ascending category index, so a tie keeps the smallest
-    int z = __builtin_ctz(touched);
+    uint32_t z = (uint32_t)__builtin_ctz(touched);
     if (catsum[z] > bv) { bv = catsum[z]; best = z; }
     catsum[z] = 0;
   }
-  bits_put(&U->day, di, DBW);
-  bits_put(&U->ses, sessions, SBW);
-  bu32(&U->ev, events);
-  bi64(&U->rev, revenue);
-  bits_put(&U->tdef, best >= 0, 1);
-  if (best >= 0) bits_put(&U->top, (uint32_t)best, CBW);
+  return di | sessions << 16 | best << 24;
 }
 
 // Person table: open addressing on the person key, id at the same index, so a probe is one load chain.
@@ -1590,6 +1612,15 @@ static void sess_task(int tid, long q, void *ctx) {
   for (size_t i = 0; i < nlive; i++) cl[pos[cpid[(uint32_t)csorted[i]]]++] = csorted[i];
   SP_ADD(tid, SP_CLICKS, t0);
   UCol *U = &ucol[tid];
+  // a person has at most a row per day and per event: room for every row of the task, so the walk stores unchecked
+  size_t rmax = (size_t)np * (size_t)NDAYS < nalive ? (size_t)np * (size_t)NDAYS : nalive;
+  bres(&U->row, rmax * 4);
+  bres(&U->ev, rmax * 4);
+  bres(&U->rev, rmax * 8);
+  uint32_t *orow = (uint32_t *)(void *)(U->row.b + U->row.n);
+  uint32_t *oev = (uint32_t *)(void *)(U->ev.b + U->ev.n);
+  int64_t *orev = (int64_t *)(void *)(U->rev.b + U->rev.n);
+  size_t nr = 0;
   CHot *hot = &chot[(size_t)tid * (ncamp + 1) * NDAYS];
   CBuy *cy = &cbuy[(size_t)tid * (ncamp + 1) * NDAYS];
   uint32_t *st = stamp[tid];
@@ -1616,7 +1647,7 @@ static void sess_task(int tid, long q, void *ctx) {
     uint32_t m = coff[p + 1] - coff[p];
     uint32_t *sst = sst0 + so, *sdi = sdi0 + so;
     soff[p] = so;
-    uint32_t rows0 = U->day.n;
+    size_t rows0 = nr;
     uint32_t nn = refn(names[p]);
     bres(&U->names, 4 + nn);
     memcpy(U->names.b + U->names.n, &nn, 4);
@@ -1673,7 +1704,10 @@ static void sess_task(int tid, long q, void *ctx) {
       uint32_t s0 = sst[z], di = sdi[z];
       if (z && di != sdi[z - 1]) {
         uint32_t pd = sdi[z - 1];
-        emit_row(U, pd, rses, revs, rrev, catd + (size_t)pd * 32, dmask[pd]);
+        orow[nr] = row_word(pd, rses, catd + (size_t)pd * 32, dmask[pd]);
+        oev[nr] = revs;
+        orev[nr] = rrev;
+        nr++;
         dmask[pd] = 0;
         rses = 0;
         revs = 0;
@@ -1701,13 +1735,19 @@ static void sess_task(int tid, long q, void *ctx) {
       if (srev[so + z]) { cy[ci].purch++; cy[ci].revenue += srev[so + z]; }
     }
     uint32_t ld = sdi[ns - 1];
-    emit_row(U, ld, rses, revs, rrev, catd + (size_t)ld * 32, dmask[ld]);
+    orow[nr] = row_word(ld, rses, catd + (size_t)ld * 32, dmask[ld]);
+    oev[nr] = revs;
+    orev[nr] = rrev;
+    nr++;
     dmask[ld] = 0;
-    bvar(&U->uidx, (uint64_t)(U->day.n - rows0) << 1);
+    bvar(&U->uidx, (uint64_t)(nr - rows0) << 1);
     bu32(&U->uidx, U->np++);
     so += ns;
   }
   soff[np] = so;
+  U->row.n += nr * 4;
+  U->ev.n += nr * 4;
+  U->rev.n += nr * 8;
   SP_ADD(tid, SP_WALK, t0);
   uint32_t *drun = aalloc(S, (size_t)so * 4);
   uint32_t *jprev = aalloc(S, ((size_t)ncamp + 1) * 4); // valid where st[] carries this person's stamp
@@ -1926,12 +1966,21 @@ static void write_file(const char *path, FileW *f) {
 static void write_user_task(int tid, long t, void *ctx) {
   (void)tid; (void)ctx;
   UCol *U = &ucol[t];
-  size_t n = U->day.n;
+  size_t n = U->row.n / 4;
   if (!n && t != 0) return;
-  bits_end(&U->day, DBW);
-  bits_end(&U->ses, SBW);
-  bits_end(&U->tdef, 1);
-  bits_end(&U->top, CBW);
+  const uint32_t *row = (const uint32_t *)(const void *)U->row.b;
+  Bits day = {0}, ses = {0}, tdef = {0}, top = {0}; // day index, sessions, top_category definition bits and index
+  bits_field(&day, row, n, 0, 0xFFFF, DBW);
+  bits_field(&ses, row, n, 16, 0xFF, SBW);
+  bits_res(&tdef, n, 1);
+  bits_res(&top, n, CBW);
+  for (size_t i = 0; i < n; i++) {
+    uint32_t c = row[i] >> 24;
+    bits_put(&tdef, c != ROW_NOTOP, 1);
+    if (c != ROW_NOTOP) bits_put(&top, c, CBW);
+  }
+  bits_end(&tdef, 1);
+  bits_end(&top, CBW);
   Buf dday = {0}, dses = {0}, dtop = {0};
   for (int32_t d = 0; d < NDAYS; d++) bu32(&dday, (uint32_t)(DAY0 + d));
   for (uint32_t v = 0; v < 1u << SBW; v++) bu32(&dses, v);
@@ -1949,8 +1998,8 @@ static void write_user_task(int tid, long t, void *ctx) {
     fw_hdr(&f);
     fw_ext(&f, U->uidx.b, U->uidx.n);
     co[0].size = (int64_t)f.pos - co[0].start;
-    fw_packed(&f, &co[1], &dday, NDAYS, &U->day, DBW);
-    fw_packed(&f, &co[2], &dses, 1u << SBW, &U->ses, SBW);
+    fw_packed(&f, &co[1], &dday, NDAYS, &day, DBW);
+    fw_packed(&f, &co[2], &dses, 1u << SBW, &ses, SBW);
     co[3].start = co[3].off = (int64_t)f.pos;
     page_hdr(&f.h, U->ev.n, (int64_t)n, 0);
     fw_hdr(&f);
@@ -1966,18 +2015,18 @@ static void write_user_task(int tid, long t, void *ctx) {
     // top_category: definition levels as one bit-packed run (4-byte length first), then the non-null indexes
     fw_dict(&f, &co[5], &dtop, ncat, n);
     uint64_t lrun = ((uint64_t)(n + 7) / 8) << 1 | 1;
-    uint64_t vrun = ((uint64_t)(U->top.n + 7) / 8) << 1 | 1;
-    size_t lev = vlen(lrun) + U->tdef.b.n;
-    size_t vals = 1 + (U->top.n ? vlen(vrun) + U->top.b.n : 0);
+    uint64_t vrun = ((uint64_t)(top.n + 7) / 8) << 1 | 1;
+    size_t lev = vlen(lrun) + tdef.b.n;
+    size_t vals = 1 + (top.n ? vlen(vrun) + top.b.n : 0);
     page_hdr(&f.h, 4 + lev + vals, (int64_t)n, 8);
     bu32(&f.h, (uint32_t)lev);
     bvar(&f.h, lrun);
     fw_hdr(&f);
-    fw_ext(&f, U->tdef.b.b, U->tdef.b.n);
+    fw_ext(&f, tdef.b.b, tdef.b.n);
     bbyte(&f.h, (uint8_t)CBW);
-    if (U->top.n) bvar(&f.h, vrun);
+    if (top.n) bvar(&f.h, vrun);
     fw_hdr(&f);
-    fw_ext(&f, U->top.b.b, U->top.b.n);
+    fw_ext(&f, top.b.b, top.b.n);
     co[5].size = (int64_t)f.pos - co[5].start;
   }
   write_footer(&f.h, UCOLS, 6, co, (int64_t)n);
