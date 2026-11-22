@@ -2331,7 +2331,7 @@ int main(void) {
   uint64_t eest = ebytes / 60 + 1024, cest = cbytes / 45 + 1024;
   // eest runs ~1.4x the real event count, so 48000 here is ~30-35K events per partition: 2^10 at 20M, 2^11 at
   // 40-64M. Board, 64M-event replica: PB=QB 11 2975 ms, 10 3020, 12 3172, 13 3490 (diag a2e7094).
-  PB = 6; while (PB < 14 && (eest >> PB) > 48000) PB++;
+  PB = 6; while (PB < 14 && (eest >> PB) > 96000) PB++;
   QB = 6; while (QB < 13 && (eest >> QB) > 64000) QB++;
   NPART = 1u << PB; NQART = 1u << QB;
   uint64_t per_t = eest / NT;
