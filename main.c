@@ -474,7 +474,7 @@ INL int32_t smap_get(const SMap *m, const char *p, uint32_t n) {
 // ---------- thread pool ----------
 static int NT = 8;
 typedef void (*task_fn)(int tid, long task, void *ctx);
-typedef struct { task_fn fn; void *ctx; long ntask; const long *order; atomic_long next; } Pool;
+typedef struct { task_fn fn, fin; void *ctx; long ntask; const long *order; atomic_long next; } Pool;
 typedef struct { Pool *p; int tid; } PArg;
 static void *pool_main(void *a) {
   PArg *pa = a;
@@ -484,16 +484,19 @@ static void *pool_main(void *a) {
     if (t >= p->ntask) break;
     p->fn(pa->tid, p->order ? p->order[t] : t, p->ctx);
   }
+  if (p->fin) p->fin(pa->tid, pa->tid, p->ctx);
   return NULL;
 }
-static void run_par_o(long ntask, const long *order, task_fn fn, void *ctx) {
-  Pool p; p.fn = fn; p.ctx = ctx; p.ntask = ntask; p.order = order; atomic_init(&p.next, 0);
+// fin, when set, runs once per thread (task = tid) as soon as that thread finds the queue empty.
+static void run_par_f(long ntask, const long *order, task_fn fn, task_fn fin, void *ctx) {
+  Pool p; p.fn = fn; p.fin = fin; p.ctx = ctx; p.ntask = ntask; p.order = order; atomic_init(&p.next, 0);
   pthread_t th[64]; PArg args[64];
   for (int i = 0; i < NT; i++) { args[i].p = &p; args[i].tid = i; }
   for (int i = 1; i < NT; i++) pthread_create(&th[i], NULL, pool_main, &args[i]);
   pool_main(&args[0]);
   for (int i = 1; i < NT; i++) pthread_join(th[i], NULL);
 }
+static void run_par_o(long ntask, const long *order, task_fn fn, void *ctx) { run_par_f(ntask, order, fn, NULL, ctx); }
 static void run_par(long ntask, task_fn fn, void *ctx) { run_par_o(ntask, NULL, fn, ctx); }
 
 // ---------- per-thread arenas ----------
@@ -1884,16 +1887,15 @@ int main(void) {
   for (uint32_t q = 0; q < NQART; q++) order[q] = q;
   qsort(order, NQART, sizeof(long), cmp_q);
   PH(" s.setup");
-  run_par_o(NQART, order, sess_task, NULL);
+  snprintf(dir, sizeof dir, "%s/user_daily", od); if (mkdir(dir, 0777) && errno != EEXIST) die(dir);
+  snprintf(dir, sizeof dir, "%s/campaign_daily", od); if (mkdir(dir, 0777) && errno != EEXIST) die(dir);
+  // each thread writes its user_daily file the moment the queue runs dry, while the others finish their partitions
+  run_par_f(NQART, order, sess_task, write_user_task, NULL);
   PH("sess");
   {
     static const char *const sn[] = {" d.zero", " d.probe", " s.gather", " s.sort", " s.clicks", " s.walk", " s.assist"};
     sp_print(SP_DZERO, SP_N, sn, PROF ? (now_s() - pt0) * 1e3 / (double)(ticks() - pk0) : 0);
   }
-  snprintf(dir, sizeof dir, "%s/user_daily", od); if (mkdir(dir, 0777) && errno != EEXIST) die(dir);
-  snprintf(dir, sizeof dir, "%s/campaign_daily", od); if (mkdir(dir, 0777) && errno != EEXIST) die(dir);
-  run_par(NT, write_user_task, NULL);
-  PH(" w.user");
   write_campaign();
   PH("write");
   if (RELEASE) run_par(nchunks + NT, release_task, NULL);
