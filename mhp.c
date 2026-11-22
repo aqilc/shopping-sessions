@@ -918,6 +918,9 @@ static void init_task(int tid, long t, void *ctx) {
   (void)tid; (void)ctx;
   uint64_t lo = (uint64_t)t * LSPAN, hi = lo + LSPAN; if (hi > lcap) hi = lcap;
   for (uint64_t i = lo; i < hi; i++) { atomic_store_explicit(&lpar[i], (uint32_t)i, memory_order_relaxed); atomic_store_explicit(&lbest[i], UINT32_MAX, memory_order_relaxed); }
+  // A span of ltab is 1 MB, so this writes every 2 MB page first: lt_insert's first touch is a load, which maps the
+  // huge zero page, and the store after it splits that into 4 KB pages (a fault per page, a TLB miss per lookup).
+  atomic_store_explicit(&ltab[lo].key, 0, memory_order_relaxed);
 }
 static void best_task(int tid, long t, void *ctx) {
   (void)tid; (void)ctx;
@@ -1115,7 +1118,7 @@ static void flush_row(UVec *ur, URow *row, int64_t *catsum, uint32_t touched) {
     catsum[z] = 0;
   }
   row->top = best;
-  if (ur->n == ur->cap) { ur->cap = ur->cap ? ur->cap * 2 : 65536; ur->a = xrealloc(ur->a, ur->cap * sizeof(URow)); }
+  if (UNLIKELY(ur->n == ur->cap)) die("rows full");
   ur->a[ur->n++] = *row;
 }
 
@@ -1694,11 +1697,12 @@ static void release_task(int tid, long t, void *ctx) {
   if (t < nchunks) { const Chunk *c = &chunks[t]; madvise((void *)(c->base + c->start), c->end - c->start, MADV_DONTNEED); return; }
   t -= nchunks;
   madvise(arenas[t].base, (size_t)(arenas[t].cur - arenas[t].base), MADV_DONTNEED);
+  madvise(urows[t].a, urows[t].n * sizeof(URow), MADV_DONTNEED);
   madvise(scratch[t].base, 1ull << 30, MADV_DONTNEED);
 }
 
 int main(void) {
-  PROF = getenv("SESS_PROF") != NULL; T0 = now_s(); if (PROF) fprintf(stderr, "t0abs %.3f ms\n", T0 * 1e3);
+  PROF = getenv("SESS_PROF") != NULL; T0 = now_s();
   const char *dd = getenv("DATA_DIR"); if (!dd) dd = "/data";
   const char *od = getenv("OUTPUT_DIR"); if (!od) od = "/output";
   OUTDIR = (char *)od;
@@ -1727,7 +1731,7 @@ int main(void) {
   MFile *ef = xmalloc(sizeof(MFile) * (ne + 1)), *cf = xmalloc(sizeof(MFile) * (ncl + 1));
   for (int i = 0; i < ne; i++) { ef[i] = map_file(ep[i]); ebytes += ef[i].n; }
   for (int i = 0; i < ncl; i++) { cf[i] = map_file(cp[i]); cbytes += cf[i].n; }
-  size_t csz = 1u << 18;
+  size_t csz = 1u << 20;
   for (int i = 0; i < ne; i++) add_chunks(ef[i], 0, csz);
   for (int i = 0; i < ncl; i++) add_chunks(cf[i], 1, csz);
   // partition sizing
@@ -1738,9 +1742,11 @@ int main(void) {
   QB = 6; while (QB < 13 && (eest >> QB) > 48000) QB++;
   NPART = 1u << PB; NQART = 1u << QB;
   uint64_t per_t = eest / NT;
-  kcap0 = (uint32_t)(per_t / NPART); kcap0 = kcap0 + kcap0 / 4 + 32;
-  pcap0 = (uint32_t)(per_t / NQART); pcap0 = pcap0 + pcap0 / 4 + 32;
-  ccap0 = (uint32_t)(cest / NT / NQART); ccap0 = ccap0 / 2 + 32;
+  // Blocks of an eighth of a bucket's expected share: a bucket's last block is the only unused memory (and the
+  // kernel zeroes all of it), so this wastes ~6% where one block of the whole share wasted ~75% (eest runs high).
+  kcap0 = (uint32_t)(per_t / NPART / 8 + 32);
+  pcap0 = (uint32_t)(per_t / NQART / 8 + 32);
+  ccap0 = (uint32_t)(cest / NT / NQART / 16 + 32);
   arenas = xcalloc(NT, sizeof(Arena)); scratch = xcalloc(NT, sizeof(Arena));
   for (int t = 0; t < NT; t++) { arena_init(&arenas[t], ARENA_SZ); arena_init(&scratch[t], 1ull << 30); }
   pend = xcalloc(NT, sizeof(Pend));
@@ -1766,6 +1772,14 @@ int main(void) {
   // largest person partitions first
   qsize = xcalloc(NQART, 8);
   for (int t = 0; t < NT; t++) for (uint32_t q = 0; q < NQART; q++) for (Blk *k = pb[(size_t)t * NQART + q].head; k; k = k->next) qsize[q] += k->n;
+  uint64_t nev = 1;
+  for (uint32_t q = 0; q < NQART; q++) nev += qsize[q];
+  for (int t = 0; t < NT; t++) { // a row per (person, day) with an event, so at most one per event; huge pages
+    Arena a;
+    arena_init(&a, nev * sizeof(URow));
+    urows[t].a = (URow *)a.base;
+    urows[t].cap = nev;
+  }
   long *order = xmalloc(sizeof(long) * NQART);
   for (uint32_t q = 0; q < NQART; q++) order[q] = q;
   qsort(order, NQART, sizeof(long), cmp_q);
