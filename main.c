@@ -249,8 +249,8 @@ INL uint64_t ts_chunk(const char *p, uint32_t rem) {
   return rem >= 8 ? ld8(p + rem - 8) : ld8(p) << (8 * (8 - rem));
 }
 
-// Reads only p[0..n-1].
-static int64_t parse_ts(const char *p, uint32_t n) {
+// Every form, exact. Reads only p[0..n-1].
+static int64_t parse_ts_any(const char *p, uint32_t n) {
   if (n == 20) {
     // ":SSZ"
     uint32_t t;
@@ -299,6 +299,88 @@ static int64_t parse_ts(const char *p, uint32_t n) {
   if (m > 16) v += ts_parse8(ts_chunk(p, n - 16)) * 10000000000000000ULL;
   return (int64_t)v;
 }
+
+#if defined(__AVX2__)
+// Per form k (0: 13-digit F3, 1: F1, 2: F2), with the 32 bytes at p as x = p - t8 and the bytes at p + 1 as y = p + 1 - '0':
+// lane i is good when x[i] <= l8[i]; u16 pairs u = maddubs(x, wa) + maddubs(y, wb) are good when u - lo <= rg;
+// madd(u, m) gives F3 as 4+4+4+1 digit groups, or F1/F2 as year, month, day * 24 + hour, minute * 60, second, offset minutes.
+typedef struct { uint8_t t8[32], l8[32]; int8_t wa[32], wb[32]; uint16_t lo[16], rg[16]; int16_t m[16]; } TsForm;
+static TsForm ts_form[3] __attribute__((aligned(32)));
+// Form by length: 0 F3 13 digits, 1 F1, 2 F2, 3 any other length.
+static const uint8_t ts_kind[26] = {3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 0, 3, 3, 3, 3, 3, 3, 1, 3, 3, 3, 3, 2};
+__attribute__((constructor)) static void ts_form_init(void) {
+  static const char *pat[3] = {"DDDDDDDDDDDDD", "DDDD-DD-DDTDD:DD:DDZ", "DDDD-DD-DDTDD:DD:DD+DD:DD"};
+  for (int k = 0; k < 3; k++) {
+    TsForm *f = &ts_form[k];
+    memset(f->l8, 0xFF, 32);
+    for (int i = 0; pat[k][i]; i++) {
+      char c = pat[k][i];
+      f->t8[i] = c == 'D' ? '0' : (uint8_t)c;
+      f->l8[i] = c == 'D' ? 9 : c == '+' ? 2 : 0; // '+' covers '+', ',' and '-'
+    }
+    for (int i = 0; i < 16; i++) f->rg[i] = 0xFFFF;
+    if (k == 0) {
+      for (int i = 0; i < 12; i += 2) { f->wa[i] = 10; f->wa[i + 1] = 1; }
+      f->wa[12] = 1;
+      for (int i = 0; i < 6; i += 2) { f->m[i] = 100; f->m[i + 1] = 1; }
+      f->m[6] = 1;
+      continue;
+    }
+    // u16 lanes from x: 0, 1 year halves, 4 day, 7 minute, 10 offset hour; from y: 2 month, 5 hour, 8 second, 11 offset minute.
+    static const int fa[5] = {0, 1, 4, 7, 10}, fb[4] = {2, 5, 8, 11};
+    for (int j = 0; j < 5; j++) { f->wa[2 * fa[j]] = 10; f->wa[2 * fa[j] + 1] = 1; }
+    for (int j = 0; j < 4; j++) { f->wb[2 * fb[j]] = 10; f->wb[2 * fb[j] + 1] = 1; }
+    f->lo[2] = 1; f->rg[2] = 11;
+    f->lo[4] = 1; f->rg[4] = 30;
+    f->rg[5] = 23; f->rg[7] = 59; f->rg[8] = 59;
+    f->m[0] = 100; f->m[1] = 1; f->m[2] = 1; f->m[4] = 24; f->m[5] = 1; f->m[7] = 60; f->m[8] = 1;
+    if (k == 2) { f->rg[10] = 23; f->rg[11] = 59; f->m[10] = 60; f->m[11] = 1; }
+  }
+}
+
+// Branch-free for the three common lengths (the form mix makes a length branch unpredictable); the rest go to
+// parse_ts_any. Reads p[0..32].
+INL int64_t parse_ts(const char *p, uint32_t n) {
+  // Selects below use masks: gcc turns ternaries on k into branches.
+  unsigned k = n < 26 ? ts_kind[n] : 3;
+  if (UNLIKELY(k == 3)) return parse_ts_any(p, n);
+  const TsForm *f = &ts_form[k];
+  __m256i x = _mm256_sub_epi8(_mm256_loadu_si256((const __m256i *)p), _mm256_load_si256((const __m256i *)f->t8));
+  __m256i y = _mm256_sub_epi8(_mm256_loadu_si256((const __m256i *)(p + 1)), _mm256_set1_epi8('0'));
+  __m256i l8 = _mm256_load_si256((const __m256i *)f->l8);
+  __m256i u = _mm256_add_epi16(_mm256_maddubs_epi16(x, _mm256_load_si256((const __m256i *)f->wa)),
+                               _mm256_maddubs_epi16(y, _mm256_load_si256((const __m256i *)f->wb)));
+  __m256i rg = _mm256_load_si256((const __m256i *)f->rg);
+  __m256i ur = _mm256_sub_epi16(u, _mm256_load_si256((const __m256i *)f->lo));
+  __m256i good = _mm256_and_si256(_mm256_cmpeq_epi8(_mm256_max_epu8(x, l8), l8), _mm256_cmpeq_epi16(_mm256_max_epu16(ur, rg), rg));
+  unsigned bad = (unsigned)_mm256_movemask_epi8(good) != 0xFFFFFFFFu;
+  bad |= (k == 2) & (p[19] == ',');
+  __m256i g = _mm256_madd_epi16(u, _mm256_load_si256((const __m256i *)f->m));
+  __m128i g0 = _mm256_castsi256_si128(g);
+  uint64_t a = (uint64_t)_mm_cvtsi128_si64(g0), b = (uint64_t)_mm_extract_epi64(g0, 1);
+  uint64_t c = (uint64_t)_mm_cvtsi128_si64(_mm256_extracti128_si256(g, 1));
+  unsigned g1 = (uint32_t)a, g2 = (uint32_t)(a >> 32), g3 = (uint32_t)b, g4 = (uint32_t)(b >> 32);
+  int64_t f3 = (int64_t)g1 * 1000000000 + (int64_t)g2 * 100000 + (int64_t)g3 * 10 + g4;
+  // F3 takes year 1900, so only an F1/F2 year can go out of the table.
+  unsigned cm = -(unsigned)(k != 0);
+  unsigned yi = (g1 - TS_Y0) & cm;
+  unsigned out = yi >= TS_NY;
+  if (UNLIKELY(out & !bad)) return parse_ts_any(p, n);
+  yi &= out - 1;
+  unsigned mo = g2 & 15, da = (unsigned)_mm256_extract_epi16(u, 4);
+  unsigned leap = (unsigned)(ts_ystart[yi + 1] - ts_ystart[yi]) - 365;
+  bad |= cm & (da > ts_mdays[leap][mo]);
+  int64_t hours = (int64_t)(ts_ystart[yi] + ts_moff[leap][mo] - 1) * 24 + g3;
+  // Offset sign at p[19]: '+' (bit 2 clear) is subtracted, '-' added; F1 has offset 0.
+  int64_t off = (int64_t)(uint32_t)(c >> 32) * 60 * (1 - ((p[19] >> 1) & 2));
+  int64_t cal = (hours * 3600 + g4 + (uint32_t)c - off) * 1000;
+  int64_t km = (int32_t)cm, bm = -(int64_t)bad;
+  int64_t r = (cal & km) | (f3 & ~km);
+  return (r & ~bm) | (BADTS & bm);
+}
+#else
+#define parse_ts parse_ts_any
+#endif
 
 // price: digits only, 1..10,000,000; returns 0 if bad
 INL uint32_t parse_price(const char *p, uint32_t n) {
