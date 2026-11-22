@@ -717,7 +717,7 @@ static int unknown_cat;
 static int ncat; static const char **catp; static uint32_t *catn;
 static int ncamp; static const char **camp_id; static uint32_t *camp_idn; static const char **chan; static uint32_t *chann;
 #ifndef EVP
-#define EVP 96000 // estimated events per eid partition (KRec streams, dedup table size)
+#define EVP 128000 // estimated events per eid partition (KRec streams, dedup table size)
 #endif
 #ifndef EVQ
 #define EVQ 64000 // estimated events per person partition (PRec and CRec streams)
