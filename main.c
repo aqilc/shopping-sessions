@@ -475,8 +475,9 @@ static uint32_t kcap0, pcap0, ccap0;
 #define STAGE 0
 #endif
 #define ST 8 // records per run
-_Static_assert(sizeof(Blk) == 16 && ST * sizeof(PRec) % 16 == 0, "stage runs must stay 16 B-aligned");
+_Static_assert(sizeof(Blk) == 16 && ST * sizeof(PRec) % 16 == 0 && ST * sizeof(KRec) % 16 == 0, "stage runs must stay 16 B-aligned");
 static char *pst; // [NT][NQART] PRec runs
+static char *kst; // [NT][NPART] KRec runs
 INL void run_stream(char *d, const char *s, size_t n) {
 #if defined(__AVX2__)
   for (size_t i = 0; i < n; i += 16) _mm_stream_si128((__m128i *)(d + i), _mm_loadu_si128((const __m128i *)(s + i)));
@@ -594,7 +595,7 @@ INL int field(const char *ls, const char *const *sep, int k, const char **fp, ui
 
 // Delay line: person lookups miss cache, so each is resolved RING lines after its prefetch.
 #define RING 32
-typedef struct { uint64_t uh, uref; uint32_t ts, x; KRec *k; } EPend;
+typedef struct { uint64_t uh, uref, eh; uint32_t ts, x, ingest; } EPend;
 typedef struct { uint64_t uh, cref; uint32_t ts, camp; } CPend;
 typedef struct { EPend e[RING]; CPend c[RING]; uint32_t ne, nc; char pad[56]; } Pend;
 static Pend *pend; // [NT]
@@ -603,7 +604,9 @@ INL void ev_emit(int tid, const EPend *p) {
   size_t bi = (size_t)tid * NQART + qpart(pk);
   PRec r = {pk, p->uref, p->ts, p->x};
   char *d = rec_put(&arenas[tid], &pb[bi], pst + bi * (ST * sizeof(PRec)), &r, sizeof(PRec), pcap0);
-  p->k->loc = (uint32_t)((d - arenas[tid].base) >> 3);
+  KRec k = {p->eh, p->ingest, (uint32_t)((d - arenas[tid].base) >> 3)};
+  size_t ki = (size_t)tid * NPART + (p->eh >> (64 - PB));
+  rec_put(&arenas[tid], &kb[ki], kst + ki * (ST * sizeof(KRec)), &k, sizeof(KRec), kcap0);
 }
 INL void cl_emit(int tid, const CPend *p) {
   uint64_t pk = person_of(p->uh);
@@ -653,17 +656,19 @@ static inline void ev_line(int tid, const char *ls, const char *const *sep, int 
   int64_t is = ing == BADTS ? 0xFFFFFFFFll : ing / 1000;
   if (is < 0) is = 0;
   if (is > 0xFFFFFFFFll) is = 0xFFFFFFFFll;
-  Bkt *b = &kb[(size_t)tid * NPART + (eh >> (64 - PB))];
-  if (UNLIKELY(b->cur == b->end)) bkt_grow(&arenas[tid], b, sizeof(KRec), b->tail ? b->tail->cap : kcap0);
-  KRec *k = (KRec *)b->cur; b->cur += sizeof(KRec);
-  k->h = eh; k->ingest = (uint32_t)is; k->loc = LOC_NONE;
-  if (ok) {
-    Pend *P = &pend[tid];
-    EPend *e = &P->e[P->ne % RING];
-    if (P->ne >= RING) ev_emit(tid, e);
-    e->uh = uh; e->uref = mkref(f[1], fl[1]); e->ts = (uint32_t)(ts - CWS); e->x = x; e->k = k;
-    P->ne++;
+  // A valid event's KRec is written by ev_emit once its payload loc is known; dedup does not depend on KRec order
+  // (it keeps the smallest ingest, and copies with equal ingest_ts are identical).
+  if (!ok) {
+    size_t ki = (size_t)tid * NPART + (eh >> (64 - PB));
+    KRec k = {eh, (uint32_t)is, LOC_NONE};
+    rec_put(&arenas[tid], &kb[ki], kst + ki * (ST * sizeof(KRec)), &k, sizeof(KRec), kcap0);
+    return;
   }
+  Pend *P = &pend[tid];
+  EPend *e = &P->e[P->ne % RING];
+  if (P->ne >= RING) ev_emit(tid, e);
+  e->uh = uh; e->uref = mkref(f[1], fl[1]); e->eh = eh; e->ts = (uint32_t)(ts - CWS); e->x = x; e->ingest = (uint32_t)is;
+  P->ne++;
 }
 
 static inline void cl_line(int tid, const char *ls, const char *const *sep, int ns, uint32_t nq) {
@@ -1450,7 +1455,11 @@ static int cmp_q(const void *a, const void *b) {
 
 static void close_task(int tid, long t, void *ctx) {
   (void)tid; (void)ctx;
-  for (uint32_t i = 0; i < NPART; i++) bkt_close(&kb[(size_t)t * NPART + i], sizeof(KRec));
+  for (uint32_t i = 0; i < NPART; i++) {
+    size_t bi = (size_t)t * NPART + i;
+    if (STAGE) stage_flush(&kb[bi], kst + bi * (ST * sizeof(KRec)), sizeof(KRec));
+    bkt_close(&kb[bi], sizeof(KRec));
+  }
   for (uint32_t i = 0; i < NQART; i++) {
     size_t bi = (size_t)t * NQART + i;
     if (STAGE) stage_flush(&pb[bi], pst + bi * (ST * sizeof(PRec)), sizeof(PRec));
@@ -1518,6 +1527,7 @@ int main(void) {
   pb = xcalloc((size_t)NT * NQART, sizeof(Bkt));
   cb = xcalloc((size_t)NT * NQART, sizeof(Bkt));
   if (STAGE) pst = hcalloc((size_t)NT * NQART * ST * sizeof(PRec));
+  if (STAGE) kst = hcalloc((size_t)NT * NPART * ST * sizeof(KRec));
   PH("map");
   run_par(nchunks, parse_task, NULL);
   run_par(NT, close_task, NULL);
