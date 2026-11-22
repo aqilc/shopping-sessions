@@ -1504,6 +1504,10 @@ static void close_task(int tid, long t, void *ctx) {
 }
 
 // Drop pages in parallel (madvise takes the mmap lock shared) so exit has little left to tear down serially.
+// -DRELEASE=0 leaves all of it to exit.
+#ifndef RELEASE
+#define RELEASE 1
+#endif
 static void release_task(int tid, long t, void *ctx) {
   (void)tid; (void)ctx;
   if (t < nchunks) { const Chunk *c = &chunks[t]; madvise((void *)(c->base + c->start), c->end - c->start, MADV_DONTNEED); return; }
@@ -1595,7 +1599,7 @@ int main(void) {
   PH(" w.user");
   write_campaign();
   PH("write");
-  run_par(nchunks + NT, release_task, NULL);
+  if (RELEASE) run_par(nchunks + NT, release_task, NULL);
   PH("release");
   _exit(0);
 }
