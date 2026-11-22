@@ -1625,8 +1625,8 @@ int main(void) {
   // partition sizing
   uint64_t eest = ebytes / 60 + 1024, cest = cbytes / 45 + 1024;
   // ~30K events per partition: fewer write streams at parse (2^10 at 20M), tables still in L2
-  PB = 6; while (PB < 14 && (eest >> PB) > 30000) PB++;
-  QB = 6; while (QB < 13 && (eest >> QB) > 30000) QB++;
+  PB = 13;
+  QB = 13;
   NPART = 1u << PB; NQART = 1u << QB;
   uint64_t per_t = eest / NT;
   kcap0 = (uint32_t)(per_t / NPART); kcap0 = kcap0 + kcap0 / 4 + 32;

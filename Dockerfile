@@ -1,15 +1,9 @@
 FROM debian:bookworm-slim AS build
 RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev clang-14 && rm -rf /var/lib/apt/lists/*
-COPY main.c ts.c fld.c fld2.c pl.c diag.c /src/
+COPY main.c pb10.c pb11.c pb13.c v6c.c fuse2.c diag.c /src/
 RUN mkdir /v && F="-O3 -static -pthread -march=x86-64-v3" && cd /src && \
-    gcc $F -o /v/gbase main.c && \
+    for v in pb10 pb11 pb13 v6c fuse2; do clang-14 $F -o /v/$v $v.c; done && \
     clang-14 $F -o /v/base main.c && \
-    clang-14 $F -o /v/ts ts.c && \
-    gcc $F -o /v/gts ts.c && \
-    clang-14 $F -o /v/fld fld.c && \
-    clang-14 $F -o /v/fld2 fld2.c && \
-    clang-14 $F -o /v/pl pl.c && \
-    clang-14 $F -DLFILT=23 -o /v/plf pl.c && \
     gcc -O2 -static -o /diag diag.c
 
 FROM scratch

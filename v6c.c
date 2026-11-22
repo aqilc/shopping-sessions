@@ -38,10 +38,6 @@ static int PROF; static double T0;
 
 // ---------- hashing / strings ----------
 INL uint64_t ld8(const char *p) { uint64_t w; memcpy(&w, p, 8); return w; }
-// event_type values as little-endian loads
-#define ET_VIEW 0x77656976u
-#define ET_CART 0x74726163u
-#define ET_PURCH 0x6573616863727570ull
 INL uint64_t mum(uint64_t a, uint64_t b) { __uint128_t r = (__uint128_t)a * b; return (uint64_t)r ^ (uint64_t)(r >> 64); }
 #define HS0 0xa0761d6478bd642full
 #define HS1 0xe7037ed1a0b428dbull
@@ -586,23 +582,16 @@ INL int tk_commas(const char **sep, int ns, const char *blk, uint64_t m) {
     }                                                                                             \
   } while (0)
 
-// Fields of a line: f[k], fl[k] with whole-field quotes stripped, no per-field branch (20% of fields are quoted
-// at random, so a branch per field mispredicts). Returns 0 if a quote is misplaced: a field quoted on one side
-// only, or quotes inside a field (then the quotes used fall short of nq).
-INL int fields(const char *ls, const char *const *sep, int nf, const char **f, uint32_t *fl, uint32_t nq) {
-  const char *s = ls;
-  uint32_t used = 0, bad = 0;
-  for (int k = 0; k < nf; k++) {
-    const char *e = sep[k];
-    uint32_t len = (uint32_t)(e - s);
-    uint32_t q = s[0] == '"'; // an empty field's first byte is its separator
-    bad |= q & ((len < 2) | (e[-1] != '"'));
-    f[k] = s + q;
-    fl[k] = len - 2 * q;
-    used += 2 * q;
-    s = e + 1;
+// Field k of a line: [fs, fe). Strips quotes; returns 0 if a quote is misplaced. nqf counts quotes used.
+INL int field(const char *ls, const char *const *sep, int k, const char **fp, uint32_t *fl, uint32_t *nqf, uint32_t nq) {
+  const char *s = k ? sep[k - 1] + 1 : ls;
+  const char *e = sep[k];
+  if (nq && e > s && *s == '"') {
+    if (e - s < 2 || e[-1] != '"') return 0;
+    s++; e--; *nqf += 2;
   }
-  return !bad && used == nq;
+  *fp = s; *fl = (uint32_t)(e - s);
+  return 1;
 }
 
 // Delay line: person lookups miss cache, so each is resolved RING lines after its prefetch.
@@ -637,25 +626,31 @@ static void pend_flush(int tid) {
 
 static inline void ev_line(int tid, const char *ls, const char *const *sep, int ns, uint32_t nq) {
   if (ns != 7) return;
-  const char *f[7]; uint32_t fl[7];
-  if (!fields(ls, sep, 7, f, fl, nq)) return;
+  const char *f[7]; uint32_t fl[7]; uint32_t nqf = 0;
+  for (int k = 0; k < 7; k++) if (!field(ls, sep, k, &f[k], &fl[k], &nqf, nq)) return;
+  if (nqf != nq) return;
   if (fl[0] == 0) return;
   uint64_t eh = hstr(f[0], fl[0]);
+  uint64_t uh = 0;
+  if (fl[1]) {
+    uh = hstr(f[1], fl[1]);
+    if (have_links) __builtin_prefetch(&ltab[uh & lmask_b]);
+  }
   int64_t ing = LIKELY(fl[3] == 20) ? ingest_s(f[3]) * 1000 : parse_ts(f[3], fl[3]);
   int64_t ts = parse_ts(f[2], fl[2]);
-  // event_type by length and one load: every field has 7 readable bytes past it (the line's rest or the PAD).
-  uint64_t w = ld8(f[4]);
-  uint32_t vc = (fl[4] == 4) & (((uint32_t)w == ET_VIEW) | ((uint32_t)w == ET_CART));
-  uint32_t pu = (fl[4] == 8) & (w == ET_PURCH);
-  int ok = (fl[1] > 0) & (ts >= WS) & (ts < WE) & (fl[5] > 0) & (vc | pu);
   uint32_t x = 0;
-  if (ok && pu) {
-    uint32_t pr = parse_price(f[6], fl[6]);
-    if (!pr) ok = 0;
-    else {
-      int32_t c = smap_get(&prodmap, f[5], fl[5]);
-      x = pr | ((uint32_t)(c < 0 ? unknown_cat : c) << 24) | X_PURCH;
-    }
+  int ok = fl[1] > 0 && ts != BADTS && ts >= WS && ts < WE && fl[5] > 0;
+  if (ok) {
+    if (fl[4] == 4 && memcmp(f[4], "view", 4) == 0) {}
+    else if (fl[4] == 4 && memcmp(f[4], "cart", 4) == 0) {}
+    else if (fl[4] == 8 && memcmp(f[4], "purchase", 8) == 0) {
+      uint32_t pr = parse_price(f[6], fl[6]);
+      if (!pr) ok = 0;
+      else {
+        int32_t c = smap_get(&prodmap, f[5], fl[5]);
+        x = pr | ((uint32_t)(c < 0 ? unknown_cat : c) << 24) | X_PURCH;
+      }
+    } else ok = 0;
   }
   if (ok && ing != BADTS && ing - ts > 86400000LL) ok = 0;
   int64_t is = ing == BADTS ? 0xFFFFFFFFll : ing / 1000;
@@ -669,8 +664,6 @@ static inline void ev_line(int tid, const char *ls, const char *const *sep, int 
     rec_put(&arenas[tid], &kb[ki], kst + ki * (ST * sizeof(KRec)), &k, sizeof(KRec), kcap0);
     return;
   }
-  uint64_t uh = hstr(f[1], fl[1]);
-  if (have_links) __builtin_prefetch(&ltab[uh & lmask_b]);
   Pend *P = &pend[tid];
   EPend *e = &P->e[P->ne % RING];
   if (P->ne >= RING) ev_emit(tid, e);
@@ -680,8 +673,9 @@ static inline void ev_line(int tid, const char *ls, const char *const *sep, int 
 
 static inline void cl_line(int tid, const char *ls, const char *const *sep, int ns, uint32_t nq) {
   if (ns != 4) return;
-  const char *f[4]; uint32_t fl[4];
-  if (!fields(ls, sep, 4, f, fl, nq)) return;
+  const char *f[4]; uint32_t fl[4]; uint32_t nqf = 0;
+  for (int k = 0; k < 4; k++) if (!field(ls, sep, k, &f[k], &fl[k], &nqf, nq)) return;
+  if (nqf != nq) return;
   if (fl[0] == 0 || fl[1] == 0) return;
   uint64_t uh = hstr(f[1], fl[1]);
   if (have_links) __builtin_prefetch(&ltab[uh & lmask_b]);
@@ -743,8 +737,9 @@ INL void lk_emit(int tid, const LPend *p) {
 }
 static inline void lk_line(int tid, const char *ls, const char *const *sep, int ns, uint32_t nq) {
   if (ns != 2) return;
-  const char *f[2]; uint32_t fl[2];
-  if (!fields(ls, sep, 2, f, fl, nq)) return;
+  const char *f[2]; uint32_t fl[2]; uint32_t nqf = 0;
+  for (int k = 0; k < 2; k++) if (!field(ls, sep, k, &f[k], &fl[k], &nqf, nq)) return;
+  if (nqf != nq) return;
   if (fl[0] == 0 || fl[1] == 0) return;
   uint64_t ha = hstr(f[0], fl[0]), hb = hstr(f[1], fl[1]);
   __builtin_prefetch(&ltab[ha & lmask_b], 1); __builtin_prefetch(&ltab[hb & lmask_b], 1);

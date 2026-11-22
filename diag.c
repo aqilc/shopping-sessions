@@ -9,6 +9,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -113,20 +114,30 @@ int main(void) {
   cat("/proc/meminfo", "MemTotal", 1);
   cat("/sys/kernel/mm/transparent_hugepage/enabled", NULL, 2);
   cat("/sys/kernel/mm/transparent_hugepage/defrag", NULL, 2);
-  cat("/sys/fs/cgroup/cpu.max", NULL, 2); cat("/sys/fs/cgroup/cpuset.cpus.effective", NULL, 2);
+  cat("/sys/fs/cgroup/cpu.max", NULL, 2); cat("/sys/fs/cgroup/memory.max", NULL, 1); cat("/sys/fs/cgroup/cpuset.cpus.effective", NULL, 2);
   cat("/proc/mounts", " /data ", 1); cat("/proc/mounts", " /scratch ", 1); cat("/proc/mounts", " /output ", 1);
   const char *dd = getenv("DATA_DIR"); if (!dd) dd = "/data";
   const char *sc = getenv("SCRATCH_DIR"); if (!sc) sc = "/scratch";
   const char *nc = getenv("NCPU"); if (!nc) nc = "8";
   char big[512]; snprintf(big, sizeof big, "%s/big", sc);
   R d = run("/v/base", dd, nc); SUMF("dev base w%.0f x%d parse%.0f sess%.0f\n", d.w, d.x, d.ph[2], d.ph[4]);
-  int K = getenv("DIAG_K") ? atoi(getenv("DIAG_K")) : 20;
+  int K = getenv("DIAG_K") ? atoi(getenv("DIAG_K")) : 60;
+  { // cap K so the replica fits in 80% of /scratch free space
+    long long src = 0; const char *subs[] = {"events", "clicks", "links"};
+    for (int i = 0; i < 3; i++) { char sd[512]; snprintf(sd, sizeof sd, "%s/%s", dd, subs[i]); DIR *d = opendir(sd); struct dirent *e;
+      while (d && (e = readdir(d))) { char p[1024]; struct stat st; snprintf(p, sizeof p, "%s/%s", sd, e->d_name); if (!stat(p, &st) && S_ISREG(st.st_mode)) src += st.st_size; }
+      if (d) closedir(d); }
+    struct statvfs v; long long fr = statvfs(sc, &v) ? -1 : (long long)v.f_bavail * v.f_frsize;
+    int kmax = src > 0 && fr > 0 ? (int)(fr * 0.8 / (src * 1.08)) : K;
+    SUMF("src %lld MB scratch free %lld MB kmax %d\n", src >> 20, fr >> 20, kmax);
+    if (K > kmax) K = kmax;
+  }
   double t = now(); mkdir(big, 0777);
   rep(dd, big, "events", K, 2); rep(dd, big, "clicks", K, 2); rep(dd, big, "links", K, 2);
   cp(dd, big, "products.csv"); cp(dd, big, "campaigns.csv"); cp(dd, big, "manifest.json");
   SUMF("replica x%d %.0f ms\n", K, (now() - t) * 1e3);
-  static const char *V[] = {"base", "gbase", "ts", "gts", "fld", "fld2", "pl", "plf"};
-  enum { NV = 8, NR = 5 };
+  static const char *V[] = {"base", "pb10", "pb11", "pb13", "v6c", "fuse2"};
+  enum { NV = 6, NR = 3 };
   static R res[NV][NR];
   run("/v/base", big, nc); // warm-up, discarded
   for (int r = 0; r < NR; r++)

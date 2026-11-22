@@ -224,6 +224,7 @@ INL int64_t ts_cal(const char *p, unsigned ss, uint64_t bad) {
 }
 
 // ingest_ts is always valid F1 (rules.md), so it needs no checks: "YYYY-MM-DDTHH:MM:SSZ" -> epoch seconds.
+#if !defined(__AVX2__)
 INL int64_t ingest_s(const char *p) {
   uint64_t q0 = ts_pairs(ld8(p) ^ 0x2D30302D30303030ULL), q1 = ts_pairs(ld8(p + 8) ^ 0x30303A3030543030ULL);
   unsigned y = LANE(q0, 0) * 100 + LANE(q0, 2), mo = LANE(q0, 5);
@@ -237,6 +238,7 @@ INL int64_t ingest_s(const char *p) {
   } else days = days_from_civil(y, mo, da);
   return days * 86400 + hh * 3600 + mi * 60 + ss;
 }
+#endif
 
 // Lemire: 8 ASCII digits (first digit in the low byte) -> value. Zero bytes count as '0'.
 INL uint64_t ts_parse8(uint64_t w) {
@@ -249,8 +251,8 @@ INL uint64_t ts_chunk(const char *p, uint32_t rem) {
   return rem >= 8 ? ld8(p + rem - 8) : ld8(p) << (8 * (8 - rem));
 }
 
-// Reads only p[0..n-1].
-static int64_t parse_ts(const char *p, uint32_t n) {
+// Every form, exact. Reads only p[0..n-1].
+static int64_t parse_ts_any(const char *p, uint32_t n) {
   if (n == 20) {
     // ":SSZ"
     uint32_t t;
@@ -299,6 +301,109 @@ static int64_t parse_ts(const char *p, uint32_t n) {
   if (m > 16) v += ts_parse8(ts_chunk(p, n - 16)) * 10000000000000000ULL;
   return (int64_t)v;
 }
+
+#if defined(__AVX2__)
+// Per form k (0: 13-digit F3, 1: F1, 2: F2), with the 32 bytes at p as x = p - t8 and the bytes at p + 1 as y = p + 1 - '0':
+// lane i is good when x[i] <= l8[i]; u16 pairs u = maddubs(x, wa) + maddubs(y, wb) are good when u - lo <= rg;
+// madd(u, m) gives F3 as 4+4+4+1 digit groups, or F1/F2 as year, month, day * 24 + hour, minute * 60, second, offset minutes.
+typedef struct { uint8_t t8[32], l8[32]; int8_t wa[32], wb[32]; uint16_t lo[16], rg[16]; int16_t m[16]; } TsForm;
+static TsForm ts_form[3] __attribute__((aligned(32)));
+// Form by length: 0 F3 13 digits, 1 F1, 2 F2, 3 any other length.
+static const uint8_t ts_kind[26] = {3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 0, 3, 3, 3, 3, 3, 3, 1, 3, 3, 3, 3, 2};
+__attribute__((constructor)) static void ts_form_init(void) {
+  static const char *pat[3] = {"DDDDDDDDDDDDD", "DDDD-DD-DDTDD:DD:DDZ", "DDDD-DD-DDTDD:DD:DD+DD:DD"};
+  for (int k = 0; k < 3; k++) {
+    TsForm *f = &ts_form[k];
+    memset(f->l8, 0xFF, 32);
+    for (int i = 0; pat[k][i]; i++) {
+      char c = pat[k][i];
+      f->t8[i] = c == 'D' ? '0' : (uint8_t)c;
+      f->l8[i] = c == 'D' ? 9 : c == '+' ? 2 : 0; // '+' covers '+', ',' and '-'
+    }
+    for (int i = 0; i < 16; i++) f->rg[i] = 0xFFFF;
+    if (k == 0) {
+      for (int i = 0; i < 12; i += 2) { f->wa[i] = 10; f->wa[i + 1] = 1; }
+      f->wa[12] = 1;
+      for (int i = 0; i < 6; i += 2) { f->m[i] = 100; f->m[i + 1] = 1; }
+      f->m[6] = 1;
+      continue;
+    }
+    // u16 lanes from x: 0, 1 year halves, 4 day, 7 minute, 10 offset hour; from y: 2 month, 5 hour, 8 second, 11 offset minute.
+    static const int fa[5] = {0, 1, 4, 7, 10}, fb[4] = {2, 5, 8, 11};
+    for (int j = 0; j < 5; j++) { f->wa[2 * fa[j]] = 10; f->wa[2 * fa[j] + 1] = 1; }
+    for (int j = 0; j < 4; j++) { f->wb[2 * fb[j]] = 10; f->wb[2 * fb[j] + 1] = 1; }
+    f->lo[2] = 1; f->rg[2] = 11;
+    f->lo[4] = 1; f->rg[4] = 30;
+    f->rg[5] = 23; f->rg[7] = 59; f->rg[8] = 59;
+    f->m[0] = 100; f->m[1] = 1; f->m[2] = 1; f->m[4] = 24; f->m[5] = 1; f->m[7] = 60; f->m[8] = 1;
+    if (k == 2) { f->rg[10] = 23; f->rg[11] = 59; f->m[10] = 60; f->m[11] = 1; }
+  }
+}
+
+// Branch-free for the three common lengths (the form mix makes a length branch unpredictable); the rest go to
+// parse_ts_any. Reads p[0..32].
+INL int64_t parse_ts(const char *p, uint32_t n) {
+  // Selects below use masks: gcc turns ternaries on k into branches.
+  unsigned k = n < 26 ? ts_kind[n] : 3;
+  if (UNLIKELY(k == 3)) return parse_ts_any(p, n);
+  const TsForm *f = &ts_form[k];
+  __m256i x = _mm256_sub_epi8(_mm256_loadu_si256((const __m256i *)p), _mm256_load_si256((const __m256i *)f->t8));
+  __m256i y = _mm256_sub_epi8(_mm256_loadu_si256((const __m256i *)(p + 1)), _mm256_set1_epi8('0'));
+  __m256i l8 = _mm256_load_si256((const __m256i *)f->l8);
+  __m256i u = _mm256_add_epi16(_mm256_maddubs_epi16(x, _mm256_load_si256((const __m256i *)f->wa)),
+                               _mm256_maddubs_epi16(y, _mm256_load_si256((const __m256i *)f->wb)));
+  __m256i rg = _mm256_load_si256((const __m256i *)f->rg);
+  __m256i ur = _mm256_sub_epi16(u, _mm256_load_si256((const __m256i *)f->lo));
+  __m256i good = _mm256_and_si256(_mm256_cmpeq_epi8(_mm256_max_epu8(x, l8), l8), _mm256_cmpeq_epi16(_mm256_max_epu16(ur, rg), rg));
+  unsigned bad = (unsigned)_mm256_movemask_epi8(good) != 0xFFFFFFFFu;
+  bad |= (k == 2) & (p[19] == ',');
+  __m256i g = _mm256_madd_epi16(u, _mm256_load_si256((const __m256i *)f->m));
+  __m128i g0 = _mm256_castsi256_si128(g);
+  uint64_t a = (uint64_t)_mm_cvtsi128_si64(g0), b = (uint64_t)_mm_extract_epi64(g0, 1);
+  uint64_t c = (uint64_t)_mm_cvtsi128_si64(_mm256_extracti128_si256(g, 1));
+  unsigned g1 = (uint32_t)a, g2 = (uint32_t)(a >> 32), g3 = (uint32_t)b, g4 = (uint32_t)(b >> 32);
+  int64_t f3 = (int64_t)g1 * 1000000000 + (int64_t)g2 * 100000 + (int64_t)g3 * 10 + g4;
+  // F3 takes year 1900, so only an F1/F2 year can go out of the table.
+  unsigned cm = -(unsigned)(k != 0);
+  unsigned yi = (g1 - TS_Y0) & cm;
+  unsigned out = yi >= TS_NY;
+  if (UNLIKELY(out & !bad)) return parse_ts_any(p, n);
+  yi &= out - 1;
+  unsigned mo = g2 & 15, da = (unsigned)_mm256_extract_epi16(u, 4);
+  unsigned leap = (unsigned)(ts_ystart[yi + 1] - ts_ystart[yi]) - 365;
+  bad |= cm & (da > ts_mdays[leap][mo]);
+  int64_t hours = (int64_t)(ts_ystart[yi] + ts_moff[leap][mo] - 1) * 24 + g3;
+  // Offset sign at p[19]: '+' (bit 2 clear) is subtracted, '-' added; F1 has offset 0.
+  int64_t off = (int64_t)(uint32_t)(c >> 32) * 60 * (1 - ((p[19] >> 1) & 2));
+  int64_t cal = (hours * 3600 + g4 + (uint32_t)c - off) * 1000;
+  int64_t km = (int32_t)cm, bm = -(int64_t)bad;
+  int64_t r = (cal & km) | (f3 & ~km);
+  return (r & ~bm) | (BADTS & bm);
+}
+
+// parse_ts's F1 lanes without its checks. Reads p[0..32].
+INL int64_t ingest_s(const char *p) {
+  const TsForm *f = &ts_form[1];
+  __m256i z = _mm256_set1_epi8('0');
+  __m256i x = _mm256_sub_epi8(_mm256_loadu_si256((const __m256i *)p), z);
+  __m256i y = _mm256_sub_epi8(_mm256_loadu_si256((const __m256i *)(p + 1)), z);
+  __m256i u = _mm256_add_epi16(_mm256_maddubs_epi16(x, _mm256_load_si256((const __m256i *)f->wa)),
+                               _mm256_maddubs_epi16(y, _mm256_load_si256((const __m256i *)f->wb)));
+  __m256i g = _mm256_madd_epi16(u, _mm256_load_si256((const __m256i *)f->m));
+  __m128i g0 = _mm256_castsi256_si128(g);
+  uint64_t a = (uint64_t)_mm_cvtsi128_si64(g0), b = (uint64_t)_mm_extract_epi64(g0, 1);
+  unsigned ss = (unsigned)_mm_cvtsi128_si32(_mm256_extracti128_si256(g, 1));
+  unsigned yr = (uint32_t)a, mo = (uint32_t)(a >> 32), yi = yr - TS_Y0;
+  int64_t days;
+  if (LIKELY(yi < TS_NY)) {
+    unsigned leap = (unsigned)(ts_ystart[yi + 1] - ts_ystart[yi]) - 365;
+    days = ts_ystart[yi] + ts_moff[leap][mo];
+  } else days = days_from_civil(yr, mo, 1);
+  return ((days - 1) * 24 + (uint32_t)b) * 3600 + (b >> 32) + ss;
+}
+#else
+#define parse_ts parse_ts_any
+#endif
 
 // price: digits only, 1..10,000,000; returns 0 if bad
 INL uint32_t parse_price(const char *p, uint32_t n) {
@@ -427,54 +532,27 @@ static uint32_t PB, QB; static uint32_t NPART, NQART; // eid partitions 2^PB, pe
 // build table: key hash, string ref, union-find parent, best (name) slot
 static _Atomic uint32_t *lpar; static _Atomic uint32_t *lbest;
 static uint64_t lcap, lmask_b;
-// Link ID table, open addressing on the ID hash: val is the ID's string ref.
+// lookup table: id hash -> person key
+// Link ID table, open addressing on the ID hash: val is the ID's string ref while links load, its person key after.
 typedef struct { _Atomic uint64_t key; uint64_t val; } LEnt;
 static LEnt *ltab; static uint64_t *lname; // lname[root slot] = name ref
 static int have_links;
-// Person lookup, built once links are named: ID hash -> root slot. Keys alone in lk, so a probe reads 8 B per ID
-// from a table sized to the IDs (most of it stays in L3); lroot[i] is read only on a hit.
-// Hashes are odd (hstr sets bit 0), so the home slot drops bit 0.
-static _Atomic uint64_t *lk; static uint32_t *lroot; static uint64_t lkmask;
-INL uint64_t lk_home(uint64_t uh) { return (uh >> 1) & lkmask; }
 
 #define LINKED (1ull << 63)
 INL uint32_t qpart(uint64_t pkey) { return (uint32_t)((pkey >> 40) & (NQART - 1)); }
-INL uint64_t mix64(uint64_t x) { x ^= x >> 33; x *= 0xff51afd7ed558ccdull; x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ull; x ^= x >> 33; return x; }
-INL uint64_t root_pkey(uint32_t r) { return LINKED | (mix64(r) & 0x7FFFFFFF00000000ull) | r; }
 
-// Linked-ID filter: a one-hash bloom of 2^LFILT bits, checked when the line is parsed so an ID it rules out
-// skips the table prefetch and probe. 0 = off.
-#ifndef LFILT
-#define LFILT 0
-#endif
-#if LFILT
-static _Atomic uint64_t *lfilt;
-INL uint64_t lf_bit(uint64_t uh) { return uh >> (64 - LFILT); }
-#endif
-
-// uh as person_prefetch returned it: bit 0 clear = filtered out as unlinked.
 INL uint64_t person_of(uint64_t uh) {
-  if (have_links && (uh & 1)) {
-    uint64_t i = lk_home(uh);
+  if (have_links) {
+    uint64_t i = uh & lmask_b;
     for (;;) {
-      uint64_t k = atomic_load_explicit(&lk[i], memory_order_relaxed);
-      if (k == uh) return root_pkey(lroot[i]);
+      const LEnt *e = &ltab[i];
+      uint64_t k = atomic_load_explicit(&e->key, memory_order_relaxed);
+      if (k == uh) return e->val;
       if (!k) break;
-      i = (i + 1) & lkmask;
+      i = (i + 1) & lmask_b;
     }
   }
-  return (uh | 1) & ~LINKED;
-}
-INL uint64_t person_prefetch(uint64_t uh) {
-  if (!have_links) return uh;
-#if LFILT
-  uint64_t b = lf_bit(uh);
-  if (!((atomic_load_explicit(&lfilt[b >> 6], memory_order_relaxed) >> (b & 63)) & 1)) return uh & ~1ull;
-#endif
-  uint64_t i = lk_home(uh);
-  __builtin_prefetch(&lk[i]);
-  __builtin_prefetch(&lroot[i]);
-  return uh;
+  return uh & ~LINKED;
 }
 
 // ---------- records ----------
@@ -622,9 +700,7 @@ INL int field(const char *ls, const char *const *sep, int k, const char **fp, ui
 }
 
 // Delay line: person lookups miss cache, so each is resolved RING lines after its prefetch.
-#ifndef RING
 #define RING 32
-#endif
 typedef struct { uint64_t uh, uref, eh; uint32_t ts, x, ingest; } EPend;
 typedef struct { uint64_t uh, cref; uint32_t ts, camp; } CPend;
 typedef struct { EPend e[RING]; CPend c[RING]; uint32_t ne, nc; char pad[56]; } Pend;
@@ -662,9 +738,17 @@ static inline void ev_line(int tid, const char *ls, const char *const *sep, int 
   uint64_t eh = hstr(f[0], fl[0]);
   uint64_t uh = 0;
   if (fl[1]) {
-    uh = person_prefetch(hstr(f[1], fl[1]));
+    uh = hstr(f[1], fl[1]);
+    if (have_links) __builtin_prefetch(&ltab[uh & lmask_b]);
   }
-  int64_t ing = LIKELY(fl[3] == 20) ? ingest_s(f[3]) * 1000 : parse_ts(f[3], fl[3]);
+  int64_t is, ing;
+  if (LIKELY(fl[3] == 20)) {
+    is = ingest_s(f[3]);
+    ing = is * 1000;
+  } else {
+    ing = parse_ts(f[3], fl[3]);
+    is = ing == BADTS ? 0xFFFFFFFFll : ing / 1000;
+  }
   int64_t ts = parse_ts(f[2], fl[2]);
   uint32_t x = 0;
   int ok = fl[1] > 0 && ts != BADTS && ts >= WS && ts < WE && fl[5] > 0;
@@ -681,7 +765,6 @@ static inline void ev_line(int tid, const char *ls, const char *const *sep, int 
     } else ok = 0;
   }
   if (ok && ing != BADTS && ing - ts > 86400000LL) ok = 0;
-  int64_t is = ing == BADTS ? 0xFFFFFFFFll : ing / 1000;
   if (is < 0) is = 0;
   if (is > 0xFFFFFFFFll) is = 0xFFFFFFFFll;
   // A valid event's KRec is written by ev_emit once its payload loc is known; dedup does not depend on KRec order
@@ -705,7 +788,8 @@ static inline void cl_line(int tid, const char *ls, const char *const *sep, int 
   for (int k = 0; k < 4; k++) if (!field(ls, sep, k, &f[k], &fl[k], &nqf, nq)) return;
   if (nqf != nq) return;
   if (fl[0] == 0 || fl[1] == 0) return;
-  uint64_t uh = person_prefetch(hstr(f[1], fl[1]));
+  uint64_t uh = hstr(f[1], fl[1]);
+  if (have_links) __builtin_prefetch(&ltab[uh & lmask_b]);
   int64_t ts = parse_ts(f[3], fl[3]);
   if (ts == BADTS || ts < CWS || ts >= WE) return;
   int32_t c = smap_get(&campmap, f[2], fl[2]);
@@ -736,9 +820,8 @@ typedef struct { Edge *e; size_t n, cap; } EVec;
 static EVec *ledges; // [NT]
 static Chunk *lchunks; static long nlchunks;
 
-INL uint64_t lt_home(uint64_t h) { return (h >> 1) & lmask_b; } // hashes are odd
 INL uint32_t lt_insert(uint64_t h, const char *p, uint32_t n) {
-  uint64_t i = lt_home(h);
+  uint64_t i = h & lmask_b;
   for (;;) {
     uint64_t k = atomic_load_explicit(&ltab[i].key, memory_order_acquire);
     if (k == h) return (uint32_t)i;
@@ -770,7 +853,7 @@ static inline void lk_line(int tid, const char *ls, const char *const *sep, int 
   if (nqf != nq) return;
   if (fl[0] == 0 || fl[1] == 0) return;
   uint64_t ha = hstr(f[0], fl[0]), hb = hstr(f[1], fl[1]);
-  __builtin_prefetch(&ltab[lt_home(ha)], 1); __builtin_prefetch(&ltab[lt_home(hb)], 1);
+  __builtin_prefetch(&ltab[ha & lmask_b], 1); __builtin_prefetch(&ltab[hb & lmask_b], 1);
   LRing *R = &lring[tid];
   LPend *e = &R->e[R->n % LRING];
   if (R->n >= LRING) lk_emit(tid, e);
@@ -814,14 +897,11 @@ static void init_task(int tid, long t, void *ctx) {
   uint64_t lo = (uint64_t)t * LSPAN, hi = lo + LSPAN; if (hi > lcap) hi = lcap;
   for (uint64_t i = lo; i < hi; i++) { atomic_store_explicit(&lpar[i], (uint32_t)i, memory_order_relaxed); atomic_store_explicit(&lbest[i], UINT32_MAX, memory_order_relaxed); }
 }
-static _Atomic uint64_t nl_ids;
 static void best_task(int tid, long t, void *ctx) {
   (void)tid; (void)ctx;
   uint64_t lo = (uint64_t)t * LSPAN, hi = lo + LSPAN; if (hi > lcap) hi = lcap;
-  uint64_t n = 0;
   for (uint64_t i = lo; i < hi; i++) {
     if (!atomic_load_explicit(&ltab[i].key, memory_order_relaxed)) continue;
-    n++;
     uint32_t r = uf_find((uint32_t)i);
     uint64_t me = ltab[i].val;
     uint32_t cur = atomic_load(&lbest[r]);
@@ -833,27 +913,22 @@ static void best_task(int tid, long t, void *ctx) {
       if (atomic_compare_exchange_weak(&lbest[r], &cur, (uint32_t)i)) break;
     }
   }
-  atomic_fetch_add(&nl_ids, n);
 }
-static void lookup_task(int tid, long t, void *ctx) { // lk/lroot: every linked ID -> its root slot; lname[root] = smallest ID's ref
+INL uint64_t mix64(uint64_t x) { x ^= x >> 33; x *= 0xff51afd7ed558ccdull; x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ull; x ^= x >> 33; return x; }
+static void name_task(int tid, long t, void *ctx) { // lname[root] = smallest ID's ref
+  (void)tid; (void)ctx;
+  uint64_t lo = (uint64_t)t * LSPAN, hi = lo + LSPAN; if (hi > lcap) hi = lcap;
+  for (uint64_t i = lo; i < hi; i++)
+    if (atomic_load_explicit(&ltab[i].key, memory_order_relaxed) && atomic_load_explicit(&lpar[i], memory_order_relaxed) == (uint32_t)i)
+      lname[i] = ltab[atomic_load(&lbest[i])].val;
+}
+static void pkey_task(int tid, long t, void *ctx) { // val: string ref -> person key
   (void)tid; (void)ctx;
   uint64_t lo = (uint64_t)t * LSPAN, hi = lo + LSPAN; if (hi > lcap) hi = lcap;
   for (uint64_t i = lo; i < hi; i++) {
-    uint64_t h = atomic_load_explicit(&ltab[i].key, memory_order_relaxed);
-    if (!h) continue;
+    if (!atomic_load_explicit(&ltab[i].key, memory_order_relaxed)) continue;
     uint32_t r = uf_find((uint32_t)i);
-    if (r == i) lname[i] = ltab[atomic_load_explicit(&lbest[i], memory_order_relaxed)].val;
-    uint64_t j = lk_home(h);
-    for (;;) {
-      uint64_t z = 0;
-      if (atomic_compare_exchange_strong_explicit(&lk[j], &z, h, memory_order_relaxed, memory_order_relaxed)) break;
-      j = (j + 1) & lkmask;
-    }
-    lroot[j] = r;
-#if LFILT
-    uint64_t b = lf_bit(h);
-    atomic_fetch_or_explicit(&lfilt[b >> 6], 1ull << (b & 63), memory_order_relaxed);
-#endif
+    ltab[i].val = LINKED | (mix64(r) & 0x7FFFFFFF00000000ull) | r;
   }
 }
 static _Atomic uint64_t nl_count;
@@ -880,7 +955,7 @@ static void load_links(const char *dd) {
   run_par(nlchunks, nl_task, NULL);
   PH(" l.count");
   uint64_t lines = nf + nl_count;
-  uint64_t est = 2 * lines + 1024; // distinct IDs <= 2 * lines, so probing always ends; real data has ~1.35 per line
+  uint64_t est = 2 * lines + lines / 2 + 1024; // distinct IDs <= 2 * lines
   lcap = 1024; while (lcap < est) lcap <<= 1;
   lmask_b = lcap - 1;
   ltab = hcalloc(lcap * sizeof(LEnt));
@@ -897,16 +972,9 @@ static void load_links(const char *dd) {
   run_par(nspan, best_task, NULL);
   PH(" l.best");
   lname = hcalloc(lcap * 8);
-  uint64_t ids = atomic_load(&nl_ids);
-  uint64_t kcap = 1024;
-  while (kcap < ids + ids / 2) kcap <<= 1;
-  lkmask = kcap - 1;
-  lk = hcalloc(kcap * sizeof(uint64_t));
-  lroot = hcalloc(kcap * sizeof(uint32_t));
-#if LFILT
-  lfilt = hcalloc((1ull << LFILT) / 8);
-#endif
-  run_par(nspan, lookup_task, NULL);
+  run_par(nspan, name_task, NULL);
+  PH(" l.name");
+  run_par(nspan, pkey_task, NULL);
   have_links = 1;
 }
 
@@ -1557,8 +1625,8 @@ int main(void) {
   // partition sizing
   uint64_t eest = ebytes / 60 + 1024, cest = cbytes / 45 + 1024;
   // ~30K events per partition: fewer write streams at parse (2^10 at 20M), tables still in L2
-  PB = 6; while (PB < 14 && (eest >> PB) > 30000) PB++;
-  QB = 6; while (QB < 13 && (eest >> QB) > 30000) QB++;
+  PB = 10;
+  QB = 10;
   NPART = 1u << PB; NQART = 1u << QB;
   uint64_t per_t = eest / NT;
   kcap0 = (uint32_t)(per_t / NPART); kcap0 = kcap0 + kcap0 / 4 + 32;
