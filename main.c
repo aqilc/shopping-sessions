@@ -66,22 +66,16 @@ INL uint64_t mum(uint64_t a, uint64_t b) { __uint128_t r = (__uint128_t)a * b; r
 #define HS1 0xe7037ed1a0b428dbull
 #define HS2 0x8ebc6af09c88c6e3ull
 #define HS3 0x589965cc75374cc3ull
-// One odd random multiplier per short length: strings of different lengths never meet in the same (a, b) pair.
-static const uint64_t HSN[17] = {
-  0x6e789e6aa1b965f5ull, 0x06c45d188009454full, 0xf88bb8a8724c81edull,
-  0x1b39896a51a8749bull, 0x53cb9f0c747ea2ebull, 0x2c829abe1f4532e1ull,
-  0xc584133ac916ab3dull, 0x3ee5789041c98ac3ull, 0xf3b8488c368cb0a7ull,
-  0x657eecdd3cb13d09ull, 0xc2d326e0055bdef7ull, 0x8621a03fe0bbdb7bull,
-  0x8e1f7555983aa92full, 0xb54e0f1600cc4d19ull, 0x84bb3f97971d80abull,
-  0x7d29825c75521255ull, 0xc3cf17102b7f7f87ull,
-};
 // Reads up to 7 bytes past p+n: every buffer we hash is padded.
 INL uint64_t hstr(const char *p, uint32_t n) {
   uint64_t a, b;
   if (LIKELY(n <= 16)) {
     if (n >= 8) { a = ld8(p); b = ld8(p + n - 8); }
     else { a = n ? ld8(p) & (~0ull >> (64 - 8 * n)) : 0; b = 0; }
-    return mum(a ^ HS1, b ^ HSN[n]) | 1; // one round: the product's two halves folded together mix every output bit
+    // One round: the product's two halves folded together mix every output bit. The multiplier's key is rotated
+    // by the length, so strings of different lengths meet only if their words differ by that 64-bit pattern.
+    uint64_t k = (HS0 << n) | (HS0 >> (64 - n) % 64);
+    return mum(a ^ HS1, b ^ k) | 1;
   }
   if (LIKELY(n <= 48)) {
     // two lanes over the first 32 bytes (the second slides back when the string is shorter), then the last 16
