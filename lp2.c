@@ -1,12 +1,13 @@
 // Shopping Sessions engine v3: one static binary, no deps.
-// Pipeline: links (parallel union-find) -> parse events+clicks (SIMD tokenizer,
-// person resolved at parse) -> dedup by event-id partition (marks dead payloads)
-// -> sessionize by person partition -> per-thread Parquet.
+// Pipeline: parse events+clicks (SIMD tokenizer, records bucketed by user-id hash) while the links (parallel
+// union-find) load in the same task queue -> dedup by event-id partition (marks dead payloads) -> person pass per
+// user-id partition (L2-local slice of the link table) -> sessionize by person partition -> per-thread Parquet.
 #define _GNU_SOURCE
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -15,7 +16,6 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
 #if defined(__x86_64__)
@@ -474,7 +474,7 @@ INL int32_t smap_get(const SMap *m, const char *p, uint32_t n) {
 // ---------- thread pool ----------
 static int NT = 8;
 typedef void (*task_fn)(int tid, long task, void *ctx);
-typedef struct { task_fn fn, fin; void *ctx; long ntask; const long *order; atomic_long next; } Pool;
+typedef struct { task_fn fn; void *ctx; long ntask; const long *order; atomic_long next; } Pool;
 typedef struct { Pool *p; int tid; } PArg;
 static void *pool_main(void *a) {
   PArg *pa = a;
@@ -484,19 +484,16 @@ static void *pool_main(void *a) {
     if (t >= p->ntask) break;
     p->fn(pa->tid, p->order ? p->order[t] : t, p->ctx);
   }
-  if (p->fin) p->fin(pa->tid, pa->tid, p->ctx);
   return NULL;
 }
-// fin, when set, runs once per thread (task = tid) as soon as that thread finds the queue empty.
-static void run_par_f(long ntask, const long *order, task_fn fn, task_fn fin, void *ctx) {
-  Pool p; p.fn = fn; p.fin = fin; p.ctx = ctx; p.ntask = ntask; p.order = order; atomic_init(&p.next, 0);
+static void run_par_o(long ntask, const long *order, task_fn fn, void *ctx) {
+  Pool p; p.fn = fn; p.ctx = ctx; p.ntask = ntask; p.order = order; atomic_init(&p.next, 0);
   pthread_t th[64]; PArg args[64];
   for (int i = 0; i < NT; i++) { args[i].p = &p; args[i].tid = i; }
   for (int i = 1; i < NT; i++) pthread_create(&th[i], NULL, pool_main, &args[i]);
   pool_main(&args[0]);
   for (int i = 1; i < NT; i++) pthread_join(th[i], NULL);
 }
-static void run_par_o(long ntask, const long *order, task_fn fn, void *ctx) { run_par_f(ntask, order, fn, NULL, ctx); }
 static void run_par(long ntask, task_fn fn, void *ctx) { run_par_o(ntask, NULL, fn, ctx); }
 
 // ---------- per-thread arenas ----------
@@ -555,44 +552,53 @@ static int ncamp; static const char **camp_id; static uint32_t *camp_idn; static
 static uint32_t PB, QB; static uint32_t NPART, NQART; // eid partitions 2^PB, person partitions 2^QB
 
 // ---------- linked IDs ----------
-// build table: key hash, string ref, union-find parent, best (name) slot
+// Per slot, 0-based so the zeroed tables need no init pass: lpar = union-find parent + 1 (0 for a root; the root + 1
+// for every non-root once the best pass has run), lbest = the root's best (name) slot + 1 (0 for none yet).
 static _Atomic uint32_t *lpar; static _Atomic uint32_t *lbest;
-static uint64_t lcap, lmask_b;
-// lookup table: id hash -> person key
-// Link ID table, open addressing on the ID hash: val is the ID's string ref while links load, its person key after.
+static uint64_t lcap, lmask_b; static unsigned LB; // lcap = 2^LB
+// Link ID table, open addressing on the ID key: val is the ID's string ref.
+// An ID's key is its hash without bit 63, and its home slot is the key's top LB bits, so the IDs of one user-id
+// partition (the key's top QB bits) live in one slice of lcap / NQART slots: the person pass of a partition only
+// touches its slice, which fits L2.
 typedef struct { _Atomic uint64_t key; uint64_t val; } LEnt;
 static LEnt *ltab; static uint64_t *lname; // lname[root slot] = name ref
 static int have_links;
 
+// A person key is an unlinked ID's key, or LINKED | its root slot's partition << (63 - QB) | root slot. The person
+// lives in its root's user-id partition, so the root's own records stay where parse put them.
 #define LINKED (1ull << 63)
-INL uint32_t qpart(uint64_t pkey) { return (uint32_t)((pkey >> 40) & (NQART - 1)); }
+INL uint32_t qpart(uint64_t pkey) { return (uint32_t)((pkey & ~LINKED) >> (63 - QB)); }
+INL uint64_t lhome(uint64_t key) { return key >> (63 - LB); }
 
-INL uint64_t person_of(uint64_t uh) {
-  if (have_links) {
-    uint64_t i = uh & lmask_b;
-    for (;;) {
-      const LEnt *e = &ltab[i];
-      uint64_t k = atomic_load_explicit(&e->key, memory_order_relaxed);
-      if (k == uh) return e->val;
-      if (!k) break;
-      i = (i + 1) & lmask_b;
+// key -> person key, once the links are loaded; an ID in no link line is its own person.
+INL uint64_t person_of(uint64_t key) {
+  uint64_t i = lhome(key);
+  for (;;) {
+    uint64_t k = atomic_load_explicit(&ltab[i].key, memory_order_relaxed);
+    if (k == key) {
+      uint32_t p = atomic_load_explicit(&lpar[i], memory_order_relaxed);
+      uint64_t r = p ? p - 1 : i;
+      return LINKED | ((r >> (LB - QB)) << (63 - QB)) | r;
     }
+    if (!k) return key;
+    i = (i + 1) & lmask_b;
   }
-  return uh & ~LINKED;
 }
 
 // ---------- records ----------
 typedef struct { uint64_t h; uint32_t ingest; uint32_t loc; } KRec;     // dedup key, per eid partition
-typedef struct { uint64_t pkey; uint64_t uref; uint32_t ts; uint32_t x; } PRec; // event payload, per person partition
-typedef struct { uint64_t pkey; uint64_t cref; uint32_t ts; uint32_t camp; } CRec; // click, per person partition
+// PRec and CRec: parse buckets them by user-id partition with pkey = the ID's key; the person pass rewrites pkey to
+// the person key, and moves the record to [NT + thread] buckets when the person's partition differs.
+typedef struct { uint64_t pkey; uint64_t uref; uint32_t ts; uint32_t x; } PRec; // event payload
+typedef struct { uint64_t pkey; uint64_t cref; uint32_t ts; uint32_t camp; } CRec; // click, pkey 0 once moved
 // PRec.x: price (24 bits) | cat (5 bits) << 24 | purchase << 29 | dead << 31
 #define X_PURCH (1u << 29)
 #define X_DEAD (1u << 31)
 #define LOC_NONE 0x0FFFFFFFu
 
 static Bkt *kb; // [NT][NPART]
-static Bkt *pb; // [NT][NQART]
-static Bkt *cb; // [NT][NQART]
+static Bkt *pb; // [2 * NT][NQART]
+static Bkt *cb; // [2 * NT][NQART]
 static uint32_t kcap0, pcap0, ccap0;
 
 // x86: records reach their bucket through a staging run per (thread, bucket), so the scattered stores land in a
@@ -725,36 +731,6 @@ INL int field(const char *ls, const char *const *sep, int k, const char **fp, ui
   return 1;
 }
 
-// Delay line: person lookups miss cache, so each is resolved RING lines after its prefetch.
-#define RING 32
-typedef struct { uint64_t uh, uref, eh; uint32_t ts, x, ingest; } EPend;
-typedef struct { uint64_t uh, cref; uint32_t ts, camp; } CPend;
-typedef struct { EPend e[RING]; CPend c[RING]; uint32_t ne, nc; char pad[56]; } Pend;
-static Pend *pend; // [NT]
-INL void ev_emit(int tid, const EPend *p) {
-  uint64_t pk = person_of(p->uh);
-  size_t bi = (size_t)tid * NQART + qpart(pk);
-  PRec r = {pk, p->uref, p->ts, p->x};
-  char *d = rec_put(&arenas[tid], &pb[bi], pst + bi * (ST * sizeof(PRec)), &r, sizeof(PRec), pcap0);
-  KRec k = {p->eh, p->ingest, (uint32_t)((d - arenas[tid].base) >> 3)};
-  size_t ki = (size_t)tid * NPART + (p->eh >> (64 - PB));
-  rec_put(&arenas[tid], &kb[ki], kst + ki * (ST * sizeof(KRec)), &k, sizeof(KRec), kcap0);
-}
-INL void cl_emit(int tid, const CPend *p) {
-  uint64_t pk = person_of(p->uh);
-  size_t bi = (size_t)tid * NQART + qpart(pk);
-  CRec r = {pk, p->cref, p->ts, p->camp};
-  rec_put(&arenas[tid], &cb[bi], cst + bi * (ST * sizeof(CRec)), &r, sizeof(CRec), ccap0);
-}
-static void pend_flush(int tid) {
-  Pend *P = &pend[tid];
-  uint32_t lo = P->ne > RING ? P->ne - RING : 0;
-  for (uint32_t i = lo; i < P->ne; i++) ev_emit(tid, &P->e[i % RING]);
-  lo = P->nc > RING ? P->nc - RING : 0;
-  for (uint32_t i = lo; i < P->nc; i++) cl_emit(tid, &P->c[i % RING]);
-  P->ne = P->nc = 0;
-}
-
 static inline void ev_line(int tid, const char *ls, const char *const *sep, int ns, uint32_t nq) {
   if (ns != 7) return;
   const char *f[7]; uint32_t fl[7]; uint32_t nqf = 0;
@@ -762,11 +738,6 @@ static inline void ev_line(int tid, const char *ls, const char *const *sep, int 
   if (nqf != nq) return;
   if (fl[0] == 0) return;
   uint64_t eh = hstr(f[0], fl[0]);
-  uint64_t uh = 0;
-  if (fl[1]) {
-    uh = hstr(f[1], fl[1]);
-    if (have_links) __builtin_prefetch(&ltab[uh & lmask_b]);
-  }
   int64_t is, ing;
   if (LIKELY(fl[3] == 20)) {
     is = ingest_s(f[3]);
@@ -793,19 +764,17 @@ static inline void ev_line(int tid, const char *ls, const char *const *sep, int 
   if (ok && ing != BADTS && ing - ts > 86400000LL) ok = 0;
   if (is < 0) is = 0;
   if (is > 0xFFFFFFFFll) is = 0xFFFFFFFFll;
-  // A valid event's KRec is written by ev_emit once its payload loc is known; dedup does not depend on KRec order
-  // (it keeps the smallest ingest, and copies with equal ingest_ts are identical).
-  if (!ok) {
-    size_t ki = (size_t)tid * NPART + (eh >> (64 - PB));
-    KRec k = {eh, (uint32_t)is, LOC_NONE};
-    rec_put(&arenas[tid], &kb[ki], kst + ki * (ST * sizeof(KRec)), &k, sizeof(KRec), kcap0);
-    return;
+  uint32_t loc = LOC_NONE;
+  if (ok) {
+    uint64_t uk = hstr(f[1], fl[1]) & ~LINKED;
+    size_t bi = (size_t)tid * NQART + qpart(uk);
+    PRec r = {uk, mkref(f[1], fl[1]), (uint32_t)(ts - CWS), x};
+    char *d = rec_put(&arenas[tid], &pb[bi], pst + bi * (ST * sizeof(PRec)), &r, sizeof(PRec), pcap0);
+    loc = (uint32_t)((d - arenas[tid].base) >> 3);
   }
-  Pend *P = &pend[tid];
-  EPend *e = &P->e[P->ne % RING];
-  if (P->ne >= RING) ev_emit(tid, e);
-  e->uh = uh; e->uref = mkref(f[1], fl[1]); e->eh = eh; e->ts = (uint32_t)(ts - CWS); e->x = x; e->ingest = (uint32_t)is;
-  P->ne++;
+  size_t ki = (size_t)tid * NPART + (eh >> (64 - PB));
+  KRec k = {eh, (uint32_t)is, loc};
+  rec_put(&arenas[tid], &kb[ki], kst + ki * (ST * sizeof(KRec)), &k, sizeof(KRec), kcap0);
 }
 
 static inline void cl_line(int tid, const char *ls, const char *const *sep, int ns, uint32_t nq) {
@@ -814,17 +783,14 @@ static inline void cl_line(int tid, const char *ls, const char *const *sep, int 
   for (int k = 0; k < 4; k++) if (!field(ls, sep, k, &f[k], &fl[k], &nqf, nq)) return;
   if (nqf != nq) return;
   if (fl[0] == 0 || fl[1] == 0) return;
-  uint64_t uh = hstr(f[1], fl[1]);
-  if (have_links) __builtin_prefetch(&ltab[uh & lmask_b]);
   int64_t ts = parse_ts(f[3], fl[3]);
   if (ts == BADTS || ts < CWS || ts >= WE) return;
   int32_t c = smap_get(&campmap, f[2], fl[2]);
   if (c < 0) return;
-  Pend *P = &pend[tid];
-  CPend *e = &P->c[P->nc % RING];
-  if (P->nc >= RING) cl_emit(tid, e);
-  e->uh = uh; e->cref = mkref(f[0], fl[0]); e->ts = (uint32_t)(ts - CWS); e->camp = (uint32_t)c;
-  P->nc++;
+  uint64_t uk = hstr(f[1], fl[1]) & ~LINKED;
+  size_t bi = (size_t)tid * NQART + qpart(uk);
+  CRec r = {uk, mkref(f[0], fl[0]), (uint32_t)(ts - CWS), (uint32_t)c};
+  rec_put(&arenas[tid], &cb[bi], cst + bi * (ST * sizeof(CRec)), &r, sizeof(CRec), ccap0);
 }
 
 #define EVL(ls, sep, ns, nq) ev_line(tid, ls, sep, ns, nq)
@@ -834,7 +800,6 @@ static void parse_task(int tid, long t, void *ctx) {
   const Chunk *c = &chunks[t];
   if (c->kind == 0) { TOKENIZE(c, EVL); }
   else { TOKENIZE(c, CLL); }
-  pend_flush(tid);
 #if defined(__AVX2__)
   _mm_sfence(); // streamed runs are visible once the tasks are joined
 #endif
@@ -847,7 +812,7 @@ static EVec *ledges; // [NT]
 static Chunk *lchunks; static long nlchunks;
 
 INL uint32_t lt_insert(uint64_t h, const char *p, uint32_t n) {
-  uint64_t i = h & lmask_b;
+  uint64_t i = lhome(h);
   for (;;) {
     uint64_t k = atomic_load_explicit(&ltab[i].key, memory_order_acquire);
     if (k == h) return (uint32_t)i;
@@ -859,7 +824,7 @@ INL uint32_t lt_insert(uint64_t h, const char *p, uint32_t n) {
     i = (i + 1) & lmask_b;
   }
 }
-// Link lines go through a delay line too: prefetch both slots, insert LRING lines later.
+// Link lines go through a delay line: prefetch both slots, insert LRING lines later.
 #define LRING 16
 typedef struct { uint64_t ha, hb; const char *pa, *pb; uint32_t na, nb; } LPend;
 typedef struct { LPend e[LRING]; uint32_t n; char pad[60]; } LRing;
@@ -878,8 +843,8 @@ static inline void lk_line(int tid, const char *ls, const char *const *sep, int 
   for (int k = 0; k < 2; k++) if (!field(ls, sep, k, &f[k], &fl[k], &nqf, nq)) return;
   if (nqf != nq) return;
   if (fl[0] == 0 || fl[1] == 0) return;
-  uint64_t ha = hstr(f[0], fl[0]), hb = hstr(f[1], fl[1]);
-  __builtin_prefetch(&ltab[ha & lmask_b], 1); __builtin_prefetch(&ltab[hb & lmask_b], 1);
+  uint64_t ha = hstr(f[0], fl[0]) & ~LINKED, hb = hstr(f[1], fl[1]) & ~LINKED;
+  __builtin_prefetch(&ltab[lhome(ha)], 1); __builtin_prefetch(&ltab[lhome(hb)], 1);
   LRing *R = &lring[tid];
   LPend *e = &R->e[R->n % LRING];
   if (R->n >= LRING) lk_emit(tid, e);
@@ -896,11 +861,12 @@ static void link_parse_task(int tid, long t, void *ctx) { (void)ctx; const Chunk
 
 INL uint32_t uf_find(uint32_t x) {
   for (;;) {
-    uint32_t p = atomic_load_explicit(&lpar[x], memory_order_relaxed);
-    if (p == x) return x;
-    uint32_t g = atomic_load_explicit(&lpar[p], memory_order_relaxed);
-    if (g != p) atomic_compare_exchange_weak_explicit(&lpar[x], &p, g, memory_order_relaxed, memory_order_relaxed);
-    x = g;
+    uint32_t p1 = atomic_load_explicit(&lpar[x], memory_order_relaxed);
+    if (!p1) return x;
+    uint32_t g1 = atomic_load_explicit(&lpar[p1 - 1], memory_order_relaxed);
+    if (!g1) return p1 - 1;
+    atomic_compare_exchange_weak_explicit(&lpar[x], &p1, g1, memory_order_relaxed, memory_order_relaxed);
+    x = g1 - 1;
   }
 }
 static void uf_task(int tid, long t, void *ctx) {
@@ -912,50 +878,37 @@ static void uf_task(int tid, long t, void *ctx) {
       a = uf_find(a); b = uf_find(b);
       if (a == b) break;
       if (a < b) { uint32_t s = a; a = b; b = s; } // link larger root under smaller
-      uint32_t exp = a;
-      if (atomic_compare_exchange_strong(&lpar[a], &exp, b)) break;
+      uint32_t exp = 0;
+      if (atomic_compare_exchange_strong(&lpar[a], &exp, b + 1)) break;
     }
   }
 }
 #define LSPAN 65536
-static void init_task(int tid, long t, void *ctx) {
-  (void)tid; (void)ctx;
-  uint64_t lo = (uint64_t)t * LSPAN, hi = lo + LSPAN; if (hi > lcap) hi = lcap;
-  for (uint64_t i = lo; i < hi; i++) { atomic_store_explicit(&lpar[i], (uint32_t)i, memory_order_relaxed); atomic_store_explicit(&lbest[i], UINT32_MAX, memory_order_relaxed); }
-}
+// Also points every non-root straight at its root: no union runs any more, so no compression can undo it.
 static void best_task(int tid, long t, void *ctx) {
   (void)tid; (void)ctx;
   uint64_t lo = (uint64_t)t * LSPAN, hi = lo + LSPAN; if (hi > lcap) hi = lcap;
   for (uint64_t i = lo; i < hi; i++) {
     if (!atomic_load_explicit(&ltab[i].key, memory_order_relaxed)) continue;
     uint32_t r = uf_find((uint32_t)i);
+    if (r != i) atomic_store_explicit(&lpar[i], r + 1, memory_order_relaxed);
     uint64_t me = ltab[i].val;
     uint32_t cur = atomic_load(&lbest[r]);
     for (;;) {
-      if (cur != UINT32_MAX) {
-        uint64_t o = ltab[cur].val;
+      if (cur) {
+        uint64_t o = ltab[cur - 1].val;
         if (str_cmp(refp(me), refn(me), refp(o), refn(o)) >= 0) break;
       }
-      if (atomic_compare_exchange_weak(&lbest[r], &cur, (uint32_t)i)) break;
+      if (atomic_compare_exchange_weak(&lbest[r], &cur, (uint32_t)i + 1)) break;
     }
   }
 }
-INL uint64_t mix64(uint64_t x) { x ^= x >> 33; x *= 0xff51afd7ed558ccdull; x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ull; x ^= x >> 33; return x; }
 static void name_task(int tid, long t, void *ctx) { // lname[root] = smallest ID's ref
   (void)tid; (void)ctx;
   uint64_t lo = (uint64_t)t * LSPAN, hi = lo + LSPAN; if (hi > lcap) hi = lcap;
   for (uint64_t i = lo; i < hi; i++)
-    if (atomic_load_explicit(&ltab[i].key, memory_order_relaxed) && atomic_load_explicit(&lpar[i], memory_order_relaxed) == (uint32_t)i)
-      lname[i] = ltab[atomic_load(&lbest[i])].val;
-}
-static void pkey_task(int tid, long t, void *ctx) { // val: string ref -> person key
-  (void)tid; (void)ctx;
-  uint64_t lo = (uint64_t)t * LSPAN, hi = lo + LSPAN; if (hi > lcap) hi = lcap;
-  for (uint64_t i = lo; i < hi; i++) {
-    if (!atomic_load_explicit(&ltab[i].key, memory_order_relaxed)) continue;
-    uint32_t r = uf_find((uint32_t)i);
-    ltab[i].val = LINKED | (mix64(r) & 0x7FFFFFFF00000000ull) | r;
-  }
+    if (atomic_load_explicit(&ltab[i].key, memory_order_relaxed) && !atomic_load_explicit(&lpar[i], memory_order_relaxed))
+      lname[i] = ltab[atomic_load(&lbest[i]) - 1].val;
 }
 static _Atomic uint64_t nl_count;
 static void nl_task(int tid, long t, void *ctx) {
@@ -965,43 +918,79 @@ static void nl_task(int tid, long t, void *ctx) {
   atomic_fetch_add(&nl_count, n);
 }
 
-static void load_links(const char *dd) {
+// The link steps run inside the parse pool: a thread takes a task of the open step when one is left, else a parse
+// chunk, so the gaps between steps fill with parsing. The thread finishing a step's last task runs its serial tail
+// (step_end) and opens the next step. Parse no longer needs the persons, so nothing waits on the links but the
+// person pass after dedup.
+enum { LS_COUNT, LS_PARSE, LS_UF, LS_BEST, LS_NAME, NLS };
+static const task_fn ls_fn[NLS] = {nl_task, link_parse_task, uf_task, best_task, name_task};
+static long ls_n[NLS];
+static atomic_long ls_grab[NLS], ls_done[NLS];
+static atomic_int ls_open = NLS; // the step whose tasks are handed out; NLS when the links are loaded or absent
+
+static void links_open(const char *dd) {
   char dir[4096]; snprintf(dir, sizeof dir, "%s/links", dd);
   char **paths; int nf = list_csv(dir, &paths);
   size_t bytes = 0;
   MFile *fs = xmalloc(sizeof(MFile) * (nf ? nf : 1));
   for (int i = 0; i < nf; i++) { fs[i] = map_file(paths[i]); bytes += fs[i].n; }
   if (bytes == 0) return;
-  // chunks
   Chunk *save = chunks; long sn = nchunks, sc = chcap;
   chunks = NULL; nchunks = 0; chcap = 0;
   for (int i = 0; i < nf; i++) add_chunks(fs[i], 2, 1 << 18);
   lchunks = chunks; nlchunks = nchunks;
   chunks = save; nchunks = sn; chcap = sc;
-  run_par(nlchunks, nl_task, NULL);
-  PH(" l.count");
-  uint64_t lines = nf + nl_count;
+  ledges = xcalloc(NT, sizeof(EVec));
+  lring = xcalloc(NT, sizeof(LRing));
+  nl_count = (uint64_t)nf;
+  ls_n[LS_COUNT] = nlchunks;
+  have_links = 1;
+  atomic_store(&ls_open, LS_COUNT);
+}
+
+static void step_end(int s) {
+  if (s != LS_COUNT) return;
+  uint64_t lines = nl_count;
   uint64_t est = 2 * lines + lines / 2 + 1024; // distinct IDs <= 2 * lines
-  lcap = 1024; while (lcap < est) lcap <<= 1;
+  // at least 64 slots per user-id partition, so a slice is never shorter than a probe run
+  LB = QB + 6;
+  while ((1ull << LB) < est) LB++;
+  lcap = 1ull << LB;
   lmask_b = lcap - 1;
   ltab = hcalloc(lcap * sizeof(LEnt));
   lpar = hcalloc(lcap * 4); lbest = hcalloc(lcap * 4);
-  ledges = xcalloc(NT, sizeof(EVec));
-  lring = xcalloc(NT, sizeof(LRing));
-  long nspan = (long)((lcap + LSPAN - 1) / LSPAN);
-  run_par(nspan, init_task, NULL);
-  PH(" l.init");
-  run_par(nlchunks, link_parse_task, NULL);
-  PH(" l.parse");
-  run_par(NT, uf_task, NULL);
-  PH(" l.uf");
-  run_par(nspan, best_task, NULL);
-  PH(" l.best");
   lname = hcalloc(lcap * 8);
-  run_par(nspan, name_task, NULL);
-  PH(" l.name");
-  run_par(nspan, pkey_task, NULL);
-  have_links = 1;
+  long nspan = (long)((lcap + LSPAN - 1) / LSPAN);
+  ls_n[LS_BEST] = ls_n[LS_NAME] = nspan;
+  ls_n[LS_PARSE] = nlchunks;
+  ls_n[LS_UF] = NT;
+}
+
+static atomic_long parse_next;
+static void fused_task(int tid, long t, void *ctx) {
+  (void)t; (void)ctx;
+  for (;;) {
+    int s = atomic_load_explicit(&ls_open, memory_order_acquire);
+    if (s < NLS) {
+      long k = atomic_fetch_add_explicit(&ls_grab[s], 1, memory_order_relaxed);
+      if (k < ls_n[s]) {
+        ls_fn[s](tid, k, NULL);
+        if (atomic_fetch_add_explicit(&ls_done[s], 1, memory_order_acq_rel) + 1 == ls_n[s]) {
+          step_end(s);
+          atomic_store_explicit(&ls_open, s + 1, memory_order_release);
+          if (s + 1 == NLS) PH(" l.done");
+        }
+        continue;
+      }
+    }
+    long c = atomic_fetch_add_explicit(&parse_next, 1, memory_order_relaxed);
+    if (c < nchunks) {
+      parse_task(tid, c, NULL);
+      continue;
+    }
+    if (s == NLS) break;
+    sched_yield(); // the open step's last tasks are running elsewhere
+  }
 }
 
 // ---------- dedup ----------
@@ -1054,56 +1043,50 @@ static void dedup_task(int tid, long q, void *ctx) {
   SP_ADD(tid, SP_DPROBE, t0);
 }
 
-// ---------- sessionize ----------
-typedef struct { uint8_t *b; size_t n, cap; } Buf;
-static inline void bres(Buf *b, size_t add) {
-  if (b->n + add > b->cap) { size_t c = b->cap ? b->cap : 4096; while (c < b->n + add) c *= 2; b->b = xrealloc(b->b, c); b->cap = c; }
-}
-static inline void bput(Buf *b, const void *p, size_t n) { bres(b, n); memcpy(b->b + b->n, p, n); b->n += n; }
-static inline void bbyte(Buf *b, uint8_t x) { bres(b, 1); b->b[b->n++] = x; }
-static inline void bvar(Buf *b, uint64_t v) { bres(b, 10); while (v >= 0x80) { b->b[b->n++] = (uint8_t)(v | 0x80); v >>= 7; } b->b[b->n++] = (uint8_t)v; }
-static inline void bu32(Buf *b, uint32_t v) { bput(b, &v, 4); }
-static inline void bi64(Buf *b, int64_t v) { bput(b, &v, 8); }
-static inline uint64_t zz(int64_t v) { return ((uint64_t)v << 1) ^ (uint64_t)(v >> 63); }
-
-// LSB-first bit-packed values, as a Parquet bit-packed run stores them
-typedef struct { Buf b; uint64_t acc; uint32_t nb, n; } Bits;
-INL void bits_put(Bits *w, uint32_t v, uint32_t bw) {
-  w->acc |= (uint64_t)v << w->nb;
-  w->nb += bw;
-  w->n++;
-  if (w->nb >= 32) {
-    bres(&w->b, 4);
-    memcpy(w->b.b + w->b.n, &w->acc, 4);
-    w->b.n += 4;
-    w->acc >>= 32;
-    w->nb -= 32;
+// ---------- person pass ----------
+// Per user-id partition, after dedup: each live record's ID key becomes its person key, read from the partition's
+// slice of the link table. A record whose person lives in another partition is copied to this thread's mover bucket
+// there, and its original is marked dead (events) or keyed 0 (clicks, which match no person then).
+static void person_task(int tid, long q, void *ctx) {
+  (void)ctx;
+  for (int t = 0; t < NT; t++) {
+    for (Blk *k = pb[(size_t)t * NQART + q].head; k; k = k->next) {
+      PRec *r = (PRec *)(k + 1);
+      for (uint32_t j = 0; j < k->n; j++) {
+        if (r[j].x & X_DEAD) continue;
+        uint64_t pk = person_of(r[j].pkey);
+        uint32_t d = qpart(pk);
+        if (d == q) { r[j].pkey = pk; continue; }
+        PRec m = r[j];
+        m.pkey = pk;
+        size_t si = (size_t)tid * NQART + d;
+        rec_put(&arenas[tid], &pb[(size_t)NT * NQART + si], pst + si * (ST * sizeof(PRec)), &m, sizeof(PRec), pcap0 / 2 + 32);
+        r[j].x |= X_DEAD;
+      }
+    }
+    for (Blk *k = cb[(size_t)t * NQART + q].head; k; k = k->next) {
+      CRec *r = (CRec *)(k + 1);
+      for (uint32_t j = 0; j < k->n; j++) {
+        uint64_t pk = person_of(r[j].pkey);
+        uint32_t d = qpart(pk);
+        if (d == q) { r[j].pkey = pk; continue; }
+        CRec m = r[j];
+        m.pkey = pk;
+        size_t si = (size_t)tid * NQART + d;
+        rec_put(&arenas[tid], &cb[(size_t)NT * NQART + si], cst + si * (ST * sizeof(CRec)), &m, sizeof(CRec), ccap0 / 2 + 32);
+        r[j].pkey = 0;
+      }
+    }
   }
-}
-// Flushes the partial word and pads to whole groups of 8 values, the unit of a bit-packed run.
-static void bits_end(Bits *w, uint32_t bw) {
-  size_t want = (size_t)(w->n + 7) / 8 * bw;
-  bres(&w->b, want - w->b.n + 8);
-  memcpy(w->b.b + w->b.n, &w->acc, 8);
-  memset(w->b.b + w->b.n + (w->nb + 7) / 8, 0, 8);
-  w->b.n = want;
-  w->acc = 0;
-  w->nb = 0;
+#if defined(__AVX2__)
+  _mm_sfence();
+#endif
 }
 
-// user_daily rows, emitted by each sess thread as it walks: user_id, day, sessions and top_category are dictionary
-// encoded (a person's rows are adjacent, so user_id is one RLE run per person over a dictionary of names), events and
-// revenue_cents PLAIN.
-typedef struct {
-  Buf names, uidx, ev, rev; // dictionary of person names, RLE runs of its index, events, revenue_cents
-  Bits day, ses, tdef, top; // day index, sessions, top_category definition bits, top_category index
-  uint32_t np;
-  char pad[60];
-} UCol;
-static UCol *ucol; // [NT]
-static uint32_t DBW, CBW; // bit widths of the day and category indexes
-// Sessions starting on one day are over 30 minutes apart, so a day holds at most 48: 6 bits.
-#define SBW 6
+// ---------- sessionize ----------
+typedef struct { uint64_t name; int32_t day; uint32_t sessions, events; int32_t top; int64_t revenue; } URow;
+typedef struct { URow *a; size_t n, cap; } UVec;
+static UVec *urows; // [NT]
 // Per thread and (campaign, day), randomly hit per session and per click, so kept small for L2: a count of
 // sessions or (session, campaign) pairs on one day is at most that day's sessions, so 32 bits hold it.
 typedef struct { uint32_t sessions, purch; int64_t revenue; } CAgg;
@@ -1157,19 +1140,16 @@ static uint64_t *sort_u64(uint64_t *a, uint64_t *tmp, uint32_t n) {
   for (uint32_t i = 0; i < n; i++) hist_add(c, (uint32_t)(a[i] >> 32));
   return radix3(a, tmp, n, c);
 }
-static void emit_row(UCol *U, uint32_t di, uint32_t sessions, uint32_t events, int64_t revenue, int64_t *catsum, uint32_t touched) {
+static void flush_row(UVec *ur, URow *row, int64_t *catsum, uint32_t touched) {
   int best = -1; int64_t bv = 0;
   for (; touched; touched &= touched - 1) { // ascending category index, so a tie keeps the smallest
     int z = __builtin_ctz(touched);
     if (catsum[z] > bv) { bv = catsum[z]; best = z; }
     catsum[z] = 0;
   }
-  bits_put(&U->day, di, DBW);
-  bits_put(&U->ses, sessions, SBW);
-  bu32(&U->ev, events);
-  bi64(&U->rev, revenue);
-  bits_put(&U->tdef, best >= 0, 1);
-  if (best >= 0) bits_put(&U->top, (uint32_t)best, CBW);
+  row->top = best;
+  if (ur->n == ur->cap) { ur->cap = ur->cap ? ur->cap * 2 : 65536; ur->a = xrealloc(ur->a, ur->cap * sizeof(URow)); }
+  ur->a[ur->n++] = *row;
 }
 
 // person table slot: person index + 1, 0 = empty
@@ -1183,7 +1163,7 @@ static void sess_task(int tid, long q, void *ctx) {
   (void)ctx;
   Arena *S = &scratch[tid]; S->cur = S->base;
   size_t ne = 0, nc = 0;
-  for (int t = 0; t < NT; t++) {
+  for (int t = 0; t < 2 * NT; t++) {
     for (Blk *k = pb[(size_t)t * NQART + q].head; k; k = k->next) ne += k->n;
     for (Blk *k = cb[(size_t)t * NQART + q].head; k; k = k->next) nc += k->n;
   }
@@ -1205,7 +1185,7 @@ static void sess_task(int tid, long q, void *ctx) {
   Hist *eh = aalloc(S, sizeof(Hist));
   if (big) memset(eh, 0, sizeof(Hist));
   size_t k = 0;
-  for (int t = 0; t < NT; t++) {
+  for (int t = 0; t < 2 * NT; t++) {
     for (Blk *bk = pb[(size_t)t * NQART + q].head; bk; bk = bk->next) {
       PRec *r = (PRec *)(bk + 1);
       for (uint32_t j = 0; j < bk->n; j++) {
@@ -1259,7 +1239,7 @@ static void sess_task(int tid, long q, void *ctx) {
   if (cbig) memset(ch, 0, sizeof(Hist));
   if (cmid) memset(ch4, 0, sizeof(Hist4));
   k = 0;
-  for (int t = 0; t < NT; t++) {
+  for (int t = 0; t < 2 * NT; t++) {
     for (Blk *bk = cb[(size_t)t * NQART + q].head; bk; bk = bk->next) {
       CRec *r = (CRec *)(bk + 1);
       for (uint32_t j = 0; j < bk->n; j++) {
@@ -1285,7 +1265,7 @@ static void sess_task(int tid, long q, void *ctx) {
   for (size_t i = 0; i < nlive; i++) cl[pos[cpid[(uint32_t)csorted[i]]]++] = csorted[i];
   SP_ADD(tid, SP_CLICKS, t0);
   uint64_t tassist = 0;
-  UCol *U = &ucol[tid];
+  UVec *ur = &urows[tid];
   CAgg *ca = &cagg[(size_t)tid * (ncamp + 1) * NDAYS];
   uint32_t *cas = &cassist[(size_t)tid * (ncamp + 1) * NDAYS];
   uint32_t *st = stamp[tid];
@@ -1301,14 +1281,7 @@ static void sess_task(int tid, long q, void *ctx) {
     uint32_t m = coff[p + 1] - coff[p];
     uint32_t hi = 0, ns = 0;
     int64_t curday = INT64_MIN;
-    uint32_t rdi = 0, rses = 0, revs = 0;
-    int64_t rrev = 0;
-    uint32_t rows0 = U->day.n;
-    uint32_t nn = refn(names[p]);
-    bres(&U->names, 4 + nn);
-    memcpy(U->names.b + U->names.n, &nn, 4);
-    memcpy(U->names.b + U->names.n + 4, refp(names[p]), nn);
-    U->names.n += 4 + nn;
+    URow row; memset(&row, 0, sizeof row);
     uint32_t touched = 0;
     uint32_t i = 0;
     while (i < n) {
@@ -1317,13 +1290,10 @@ static void sess_task(int tid, long q, void *ctx) {
       int64_t rev = 0; uint32_t cnt = 0; int purch = 0;
       int64_t day = (CWS + (int64_t)s0) / 86400000LL;
       if (day != curday) {
-        if (curday != INT64_MIN) emit_row(U, rdi, rses, revs, rrev, catsum, touched);
+        if (curday != INT64_MIN) flush_row(ur, &row, catsum, touched);
         touched = 0;
         curday = day;
-        rdi = (uint32_t)(day - DAY0);
-        rses = 0;
-        revs = 0;
-        rrev = 0;
+        row.name = names[p]; row.day = (int32_t)day; row.sessions = 0; row.events = 0; row.revenue = 0;
       }
       while (i < n) {
         uint32_t t = (uint32_t)(e[i] >> 32);
@@ -1338,9 +1308,7 @@ static void sess_task(int tid, long q, void *ctx) {
         }
         i++;
       }
-      rses++;
-      revs += cnt;
-      rrev += rev;
+      row.sessions++; row.events += cnt; row.revenue += rev;
       while (hi < m && (uint32_t)(c[hi] >> 32) <= s0) hi++;
       int di = (int)(day - DAY0);
       sst[ns] = s0;
@@ -1359,9 +1327,7 @@ static void sess_task(int tid, long q, void *ctx) {
       CAgg *a = &ca[(size_t)credited * NDAYS + di];
       a->sessions++; a->purch += purch; a->revenue += rev;
     }
-    emit_row(U, rdi, rses, revs, rrev, catsum, touched);
-    bvar(&U->uidx, (uint64_t)(U->day.n - rows0) << 1);
-    bu32(&U->uidx, U->np++);
+    if (curday != INT64_MIN) flush_row(ur, &row, catsum, touched);
     if (!m) continue;
     uint64_t ta = PROF ? ticks() : 0;
     // assists: a click at t assists the sessions starting in [t, t + 7 days]; per campaign only the
@@ -1392,6 +1358,16 @@ static void sess_task(int tid, long q, void *ctx) {
 }
 
 // ---------- parquet writer ----------
+typedef struct { uint8_t *b; size_t n, cap; } Buf;
+static inline void bres(Buf *b, size_t add) {
+  if (b->n + add > b->cap) { size_t c = b->cap ? b->cap : 4096; while (c < b->n + add) c *= 2; b->b = xrealloc(b->b, c); b->cap = c; }
+}
+static inline void bput(Buf *b, const void *p, size_t n) { bres(b, n); memcpy(b->b + b->n, p, n); b->n += n; }
+static inline void bbyte(Buf *b, uint8_t x) { bres(b, 1); b->b[b->n++] = x; }
+static inline void bvar(Buf *b, uint64_t v) { bres(b, 10); while (v >= 0x80) { b->b[b->n++] = (uint8_t)(v | 0x80); v >>= 7; } b->b[b->n++] = (uint8_t)v; }
+static inline void bu32(Buf *b, uint32_t v) { bput(b, &v, 4); }
+static inline void bi64(Buf *b, int64_t v) { bput(b, &v, 8); }
+static inline uint64_t zz(int64_t v) { return ((uint64_t)v << 1) ^ (uint64_t)(v >> 63); }
 
 typedef struct { Buf *b; int16_t last[32]; int d; } TW;
 static void tw_fh(TW *w, int id, int type) {
@@ -1412,39 +1388,25 @@ static void tw_eend(TW *w) { bbyte(w->b, 0); w->d--; }
 enum { PT_INT32 = 1, PT_INT64 = 2, PT_BYTES = 6 };
 enum { LT_NONE = 0, LT_STRING = 1, LT_DATE = 6 };
 typedef struct { const char *name; int type; int logical; int optional; } ColDef;
-// off: the data page; start: the chunk, at the dictionary page when dict
-typedef struct { Buf data; int64_t nvals; int64_t off, start; int64_t size; int dict; } ColOut;
+typedef struct { Buf data; int64_t nvals; int64_t off; int64_t size; } ColOut;
 
 // Appends the header of a data page with body bytes (levels + values) holding nvals values.
-static void page_hdr(Buf *file, size_t body, int64_t nvals, int enc) {
+static void page_hdr(Buf *file, size_t body, int64_t nvals) {
   TW w = {file, {0}, 0};
   tw_i32(&w, 1, 0);
   tw_i32(&w, 2, (int32_t)body);
   tw_i32(&w, 3, (int32_t)body);
   tw_sbeg(&w, 5);
   tw_i32(&w, 1, (int32_t)nvals);
-  tw_i32(&w, 2, enc);
+  tw_i32(&w, 2, 0);
   tw_i32(&w, 3, 3);
   tw_i32(&w, 4, 3);
   tw_send(&w);
   bbyte(file, 0);
 }
-// Appends the header of a PLAIN dictionary page of nvals values in body bytes.
-static void dict_hdr(Buf *file, size_t body, int64_t nvals) {
-  TW w = {file, {0}, 0};
-  tw_i32(&w, 1, 2);
-  tw_i32(&w, 2, (int32_t)body);
-  tw_i32(&w, 3, (int32_t)body);
-  tw_sbeg(&w, 7);
-  tw_i32(&w, 1, (int32_t)nvals);
-  tw_i32(&w, 2, 0);
-  tw_send(&w);
-  bbyte(file, 0);
-}
 static void write_page(Buf *file, ColOut *co, int64_t nvals) {
   co->off = (int64_t)file->n;
-  co->start = co->off;
-  page_hdr(file, co->data.n, nvals, 0);
+  page_hdr(file, co->data.n, nvals);
   bput(file, co->data.b, co->data.n);
   co->size = (int64_t)(file->n) - co->off;
   co->nvals = nvals;
@@ -1474,18 +1436,16 @@ static void write_footer(Buf *file, const ColDef *cols, int nc, ColOut *co, int6
     int64_t total = 0;
     for (int i = 0; i < nc; i++) {
       tw_ebeg(&w);
-      tw_i64(&w, 2, co[i].start);
+      tw_i64(&w, 2, co[i].off);
       tw_sbeg(&w, 3);
       tw_i32(&w, 1, cols[i].type);
-      tw_lbeg(&w, 2, 5, co[i].dict ? 3 : 2); bvar(&meta, zz(0)); bvar(&meta, zz(3));
-      if (co[i].dict) bvar(&meta, zz(8));
+      tw_lbeg(&w, 2, 5, 2); bvar(&meta, zz(0)); bvar(&meta, zz(3));
       tw_lbeg(&w, 3, 8, 1); bvar(&meta, strlen(cols[i].name)); bput(&meta, cols[i].name, strlen(cols[i].name));
       tw_i32(&w, 4, 0);
       tw_i64(&w, 5, co[i].nvals);
       tw_i64(&w, 6, co[i].size);
       tw_i64(&w, 7, co[i].size);
       tw_i64(&w, 9, co[i].off);
-      if (co[i].dict) tw_i64(&w, 11, co[i].start);
       tw_send(&w);
       tw_eend(&w);
       total += co[i].size;
@@ -1504,6 +1464,18 @@ static void write_footer(Buf *file, const ColDef *cols, int nc, ColOut *co, int6
   free(meta.b);
 }
 
+static void write_file(const char *path, Buf *file) {
+  int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (fd < 0) die(path);
+  size_t off = 0;
+  while (off < file->n) {
+    ssize_t w = write(fd, file->b + off, file->n - off);
+    if (w < 0) { if (errno == EINTR) continue; die("write"); }
+    off += (size_t)w;
+  }
+  close(fd);
+}
+
 static const ColDef UCOLS[6] = {
   {"user_id", PT_BYTES, LT_STRING, 0}, {"day", PT_INT32, LT_DATE, 0}, {"sessions", PT_INT32, 0, 0},
   {"events", PT_INT32, 0, 0}, {"revenue_cents", PT_INT64, 0, 0}, {"top_category", PT_BYTES, LT_STRING, 1}};
@@ -1514,126 +1486,75 @@ static const ColDef CCOLS[7] = {
 
 static char *OUTDIR;
 
-// The file goes out in one writev: page headers and footer gathered in one buffer, page bodies straight from the
-// thread's column buffers.
-typedef struct { Buf h; struct iovec v[64]; size_t hoff[64]; int nv; size_t pos, mark; } FileW;
-static void fw_hdr(FileW *f) { // the header bytes since the last call
-  f->hoff[f->nv] = f->mark;
-  f->v[f->nv].iov_base = NULL;
-  f->v[f->nv].iov_len = f->h.n - f->mark;
-  f->nv++;
-  f->pos += f->h.n - f->mark;
-  f->mark = f->h.n;
-}
-static void fw_ext(FileW *f, const void *p, size_t n) {
-  f->v[f->nv].iov_base = (void *)p;
-  f->v[f->nv].iov_len = n;
-  f->nv++;
-  f->pos += n;
-}
-static size_t vlen(uint64_t v) { size_t n = 1; while (v >= 0x80) { v >>= 7; n++; } return n; }
-
-// A dictionary column chunk: the dictionary page (nd values in dict), then one data page of n values whose body is
-// pre (header bytes, already sized into body) followed by the bit-packed indexes in idx.
-static void fw_dict(FileW *f, ColOut *co, const Buf *dict, int64_t nd, size_t n) {
-  co->dict = 1;
-  co->start = (int64_t)f->pos;
-  dict_hdr(&f->h, dict->n, nd);
-  fw_hdr(f);
-  fw_ext(f, dict->b, dict->n);
-  co->off = (int64_t)f->pos;
-  co->nvals = (int64_t)n;
-}
-// Data page of a required dictionary column whose indexes are one bit-packed run.
-static void fw_packed(FileW *f, ColOut *co, const Buf *dict, int64_t nd, const Bits *idx, uint32_t bw) {
-  size_t n = idx->n;
-  fw_dict(f, co, dict, nd, n);
-  uint64_t run = ((uint64_t)(n + 7) / 8) << 1 | 1;
-  page_hdr(&f->h, 1 + vlen(run) + idx->b.n, (int64_t)n, 8);
-  bbyte(&f->h, (uint8_t)bw);
-  bvar(&f->h, run);
-  fw_hdr(f);
-  fw_ext(f, idx->b.b, idx->b.n);
-  co->size = (int64_t)f->pos - co->start;
-}
-
-static void write_file(const char *path, FileW *f) {
-  for (int i = 0; i < f->nv; i++) if (!f->v[i].iov_base) f->v[i].iov_base = f->h.b + f->hoff[i];
-  int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-  if (fd < 0) die(path);
-  struct iovec *v = f->v;
-  int nv = f->nv;
-  while (nv) {
-    ssize_t w = writev(fd, v, nv);
-    if (w < 0) { if (errno == EINTR) continue; die("write"); }
-    while (nv && (size_t)w >= v->iov_len) { w -= (ssize_t)v->iov_len; v++; nv--; }
-    if (nv) { v->iov_base = (char *)v->iov_base + w; v->iov_len -= (size_t)w; }
-  }
-  close(fd);
-}
-
+// Lays the file out in the thread's scratch arena: sizes first, then page headers at their final offsets, then one
+// pass over the rows fills every column in place, and the file goes out in one write.
 static void write_user_task(int tid, long t, void *ctx) {
-  (void)tid; (void)ctx;
-  UCol *U = &ucol[t];
-  size_t n = U->day.n;
-  if (!n && t != 0) return;
-  bits_end(&U->day, DBW);
-  bits_end(&U->ses, SBW);
-  bits_end(&U->tdef, 1);
-  bits_end(&U->top, CBW);
-  Buf dday = {0}, dses = {0}, dtop = {0};
-  for (int32_t d = 0; d < NDAYS; d++) bu32(&dday, (uint32_t)(DAY0 + d));
-  for (uint32_t v = 0; v < 1u << SBW; v++) bu32(&dses, v);
-  for (int c = 0; c < ncat; c++) { bu32(&dtop, catn[c]); bput(&dtop, catp[c], catn[c]); }
-  FileW f;
-  memset(&f, 0, sizeof f);
-  ColOut co[6];
-  memset(co, 0, sizeof co);
-  bput(&f.h, "PAR1", 4);
-  fw_hdr(&f);
-  if (n) {
-    fw_dict(&f, &co[0], &U->names, U->np, n);
-    page_hdr(&f.h, 1 + U->uidx.n, (int64_t)n, 8);
-    bbyte(&f.h, 32);
-    fw_hdr(&f);
-    fw_ext(&f, U->uidx.b, U->uidx.n);
-    co[0].size = (int64_t)f.pos - co[0].start;
-    fw_packed(&f, &co[1], &dday, NDAYS, &U->day, DBW);
-    fw_packed(&f, &co[2], &dses, 1u << SBW, &U->ses, SBW);
-    co[3].start = co[3].off = (int64_t)f.pos;
-    page_hdr(&f.h, U->ev.n, (int64_t)n, 0);
-    fw_hdr(&f);
-    fw_ext(&f, U->ev.b, U->ev.n);
-    co[3].size = (int64_t)f.pos - co[3].start;
-    co[3].nvals = (int64_t)n;
-    co[4].start = co[4].off = (int64_t)f.pos;
-    page_hdr(&f.h, U->rev.n, (int64_t)n, 0);
-    fw_hdr(&f);
-    fw_ext(&f, U->rev.b, U->rev.n);
-    co[4].size = (int64_t)f.pos - co[4].start;
-    co[4].nvals = (int64_t)n;
-    // top_category: definition levels as one bit-packed run (4-byte length first), then the non-null indexes
-    fw_dict(&f, &co[5], &dtop, ncat, n);
-    uint64_t lrun = ((uint64_t)(n + 7) / 8) << 1 | 1;
-    uint64_t vrun = ((uint64_t)(U->top.n + 7) / 8) << 1 | 1;
-    size_t lev = vlen(lrun) + U->tdef.b.n;
-    size_t vals = 1 + (U->top.n ? vlen(vrun) + U->top.b.n : 0);
-    page_hdr(&f.h, 4 + lev + vals, (int64_t)n, 8);
-    bu32(&f.h, (uint32_t)lev);
-    bvar(&f.h, lrun);
-    fw_hdr(&f);
-    fw_ext(&f, U->tdef.b.b, U->tdef.b.n);
-    bbyte(&f.h, (uint8_t)CBW);
-    if (U->top.n) bvar(&f.h, vrun);
-    fw_hdr(&f);
-    fw_ext(&f, U->top.b.b, U->top.b.n);
-    co[5].size = (int64_t)f.pos - co[5].start;
+  (void)ctx;
+  UVec *v = &urows[t];
+  if (!v->n && t != 0) return;
+  size_t n = v->n;
+  size_t body[6] = {0, n * 4, n * 4, n * 4, n * 8, 0};
+  for (size_t i = 0; i < n; i++) {
+    body[0] += refn(v->a[i].name) + 4;
+    if (v->a[i].top >= 0) body[5] += catn[v->a[i].top] + 4;
   }
-  write_footer(&f.h, UCOLS, 6, co, (int64_t)n);
-  fw_hdr(&f);
+  // top_category definition levels: RLE/bit-packed hybrid, one bit-packed run of (n + 7) / 8 groups
+  size_t groups = (n + 7) / 8;
+  Buf lv = {0};
+  bvar(&lv, (groups << 1) | 1);
+  size_t lhead = lv.n;
+  free(lv.b);
+  size_t levn = 4 + lhead + groups;
+  body[5] += levn;
+  size_t cap = 4096; // the footer; bres must never grow this buffer, it is not malloc'd
+  for (int c = 0; c < 6; c++) cap += body[c] + 64;
+  Arena *S = &scratch[tid]; S->cur = S->base;
+  Buf file = {aalloc(S, cap), 0, cap};
+  bput(&file, "PAR1", 4);
+  ColOut co[6]; memset(co, 0, sizeof co);
+  uint8_t *col[6];
+  for (int c = 0; n && c < 6; c++) {
+    co[c].off = (int64_t)file.n;
+    page_hdr(&file, body[c], (int64_t)n);
+    col[c] = file.b + file.n;
+    file.n += body[c];
+    co[c].size = (int64_t)file.n - co[c].off;
+    co[c].nvals = (int64_t)n;
+  }
+  if (n) {
+    uint8_t *lev = col[5];
+    uint32_t enc = (uint32_t)(lhead + groups);
+    memcpy(lev, &enc, 4);
+    uint8_t *p = lev + 4;
+    uint64_t g = (groups << 1) | 1;
+    while (g >= 0x80) { *p++ = (uint8_t)(g | 0x80); g >>= 7; }
+    *p++ = (uint8_t)g;
+    uint8_t *bits = p;
+    memset(bits, 0, groups);
+    col[5] += levn;
+    for (size_t i = 0; i < n; i++) {
+      URow *r = &v->a[i];
+      uint32_t nn = refn(r->name);
+      memcpy(col[0], &nn, 4);
+      memcpy(col[0] + 4, refp(r->name), nn);
+      col[0] += 4 + nn;
+      memcpy(col[1] + 4 * i, &r->day, 4);
+      memcpy(col[2] + 4 * i, &r->sessions, 4);
+      memcpy(col[3] + 4 * i, &r->events, 4);
+      memcpy(col[4] + 8 * i, &r->revenue, 8);
+      if (r->top >= 0) {
+        uint32_t cn = catn[r->top];
+        memcpy(col[5], &cn, 4);
+        memcpy(col[5] + 4, catp[r->top], cn);
+        col[5] += 4 + cn;
+        bits[i / 8] |= (uint8_t)(1u << (i % 8));
+      }
+    }
+  }
+  write_footer(&file, UCOLS, 6, co, (int64_t)n);
   char path[4096];
   snprintf(path, sizeof path, "%s/user_daily/part-%03ld.parquet", OUTDIR, t);
-  write_file(path, &f);
+  write_file(path, &file);
 }
 
 static void write_campaign(void) {
@@ -1671,10 +1592,7 @@ static void write_campaign(void) {
   write_footer(&file, CCOLS, 7, co, n);
   char path[4096];
   snprintf(path, sizeof path, "%s/campaign_daily/part-000.parquet", OUTDIR);
-  FileW f;
-  memset(&f, 0, sizeof f);
-  fw_ext(&f, file.b, file.n);
-  write_file(path, &f);
+  write_file(path, &file);
 }
 
 // ---------- setup ----------
@@ -1783,19 +1701,21 @@ static int cmp_q(const void *a, const void *b) {
   return x > y ? -1 : (x < y ? 1 : 0);
 }
 
+// Thread t's buckets: its parse buckets, or with ctx set, its person pass movers (stage runs are per thread).
 static void close_task(int tid, long t, void *ctx) {
-  (void)tid; (void)ctx;
-  for (uint32_t i = 0; i < NPART; i++) {
+  (void)tid;
+  size_t b0 = ctx ? (size_t)NT * NQART : 0;
+  for (uint32_t i = 0; !ctx && i < NPART; i++) {
     size_t bi = (size_t)t * NPART + i;
     if (STAGE) stage_flush(&kb[bi], kst + bi * (ST * sizeof(KRec)), sizeof(KRec));
     bkt_close(&kb[bi], sizeof(KRec));
   }
   for (uint32_t i = 0; i < NQART; i++) {
-    size_t bi = (size_t)t * NQART + i;
-    if (STAGE) stage_flush(&pb[bi], pst + bi * (ST * sizeof(PRec)), sizeof(PRec));
-    if (STAGE) stage_flush(&cb[bi], cst + bi * (ST * sizeof(CRec)), sizeof(CRec));
-    bkt_close(&pb[bi], sizeof(PRec));
-    bkt_close(&cb[bi], sizeof(CRec));
+    size_t si = (size_t)t * NQART + i;
+    if (STAGE) stage_flush(&pb[b0 + si], pst + si * (ST * sizeof(PRec)), sizeof(PRec));
+    if (STAGE) stage_flush(&cb[b0 + si], cst + si * (ST * sizeof(CRec)), sizeof(CRec));
+    bkt_close(&pb[b0 + si], sizeof(PRec));
+    bkt_close(&cb[b0 + si], sizeof(CRec));
   }
 }
 
@@ -1804,17 +1724,12 @@ static void close_task(int tid, long t, void *ctx) {
 #ifndef RELEASE
 #define RELEASE 1
 #endif
-// The big arenas go first so no thread picks one up after the files run out. Input goes a whole file per task (at a
-// file's first chunk): threads zapping neighboring chunks would share page-table pages and their locks.
 static void release_task(int tid, long t, void *ctx) {
   (void)tid; (void)ctx;
-  if (t < NT) {
-    madvise(arenas[t].base, (size_t)(arenas[t].cur - arenas[t].base), MADV_DONTNEED);
-    madvise(scratch[t].base, 1ull << 30, MADV_DONTNEED);
-    return;
-  }
-  const Chunk *c = &chunks[t - NT];
-  if (c->start == 0) madvise((void *)c->base, c->fsize, MADV_DONTNEED);
+  if (t < nchunks) { const Chunk *c = &chunks[t]; madvise((void *)(c->base + c->start), c->end - c->start, MADV_DONTNEED); return; }
+  t -= nchunks;
+  madvise(arenas[t].base, (size_t)(arenas[t].cur - arenas[t].base), MADV_DONTNEED);
+  madvise(scratch[t].base, 1ull << 30, MADV_DONTNEED);
 }
 
 int main(void) {
@@ -1836,7 +1751,7 @@ int main(void) {
   load_products(dd);
   load_campaigns(dd);
   PH("small");
-  load_links(dd);
+  links_open(dd);
   PH("links");
 
   char dir[4096];
@@ -1863,23 +1778,25 @@ int main(void) {
   ccap0 = (uint32_t)(cest / NT / NQART); ccap0 = ccap0 / 2 + 32;
   arenas = xcalloc(NT, sizeof(Arena)); scratch = xcalloc(NT, sizeof(Arena));
   for (int t = 0; t < NT; t++) { arena_init(&arenas[t], ARENA_SZ); arena_init(&scratch[t], 1ull << 30); }
-  pend = xcalloc(NT, sizeof(Pend));
   kb = xcalloc((size_t)NT * NPART, sizeof(Bkt));
-  pb = xcalloc((size_t)NT * NQART, sizeof(Bkt));
-  cb = xcalloc((size_t)NT * NQART, sizeof(Bkt));
+  pb = xcalloc((size_t)2 * NT * NQART, sizeof(Bkt));
+  cb = xcalloc((size_t)2 * NT * NQART, sizeof(Bkt));
   if (STAGE) pst = hcalloc((size_t)NT * NQART * ST * sizeof(PRec));
   if (STAGE) kst = hcalloc((size_t)NT * NPART * ST * sizeof(KRec));
   if (STAGE) cst = hcalloc((size_t)NT * NQART * ST * sizeof(CRec));
   PH("map");
-  run_par(nchunks, parse_task, NULL);
+  run_par(NT, fused_task, NULL);
   run_par(NT, close_task, NULL);
   PH("parse");
   double pt0 = now_s(); uint64_t pk0 = ticks();
   run_par(NPART, dedup_task, NULL);
+  if (have_links) {
+    PH(" d.kill");
+    run_par(NQART, person_task, NULL);
+    run_par(NT, close_task, &have_links);
+  }
   PH("dedup");
-  ucol = xcalloc(NT, sizeof(UCol));
-  DBW = 1; while ((1u << DBW) < (uint32_t)NDAYS) DBW++;
-  CBW = 1; while ((1u << CBW) < (uint32_t)ncat) CBW++;
+  urows = xcalloc(NT, sizeof(UVec));
   cagg = xcalloc((size_t)NT * (ncamp + 1) * NDAYS, sizeof(CAgg));
   cassist = xcalloc((size_t)NT * (ncamp + 1) * NDAYS, sizeof(uint32_t));
   stamp = xmalloc(sizeof(uint32_t *) * NT);
@@ -1887,20 +1804,21 @@ int main(void) {
   for (int t = 0; t < NT; t++) stamp[t] = xcalloc(ncamp + 1, sizeof(uint32_t));
   // largest person partitions first
   qsize = xcalloc(NQART, 8);
-  for (int t = 0; t < NT; t++) for (uint32_t q = 0; q < NQART; q++) for (Blk *k = pb[(size_t)t * NQART + q].head; k; k = k->next) qsize[q] += k->n;
+  for (int t = 0; t < 2 * NT; t++) for (uint32_t q = 0; q < NQART; q++) for (Blk *k = pb[(size_t)t * NQART + q].head; k; k = k->next) qsize[q] += k->n;
   long *order = xmalloc(sizeof(long) * NQART);
   for (uint32_t q = 0; q < NQART; q++) order[q] = q;
   qsort(order, NQART, sizeof(long), cmp_q);
   PH(" s.setup");
-  snprintf(dir, sizeof dir, "%s/user_daily", od); if (mkdir(dir, 0777) && errno != EEXIST) die(dir);
-  snprintf(dir, sizeof dir, "%s/campaign_daily", od); if (mkdir(dir, 0777) && errno != EEXIST) die(dir);
-  // each thread writes its user_daily file the moment the queue runs dry, while the others finish their partitions
-  run_par_f(NQART, order, sess_task, write_user_task, NULL);
+  run_par_o(NQART, order, sess_task, NULL);
   PH("sess");
   {
     static const char *const sn[] = {" d.zero", " d.probe", " s.gather", " s.sort", " s.clicks", " s.walk", " s.assist"};
     sp_print(SP_DZERO, SP_N, sn, PROF ? (now_s() - pt0) * 1e3 / (double)(ticks() - pk0) : 0);
   }
+  snprintf(dir, sizeof dir, "%s/user_daily", od); if (mkdir(dir, 0777) && errno != EEXIST) die(dir);
+  snprintf(dir, sizeof dir, "%s/campaign_daily", od); if (mkdir(dir, 0777) && errno != EEXIST) die(dir);
+  run_par(NT, write_user_task, NULL);
+  PH(" w.user");
   write_campaign();
   PH("write");
   if (RELEASE) run_par(nchunks + NT, release_task, NULL);
