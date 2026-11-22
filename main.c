@@ -1015,7 +1015,8 @@ static void sess_task(int tid, long q, void *ctx) {
   if (!ne) return;
   uint64_t t0 = PROF ? ticks() : 0;
   // one pass over the records: per person counts, (ts << 32 | slot) and (person << 32 | x) per slot
-  uint32_t pcap = 256; while (pcap < ne) pcap <<= 1;
+  // sized for ~8 events per person (the mean is ~30), so the table stays in L1; it doubles past half full
+  uint32_t pcap = 256; while (pcap < ne / 4) pcap <<= 1;
   uint32_t *tab = aalloc(S, (size_t)pcap * 4); memset(tab, 0, (size_t)pcap * 4);
   uint32_t pmask = pcap - 1, np = 0;
   uint64_t *pkeys = aalloc(S, ne * 8);
