@@ -28,7 +28,7 @@ static void cat(const char *p, const char *grep, int maxl) {
   fclose(f);
 }
 
-static int RUNI;
+static int RUNI, XCAP;
 // Per run: wall from fork to reap, phase deltas between the main stamps only (sub-timer lines are skipped,
 // so a phase's time is never hidden behind its own sub-stamps), start (fork -> main's T0), exit (last stamp -> reap),
 // user/sys cpu, max rss, minor faults.
@@ -51,6 +51,7 @@ static R run(const char *bin, const char *data, const char *ncpu) {
   r.rss = ru.ru_maxrss / 1024.0; r.flt = ru.ru_minflt / 1000.0;
   FILE *f = fopen(lf, "r"); char l[256], nm[64]; double v, prev = 0, last = 0;
   while (f && fgets(l, sizeof l, f)) {
+    if (XCAP && !strncmp(l, "X:", 2)) { const char *b = strrchr(bin, '/'); SUMF("%s %.200s", b ? b + 1 : bin, l); if (!strchr(l, '\n')) SUMF("\n"); continue; }
     if (l[0] == ' ') continue; // sub-timer
     if (sscanf(l, "%63s %lf ms", nm, &v) != 2) continue;
     if (!strcmp(nm, "t0abs")) { r.st = v - t * 1e3; continue; }
@@ -137,12 +138,12 @@ int main(void) {
   rep(dd, big, "events", K, 2); rep(dd, big, "clicks", K, 2); rep(dd, big, "links", K, 2);
   cp(dd, big, "products.csv"); cp(dd, big, "campaigns.csv"); cp(dd, big, "manifest.json");
   SUMF("replica x%d %.0f ms\n", K, (now() - t) * 1e3);
-  static const char *V[] = {"base", "lpa", "lpb"};
-  enum { NV = 3, NR = 6 };
+  static const char *V[] = {"base", "rd", "nl", "mm", "wb", "pw"};
+  enum { NV = 6, NR = 4 };
   static R res[NV][NR];
   run("/v/base", big, nc); // warm-up, discarded
   for (int r = 0; r < NR; r++)
-    for (int v = 0; v < NV; v++) { char b[64]; snprintf(b, sizeof b, "/v/%s", V[v]); res[v][r] = run(b, big, nc); }
+    for (int v = 0; v < NV; v++) { char b[64]; snprintf(b, sizeof b, "/v/%s", V[v]); XCAP = r == 0; res[v][r] = run(b, big, nc); XCAP = 0; }
   for (int v = 0; v < NV; v++) {
     R *x = res[v]; double w[NR], q[NR], mn = 1e9;
     for (int r = 0; r < NR; r++) { w[r] = x[r].w; if (w[r] < mn) mn = w[r]; }
