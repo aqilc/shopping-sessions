@@ -1132,12 +1132,7 @@ static Chunk *lchunks; static long nlchunks;
 // into its own table region (L2-sized, no atomics) and writes the dense ids into the edges.
 typedef struct { uint64_t h, ref, pre; uint32_t tid, pos; } LRec; // pos: edge index * 2 + side
 #define LBLK 256
-// A cache-line header: at 8 KB + 64 the blocks sit at different page offsets, so the write heads of a thread's
-// buckets do not share cache sets (blocks of exactly 8 KB were slower on x86).
-typedef struct LBlk { struct LBlk *next; uint32_t n; char pad[52]; LRec r[LBLK]; } LBlk;
-#define LCH 254 // blocks a thread takes from the pool at a time, ~2 MB: each thread faults in its own pages
-typedef struct { uint64_t cur, end; char pad[48]; } LTake;
-static LTake *ltake; // [NT]
+typedef struct LBlk { struct LBlk *next; uint32_t n; char pad[52]; LRec r[LBLK]; } LBlk; // a cache-line header
 typedef struct { LBlk *head; uint32_t n; } LBkt;
 static LBkt *lbkt; // [NT][LP]
 static uint32_t LPB, LP;
@@ -1147,13 +1142,9 @@ INL void lrec_put(int tid, uint64_t h, const char *p, uint32_t n, uint32_t pos) 
   LBkt *b = &lbkt[(size_t)tid * LP + (LPB ? h >> (64 - LPB) : 0)];
   LBlk *k = b->head;
   if (UNLIKELY(!k || k->n == LBLK)) {
-    LTake *tk = &ltake[tid];
-    if (UNLIKELY(tk->cur == tk->end)) {
-      tk->cur = atomic_fetch_add_explicit(&lpool_n, LCH, memory_order_relaxed);
-      tk->end = tk->cur + LCH;
-      if (UNLIKELY(tk->end > lpool_cap)) die("links: block pool full");
-    }
-    k = &lpool[tk->cur++];
+    uint64_t q = atomic_fetch_add_explicit(&lpool_n, 1, memory_order_relaxed);
+    if (UNLIKELY(q >= lpool_cap)) die("links: block pool full");
+    k = &lpool[q];
     k->next = b->head; k->n = 0;
     b->head = k;
   }
@@ -1243,8 +1234,8 @@ static void pkey_task(int tid, long t, void *ctx) { // lval: id -> root id
   (void)tid; (void)ctx;
   uint64_t lo = (uint64_t)t * LSPAN, hi = lo + LSPAN; if (hi > lcap) hi = lcap;
   for (uint64_t i = lo; i < hi; i++) {
-    uint32_t d = lval[i]; // dense ids start at 1: 0 is an empty slot
-    if (d) lval[i] = uf_find(d);
+    if (!lkey[i]) continue;
+    lval[i] = uf_find(lval[i]);
   }
 }
 static void load_links(const char *dd) {
@@ -1263,9 +1254,8 @@ static void load_links(const char *dd) {
   LPB = 0; while (LPB < 20 && (bytes >> (17 + LPB))) LPB++;
   LP = 1u << LPB;
   lbkt = xcalloc((size_t)NT * LP, sizeof(LBkt));
-  // a line is >= 4 bytes ("a,b\n") with two IDs, plus a part-full block per bucket and a part-used take per thread
-  lpool_cap = bytes / 2 / LBLK + 1 + (uint64_t)NT * LP + (uint64_t)NT * LCH;
-  ltake = xcalloc(NT, sizeof(LTake));
+  // a line is >= 4 bytes ("a,b\n") with two IDs, plus a part-full block per bucket
+  lpool_cap = bytes / 2 / LBLK + 1 + (uint64_t)NT * LP;
   lpool = hcalloc(lpool_cap * sizeof(LBlk)); // NORESERVE: only the blocks used are mapped
   ledges = xcalloc(NT, sizeof(EVec));
   run_par(nlchunks, link_parse_task, NULL);
@@ -2303,6 +2293,12 @@ static void release_task(int tid, long t, void *ctx) {
   madvise(scratch[t].base, 1ull << 30, MADV_DONTNEED);
 }
 
+static void *load_small(void *dd) {
+  load_products(dd);
+  load_campaigns(dd);
+  return NULL;
+}
+
 int main(void) {
   PROF = getenv("SESS_PROF") != NULL; T0 = now_s();
   const char *dd = getenv("DATA_DIR"); if (!dd) dd = "/data";
@@ -2321,10 +2317,12 @@ int main(void) {
   mowin_init(&mw_cl, CWS);
   DAY0 = WS / 86400000LL; if (WS < 0 && WS % 86400000LL) DAY0--;
   NDAYS = (int32_t)((WE - 1) / 86400000LL - DAY0 + 1);
-  load_products(dd);
-  load_campaigns(dd);
+  // products and campaigns on their own thread beside links: their ~9 ms were the run's only serial phase
+  pthread_t small_th;
   PH("small");
+  if (pthread_create(&small_th, NULL, load_small, (void *)dd)) die("thread");
   load_links(dd);
+  pthread_join(small_th, NULL);
   PH("links");
 
   char dir[4096];

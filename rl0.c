@@ -2293,6 +2293,12 @@ static void release_task(int tid, long t, void *ctx) {
   madvise(scratch[t].base, 1ull << 30, MADV_DONTNEED);
 }
 
+static void *load_small(void *dd) {
+  load_products(dd);
+  load_campaigns(dd);
+  return NULL;
+}
+
 int main(void) {
   PROF = getenv("SESS_PROF") != NULL; T0 = now_s();
   const char *dd = getenv("DATA_DIR"); if (!dd) dd = "/data";
@@ -2311,10 +2317,12 @@ int main(void) {
   mowin_init(&mw_cl, CWS);
   DAY0 = WS / 86400000LL; if (WS < 0 && WS % 86400000LL) DAY0--;
   NDAYS = (int32_t)((WE - 1) / 86400000LL - DAY0 + 1);
-  load_products(dd);
-  load_campaigns(dd);
+  // products and campaigns on their own thread beside links: their ~9 ms were the run's only serial phase
+  pthread_t small_th;
   PH("small");
+  if (pthread_create(&small_th, NULL, load_small, (void *)dd)) die("thread");
   load_links(dd);
+  pthread_join(small_th, NULL);
   PH("links");
 
   char dir[4096];

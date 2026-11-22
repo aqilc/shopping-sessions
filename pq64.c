@@ -49,14 +49,20 @@ INL uint64_t ticks(void) {
 enum { SP_DSPLIT, SP_DPROBE, SP_GATHER, SP_SORT, SP_CLICKS, SP_WALK, SP_ASSIST, SP_N };
 static uint64_t sprof[16][8]; // [thread][SP_*], one cache line per thread
 #define SP_ADD(tid, k, t0) do { if (PROF) { uint64_t t1_ = ticks(); sprof[tid][k] += t1_ - (t0); (t0) = t1_; } } while (0)
-// Prints sub-phases k0..k1-1 as PH-style lines: max over threads, then the sum.
+// Prints sub-phases k0..k1-1 as PH-style lines: max over threads, then the sum. The sums again as one "X:" line,
+// which the board diag copies into its summary (it skips the sub-timer lines).
 static void sp_print(int k0, int k1, const char *const *names, double ms_per_tick) {
   if (!PROF) return;
+  double sums[SP_N];
   for (int k = k0; k < k1; k++) {
     uint64_t mx = 0, sum = 0;
     for (int t = 0; t < 16; t++) { sum += sprof[t][k]; if (sprof[t][k] > mx) mx = sprof[t][k]; }
-    fprintf(stderr, "%-10s %7.1f ms max/thread, %.1f ms sum\n", names[k - k0], mx * ms_per_tick, sum * ms_per_tick);
+    sums[k] = sum * ms_per_tick;
+    fprintf(stderr, "%-10s %7.1f ms max/thread, %.1f ms sum\n", names[k - k0], mx * ms_per_tick, sums[k]);
   }
+  fprintf(stderr, "X: thread sums ms");
+  for (int k = k0; k < k1; k++) fprintf(stderr, "%s %.0f", names[k - k0], sums[k]);
+  fprintf(stderr, "\n");
 }
 
 // ---------- hashing / strings ----------
@@ -1374,6 +1380,8 @@ INL void bits_put(Bits *w, uint32_t v, uint32_t bw) {
     w->nb -= 32;
   }
 }
+// Room for n more values, so the puts that follow never grow the buffer.
+static void bits_res(Bits *w, size_t n, uint32_t bw) { bres(&w->b, n * bw / 8 + 16); }
 // Flushes the partial word and pads to whole groups of 8 values, the unit of a bit-packed run.
 static void bits_end(Bits *w, uint32_t bw) {
   size_t want = (size_t)(w->n + 7) / 8 * bw;
@@ -1387,14 +1395,38 @@ static void bits_end(Bits *w, uint32_t bw) {
 
 // user_daily rows, emitted by each sess thread as it walks: user_id, day, sessions and top_category are dictionary
 // encoded (a person's rows are adjacent, so user_id is one RLE run per person over a dictionary of names), events and
-// revenue_cents PLAIN.
+// revenue_cents PLAIN. The walk stores a row's three small fields as one word; write_user_task bit-packs them per
+// column in tight loops, far cheaper than four interleaved bit streams fed row by row.
 typedef struct {
   Buf names, uidx, ev, rev; // dictionary of person names, RLE runs of its index, events, revenue_cents
-  Bits day, ses, tdef, top; // day index, sessions, top_category definition bits, top_category index
+  Buf row;                  // per row: day index | sessions << 16 | top_category index << 24 (ROW_NOTOP: null)
   uint32_t np;
   char pad[60];
 } UCol;
+#define ROW_NOTOP 0xFFu
 static UCol *ucol; // [NT]
+// Bit-packs the field (row >> sh) & mask of n row words as one finished run.
+static void bits_field(Bits *w, const uint32_t *row, size_t n, uint32_t sh, uint32_t mask, uint32_t bw) {
+  bits_res(w, n, bw);
+  uint8_t *o = w->b.b;
+  uint64_t acc = 0;
+  uint32_t nb = 0;
+  for (size_t i = 0; i < n; i++) {
+    acc |= (uint64_t)((row[i] >> sh) & mask) << nb;
+    nb += bw;
+    if (nb >= 32) {
+      memcpy(o, &acc, 4);
+      o += 4;
+      acc >>= 32;
+      nb -= 32;
+    }
+  }
+  w->b.n = (size_t)(o - w->b.b);
+  w->acc = acc;
+  w->nb = nb;
+  w->n = (uint32_t)n;
+  bits_end(w, bw);
+}
 static uint32_t DBW, CBW; // bit widths of the day and category indexes
 // Sessions starting on one day are over 30 minutes apart, so a day holds at most 48: 6 bits.
 #define SBW 6
@@ -1453,19 +1485,15 @@ static uint64_t *sort_u64(uint64_t *a, uint64_t *tmp, uint32_t n) {
   for (uint32_t i = 0; i < n; i++) hist_add(c, (uint32_t)(a[i] >> 32));
   return radix3(a, tmp, n, c);
 }
-static void emit_row(UCol *U, uint32_t di, uint32_t sessions, uint32_t events, int64_t revenue, int64_t *catsum, uint32_t touched) {
-  int best = -1; int64_t bv = 0;
+// A row's day index, sessions and top category as one word of UCol.row.
+INL uint32_t row_word(uint32_t di, uint32_t sessions, int64_t *catsum, uint32_t touched) {
+  uint32_t best = ROW_NOTOP; int64_t bv = 0;
   for (; touched; touched &= touched - 1) { // ascending category index, so a tie keeps the smallest
-    int z = __builtin_ctz(touched);
+    uint32_t z = (uint32_t)__builtin_ctz(touched);
     if (catsum[z] > bv) { bv = catsum[z]; best = z; }
     catsum[z] = 0;
   }
-  bits_put(&U->day, di, DBW);
-  bits_put(&U->ses, sessions, SBW);
-  bu32(&U->ev, events);
-  bi64(&U->rev, revenue);
-  bits_put(&U->tdef, best >= 0, 1);
-  if (best >= 0) bits_put(&U->top, (uint32_t)best, CBW);
+  return di | sessions << 16 | best << 24;
 }
 
 // Person table: open addressing on the person key, id at the same index, so a probe is one load chain.
@@ -1482,8 +1510,46 @@ INL uint32_t pt_find(const PTab *t, uint64_t pk) {
 #define BSH 20
 typedef struct { uint32_t mn, mx, cnt, day; uint64_t rev; } TBkt; // day: index of the session's day, set by the walk
 
-static void sess_task(int tid, long q, void *ctx) {
-  (void)ctx;
+// A partition's records are cold when its task starts, and reading them is most of gather: every thread streams
+// from memory at once. So a thread claims its next partition one task early and fetches that partition's blocks
+// during the walk of the current one, which computes on cached data and leaves the memory bus idle.
+static uint64_t *qsize; // [NQART] events per person partition
+#ifndef AHEAD
+#define AHEAD 1
+#endif
+typedef struct { const Blk *k; const char *p, *end; long q; int c; } Ahead; // c: next chain, events then clicks
+static void ahead_init(Ahead *a, long q) {
+  a->k = NULL; a->p = a->end = NULL; a->q = AHEAD ? q : -1; a->c = 0;
+  if (a->q < 0) return;
+  for (int t = 0; t < NT; t++) {
+    __builtin_prefetch(pb[(size_t)t * NQART + q].head, 0, 2);
+    __builtin_prefetch(cb[(size_t)t * NQART + q].head, 0, 2);
+  }
+}
+// Fetches the next `lines` cache lines of the partition's blocks.
+INL void ahead_step(Ahead *a, uint32_t lines) {
+  if (a->q < 0) return;
+  for (; lines; lines--) {
+    if (a->p >= a->end) {
+      const Blk *k = a->k ? a->k->next : NULL;
+      while (!k) {
+        if (a->c == 2 * NT) { a->q = -1; return; }
+        int c = a->c++;
+        k = c < NT ? pb[(size_t)c * NQART + a->q].head : cb[(size_t)(c - NT) * NQART + a->q].head;
+      }
+      __builtin_prefetch(k->next, 0, 2);
+      a->k = k;
+      a->p = (const char *)k + 64;
+      a->end = (const char *)(k + 1) + (size_t)k->n * sizeof(PRec);
+      continue;
+    }
+    __builtin_prefetch(a->p, 0, 2);
+    a->p += 64;
+  }
+}
+_Static_assert(sizeof(PRec) == sizeof(CRec), "ahead_step sizes both kinds of block alike");
+
+static void sess_task(int tid, long q, long nq) {
   Arena *S = &scratch[tid]; S->cur = S->base;
   size_t ne = 0, nc = 0;
   for (int t = 0; t < NT; t++) {
@@ -1590,6 +1656,15 @@ static void sess_task(int tid, long q, void *ctx) {
   for (size_t i = 0; i < nlive; i++) cl[pos[cpid[(uint32_t)csorted[i]]]++] = csorted[i];
   SP_ADD(tid, SP_CLICKS, t0);
   UCol *U = &ucol[tid];
+  // a person has at most a row per day and per event: room for every row of the task, so the walk stores unchecked
+  size_t rmax = (size_t)np * (size_t)NDAYS < nalive ? (size_t)np * (size_t)NDAYS : nalive;
+  bres(&U->row, rmax * 4);
+  bres(&U->ev, rmax * 4);
+  bres(&U->rev, rmax * 8);
+  uint32_t *orow = (uint32_t *)(void *)(U->row.b + U->row.n);
+  uint32_t *oev = (uint32_t *)(void *)(U->ev.b + U->ev.n);
+  int64_t *orev = (int64_t *)(void *)(U->rev.b + U->rev.n);
+  size_t nr = 0;
   CHot *hot = &chot[(size_t)tid * (ncamp + 1) * NDAYS];
   CBuy *cy = &cbuy[(size_t)tid * (ncamp + 1) * NDAYS];
   uint32_t *st = stamp[tid];
@@ -1598,7 +1673,9 @@ static void sess_task(int tid, long q, void *ctx) {
   uint32_t nb = (uint32_t)((WE - 1 - WS) >> BSH) + 1;
   TBkt *tb = aalloc(S, (size_t)nb * sizeof(TBkt));
   for (uint32_t b = 0; b < nb; b++) { tb[b].mn = UINT32_MAX; tb[b].mx = 0; tb[b].cnt = 0; tb[b].rev = 0; }
-  uint64_t *bits = aalloc(S, ((size_t)nb / 64 + 1) * 8); memset(bits, 0, ((size_t)nb / 64 + 1) * 8);
+  if (nb > 64 * 64) die("event window over 2^12 time buckets"); // wmask in the walk is one word
+  uint16_t *blist = aalloc(S, ((size_t)nb + 1) * 2); // the person's non-empty buckets, in first-event order
+  uint64_t *bits = aalloc(S, 64 * 8); memset(bits, 0, 64 * 8);
   int64_t *catd = aalloc(S, (size_t)NDAYS * 32 * 8); memset(catd, 0, (size_t)NDAYS * 32 * 8);
   uint32_t *dmask = aalloc(S, (size_t)NDAYS * 4); memset(dmask, 0, (size_t)NDAYS * 4);
   uint64_t *pur = aalloc(S, nalive * 8); // the person's purchases, ts << 32 | x
@@ -1609,53 +1686,72 @@ static void sess_task(int tid, long q, void *ctx) {
   uint32_t *scnt = aalloc(S, nalive * 4);
   int64_t *srev = aalloc(S, nalive * 8);
   uint32_t so = 0;
+  Ahead ah;
+  ahead_init(&ah, nq);
+  // lines per person so the walk covers the next partition: its events and about a quarter as many clicks
+  uint64_t ahl = nq < 0 ? 0 : qsize[nq] * (sizeof(PRec) * 5 / 4) / 64 / np + 2;
+  uint32_t ahn = ahl < 512 ? (uint32_t)ahl : 512;
   for (uint32_t p = 0; p < np; p++) {
+    ahead_step(&ah, ahn);
     const uint64_t *e = ev + eoff[p];
     uint32_t n = eoff[p + 1] - eoff[p];
     uint64_t *c = cl + coff[p];
     uint32_t m = coff[p + 1] - coff[p];
     uint32_t *sst = sst0 + so, *sdi = sdi0 + so;
     soff[p] = so;
-    uint32_t rows0 = U->day.n;
+    size_t rows0 = nr;
     uint32_t nn = refn(names[p]);
     bres(&U->names, 4 + nn);
     memcpy(U->names.b + U->names.n, &nn, 4);
     memcpy(U->names.b + U->names.n + 4, refp(names[p]), nn);
     U->names.n += 4 + nn;
-    uint32_t blo = nb, bhi = 0, npur = 0;
+    uint32_t nbk = 0, npur = 0;
     for (uint32_t i = 0; i < n; i++) {
       uint32_t t = (uint32_t)(e[i] >> 32);
       uint32_t x = (uint32_t)e[i];
       uint32_t b = (t - ebase) >> BSH;
       TBkt *B = &tb[b];
+      blist[nbk] = (uint16_t)b; // kept only when this event is the bucket's first
+      nbk += B->cnt == 0;
       B->mn = t < B->mn ? t : B->mn;
       B->mx = t > B->mx ? t : B->mx;
       B->cnt++;
-      bits[b >> 6] |= 1ull << (b & 63);
-      blo = b < blo ? b : blo;
-      bhi = b > bhi ? b : bhi;
       if (x & X_PURCH) { B->rev += x & 0xFFFFFF; pur[npur++] = e[i]; }
     }
-    // buckets in ts order -> sessions
-    uint32_t ns = 0, last = 0;
-    for (uint32_t w = blo >> 6; w <= bhi >> 6; w++) {
-      uint64_t bw = bits[w];
+    // The non-empty buckets go to a bitmap here, not per event: an event's update of a bitmap word waits for the
+    // previous event's store to the same word.
+    uint64_t wmask = 0; // non-empty words of bits
+    for (uint32_t i = 0; i < nbk; i++) {
+      uint32_t b = blist[i];
+      bits[b >> 6] |= 1ull << (b & 63);
+      wmask |= 1ull << (b >> 6);
+    }
+    // buckets in ts order -> sessions. One loop over the nbk set bits, the next word picked by selects: a loop
+    // per word leaves it after 1 or 2 buckets, a mispredicted exit for about every session.
+    uint32_t ns = 0, last = 0, w = 0;
+    uint64_t bw = 0;
+    for (uint32_t k = nbk; k; k--) {
+      uint32_t wn = (uint32_t)__builtin_ctzll(wmask | 1ull << 63);
+      uint64_t next = bits[wn];
+      int refill = bw == 0;
+      w = refill ? wn : w;
+      wmask = refill ? wmask & (wmask - 1) : wmask;
+      bw = refill ? next : bw;
       bits[w] = 0;
-      for (; bw; bw &= bw - 1) {
-        TBkt *B = &tb[w * 64 + (uint32_t)__builtin_ctzll(bw)];
-        if (!ns || B->mn - last > 1800000u) {
-          sst[ns] = B->mn;
-          sdi[ns] = (uint32_t)((CWS + (int64_t)B->mn) / 86400000LL - DAY0);
-          scnt[so + ns] = 0;
-          srev[so + ns] = 0;
-          ns++;
-        }
-        last = B->mx;
-        scnt[so + ns - 1] += B->cnt;
-        srev[so + ns - 1] += (int64_t)B->rev;
-        B->day = sdi[ns - 1];
-        B->mn = UINT32_MAX; B->mx = 0; B->cnt = 0; B->rev = 0;
+      TBkt *B = &tb[w * 64 + (uint32_t)__builtin_ctzll(bw)];
+      bw &= bw - 1;
+      if (!ns || B->mn - last > 1800000u) {
+        sst[ns] = B->mn;
+        sdi[ns] = (uint32_t)((CWS + (int64_t)B->mn) / 86400000LL - DAY0);
+        scnt[so + ns] = 0;
+        srev[so + ns] = 0;
+        ns++;
       }
+      last = B->mx;
+      scnt[so + ns - 1] += B->cnt;
+      srev[so + ns - 1] += (int64_t)B->rev;
+      B->day = sdi[ns - 1];
+      B->mn = UINT32_MAX; B->mx = 0; B->cnt = 0; B->rev = 0;
     }
     // purchases count for the category of their session's day
     for (uint32_t i = 0; i < npur; i++) {
@@ -1673,7 +1769,10 @@ static void sess_task(int tid, long q, void *ctx) {
       uint32_t s0 = sst[z], di = sdi[z];
       if (z && di != sdi[z - 1]) {
         uint32_t pd = sdi[z - 1];
-        emit_row(U, pd, rses, revs, rrev, catd + (size_t)pd * 32, dmask[pd]);
+        orow[nr] = row_word(pd, rses, catd + (size_t)pd * 32, dmask[pd]);
+        oev[nr] = revs;
+        orev[nr] = rrev;
+        nr++;
         dmask[pd] = 0;
         rses = 0;
         revs = 0;
@@ -1701,13 +1800,19 @@ static void sess_task(int tid, long q, void *ctx) {
       if (srev[so + z]) { cy[ci].purch++; cy[ci].revenue += srev[so + z]; }
     }
     uint32_t ld = sdi[ns - 1];
-    emit_row(U, ld, rses, revs, rrev, catd + (size_t)ld * 32, dmask[ld]);
+    orow[nr] = row_word(ld, rses, catd + (size_t)ld * 32, dmask[ld]);
+    oev[nr] = revs;
+    orev[nr] = rrev;
+    nr++;
     dmask[ld] = 0;
-    bvar(&U->uidx, (uint64_t)(U->day.n - rows0) << 1);
+    bvar(&U->uidx, (uint64_t)(nr - rows0) << 1);
     bu32(&U->uidx, U->np++);
     so += ns;
   }
   soff[np] = so;
+  U->row.n += nr * 4;
+  U->ev.n += nr * 4;
+  U->rev.n += nr * 8;
   SP_ADD(tid, SP_WALK, t0);
   uint32_t *drun = aalloc(S, (size_t)so * 4);
   uint32_t *jprev = aalloc(S, ((size_t)ncamp + 1) * 4); // valid where st[] carries this person's stamp
@@ -1926,12 +2031,21 @@ static void write_file(const char *path, FileW *f) {
 static void write_user_task(int tid, long t, void *ctx) {
   (void)tid; (void)ctx;
   UCol *U = &ucol[t];
-  size_t n = U->day.n;
+  size_t n = U->row.n / 4;
   if (!n && t != 0) return;
-  bits_end(&U->day, DBW);
-  bits_end(&U->ses, SBW);
-  bits_end(&U->tdef, 1);
-  bits_end(&U->top, CBW);
+  const uint32_t *row = (const uint32_t *)(const void *)U->row.b;
+  Bits day = {0}, ses = {0}, tdef = {0}, top = {0}; // day index, sessions, top_category definition bits and index
+  bits_field(&day, row, n, 0, 0xFFFF, DBW);
+  bits_field(&ses, row, n, 16, 0xFF, SBW);
+  bits_res(&tdef, n, 1);
+  bits_res(&top, n, CBW);
+  for (size_t i = 0; i < n; i++) {
+    uint32_t c = row[i] >> 24;
+    bits_put(&tdef, c != ROW_NOTOP, 1);
+    if (c != ROW_NOTOP) bits_put(&top, c, CBW);
+  }
+  bits_end(&tdef, 1);
+  bits_end(&top, CBW);
   Buf dday = {0}, dses = {0}, dtop = {0};
   for (int32_t d = 0; d < NDAYS; d++) bu32(&dday, (uint32_t)(DAY0 + d));
   for (uint32_t v = 0; v < 1u << SBW; v++) bu32(&dses, v);
@@ -1949,8 +2063,8 @@ static void write_user_task(int tid, long t, void *ctx) {
     fw_hdr(&f);
     fw_ext(&f, U->uidx.b, U->uidx.n);
     co[0].size = (int64_t)f.pos - co[0].start;
-    fw_packed(&f, &co[1], &dday, NDAYS, &U->day, DBW);
-    fw_packed(&f, &co[2], &dses, 1u << SBW, &U->ses, SBW);
+    fw_packed(&f, &co[1], &dday, NDAYS, &day, DBW);
+    fw_packed(&f, &co[2], &dses, 1u << SBW, &ses, SBW);
     co[3].start = co[3].off = (int64_t)f.pos;
     page_hdr(&f.h, U->ev.n, (int64_t)n, 0);
     fw_hdr(&f);
@@ -1966,18 +2080,18 @@ static void write_user_task(int tid, long t, void *ctx) {
     // top_category: definition levels as one bit-packed run (4-byte length first), then the non-null indexes
     fw_dict(&f, &co[5], &dtop, ncat, n);
     uint64_t lrun = ((uint64_t)(n + 7) / 8) << 1 | 1;
-    uint64_t vrun = ((uint64_t)(U->top.n + 7) / 8) << 1 | 1;
-    size_t lev = vlen(lrun) + U->tdef.b.n;
-    size_t vals = 1 + (U->top.n ? vlen(vrun) + U->top.b.n : 0);
+    uint64_t vrun = ((uint64_t)(top.n + 7) / 8) << 1 | 1;
+    size_t lev = vlen(lrun) + tdef.b.n;
+    size_t vals = 1 + (top.n ? vlen(vrun) + top.b.n : 0);
     page_hdr(&f.h, 4 + lev + vals, (int64_t)n, 8);
     bu32(&f.h, (uint32_t)lev);
     bvar(&f.h, lrun);
     fw_hdr(&f);
-    fw_ext(&f, U->tdef.b.b, U->tdef.b.n);
+    fw_ext(&f, tdef.b.b, tdef.b.n);
     bbyte(&f.h, (uint8_t)CBW);
-    if (U->top.n) bvar(&f.h, vrun);
+    if (top.n) bvar(&f.h, vrun);
     fw_hdr(&f);
-    fw_ext(&f, U->top.b.b, U->top.b.n);
+    fw_ext(&f, top.b.b, top.b.n);
     co[5].size = (int64_t)f.pos - co[5].start;
   }
   write_footer(&f.h, UCOLS, 6, co, (int64_t)n);
@@ -2134,7 +2248,18 @@ static void load_campaigns(const char *dd) {
   }
 }
 
-static uint64_t *qsize;
+// A sess thread: partitions in `sess_order`, each claimed one task before its turn so sess_task knows which
+// comes next, then the thread's user_daily file.
+static const long *sess_order; static atomic_long sess_next;
+static void sess_thread(int tid, long t, void *ctx) {
+  long cur = atomic_fetch_add_explicit(&sess_next, 1, memory_order_relaxed);
+  while (cur < (long)NQART) {
+    long nxt = atomic_fetch_add_explicit(&sess_next, 1, memory_order_relaxed);
+    sess_task(tid, sess_order[cur], nxt < (long)NQART ? sess_order[nxt] : -1);
+    cur = nxt;
+  }
+  write_user_task(tid, t, ctx);
+}
 static int cmp_q(const void *a, const void *b) {
   uint64_t x = qsize[*(const long *)a], y = qsize[*(const long *)b];
   return x > y ? -1 : (x < y ? 1 : 0);
@@ -2168,6 +2293,12 @@ static void release_task(int tid, long t, void *ctx) {
   madvise(scratch[t].base, 1ull << 30, MADV_DONTNEED);
 }
 
+static void *load_small(void *dd) {
+  load_products(dd);
+  load_campaigns(dd);
+  return NULL;
+}
+
 int main(void) {
   PROF = getenv("SESS_PROF") != NULL; T0 = now_s();
   const char *dd = getenv("DATA_DIR"); if (!dd) dd = "/data";
@@ -2186,10 +2317,12 @@ int main(void) {
   mowin_init(&mw_cl, CWS);
   DAY0 = WS / 86400000LL; if (WS < 0 && WS % 86400000LL) DAY0--;
   NDAYS = (int32_t)((WE - 1) / 86400000LL - DAY0 + 1);
-  load_products(dd);
-  load_campaigns(dd);
+  // products and campaigns on their own thread beside links: their ~9 ms were the run's only serial phase
+  pthread_t small_th;
   PH("small");
+  if (pthread_create(&small_th, NULL, load_small, (void *)dd)) die("thread");
   load_links(dd);
+  pthread_join(small_th, NULL);
   PH("links");
 
   char dir[4096];
@@ -2206,15 +2339,17 @@ int main(void) {
   uint64_t eest = ebytes / 60 + 1024, cest = cbytes / 45 + 1024;
   // eest runs ~1.4x the real event count, so 48000 here is ~30-35K events per partition: 2^10 at 20M, 2^11 at
   // 40-64M. Board, 64M-event replica: PB=QB 11 2975 ms, 10 3020, 12 3172, 13 3490 (diag a2e7094).
-  PB = 6; while (PB < 14 && (eest >> PB) > 48000) PB++;
-  QB = 6; while (QB < 13 && (eest >> QB) > 48000) QB++;
+  PB = 6; while (PB < 14 && (eest >> PB) > 64000) PB++;
+  QB = 6; while (QB < 13 && (eest >> QB) > 64000) QB++;
   NPART = 1u << PB; NQART = 1u << QB;
   uint64_t per_t = eest / NT;
   // Blocks of an eighth of a bucket's expected share: a bucket's last block is the only unused memory (and the
   // kernel zeroes all of it), so this wastes ~6% where one block of the whole share wasted ~75% (eest runs high).
+  // Clicks take a quarter: an eighth of their share is under 2 KB, and sess reads a partition's clicks as that many
+  // cold streams, each start a run of cache misses (gen20: 4x the block cut s.clicks by a quarter for +7 MB).
   kcap0 = (uint32_t)(per_t / NPART / 8 + 32);
   pcap0 = (uint32_t)(per_t / NQART / 8 + 32);
-  ccap0 = (uint32_t)(cest / NT / NQART / 16 + 32);
+  ccap0 = (uint32_t)(cest / NT / NQART / 4 + 32);
   arenas = xcalloc(NT, sizeof(Arena)); scratch = xcalloc(NT, sizeof(Arena));
   for (int t = 0; t < NT; t++) { arena_init(&arenas[t], ARENA_SZ); arena_init(&scratch[t], 1ull << 30); }
   strs = xcalloc(NT, sizeof(Arena)); rbufs = xcalloc(NT, sizeof(RBuf));
@@ -2237,6 +2372,7 @@ int main(void) {
   double pt0 = now_s(); uint64_t pk0 = ticks();
   run_par(NPART, dedup_task, NULL);
   PH("dedup");
+  double setup0 = now_s();
   ucol = xcalloc(NT, sizeof(UCol));
   DBW = 1; while ((1u << DBW) < (uint32_t)NDAYS) DBW++;
   CBW = 1; while ((1u << CBW) < (uint32_t)ncat) CBW++;
@@ -2252,14 +2388,18 @@ int main(void) {
   for (uint32_t q = 0; q < NQART; q++) order[q] = q;
   qsort(order, NQART, sizeof(long), cmp_q);
   PH(" s.setup");
+  double setup1 = now_s();
   snprintf(dir, sizeof dir, "%s/user_daily", od); if (mkdir(dir, 0777) && errno != EEXIST) die(dir);
   snprintf(dir, sizeof dir, "%s/campaign_daily", od); if (mkdir(dir, 0777) && errno != EEXIST) die(dir);
   // each thread writes its user_daily file the moment the queue runs dry, while the others finish their partitions
-  run_par_f(NQART, order, sess_task, write_user_task, NULL);
+  sess_order = order;
+  atomic_init(&sess_next, 0);
+  run_par_f(0, NULL, NULL, sess_thread, NULL);
   PH("sess");
   {
     static const char *const sn[] = {" d.split", " d.probe", " s.gather", " s.sort", " s.clicks", " s.walk", " s.assist"};
     sp_print(SP_DSPLIT, SP_N, sn, PROF ? (now_s() - pt0) * 1e3 / (double)(ticks() - pk0) : 0);
+    if (PROF) fprintf(stderr, "X: s.setup %.2f ms wall, one thread\n", (setup1 - setup0) * 1e3);
   }
   write_campaign();
   PH("write");
