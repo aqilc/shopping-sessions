@@ -475,9 +475,10 @@ static uint32_t kcap0, pcap0, ccap0;
 #define STAGE 0
 #endif
 #define ST 8 // records per run
-_Static_assert(sizeof(Blk) == 16 && ST * sizeof(PRec) % 16 == 0 && ST * sizeof(KRec) % 16 == 0, "stage runs must stay 16 B-aligned");
+_Static_assert(sizeof(Blk) == 16 && ST * sizeof(PRec) % 16 == 0 && ST * sizeof(KRec) % 16 == 0 && ST * sizeof(CRec) % 16 == 0, "stage runs must stay 16 B-aligned");
 static char *pst; // [NT][NQART] PRec runs
 static char *kst; // [NT][NPART] KRec runs
+static char *cst; // [NT][NQART] CRec runs
 INL void run_stream(char *d, const char *s, size_t n) {
 #if defined(__AVX2__)
   for (size_t i = 0; i < n; i += 16) _mm_stream_si128((__m128i *)(d + i), _mm_loadu_si128((const __m128i *)(s + i)));
@@ -610,10 +611,9 @@ INL void ev_emit(int tid, const EPend *p) {
 }
 INL void cl_emit(int tid, const CPend *p) {
   uint64_t pk = person_of(p->uh);
-  Bkt *b = &cb[(size_t)tid * NQART + qpart(pk)];
-  if (UNLIKELY(b->cur == b->end)) bkt_grow(&arenas[tid], b, sizeof(CRec), b->tail ? b->tail->cap : ccap0);
-  CRec *r = (CRec *)b->cur; b->cur += sizeof(CRec);
-  r->pkey = pk; r->cref = p->cref; r->ts = p->ts; r->camp = p->camp;
+  size_t bi = (size_t)tid * NQART + qpart(pk);
+  CRec r = {pk, p->cref, p->ts, p->camp};
+  rec_put(&arenas[tid], &cb[bi], cst + bi * (ST * sizeof(CRec)), &r, sizeof(CRec), ccap0);
 }
 static void pend_flush(int tid) {
   Pend *P = &pend[tid];
@@ -1463,6 +1463,7 @@ static void close_task(int tid, long t, void *ctx) {
   for (uint32_t i = 0; i < NQART; i++) {
     size_t bi = (size_t)t * NQART + i;
     if (STAGE) stage_flush(&pb[bi], pst + bi * (ST * sizeof(PRec)), sizeof(PRec));
+    if (STAGE) stage_flush(&cb[bi], cst + bi * (ST * sizeof(CRec)), sizeof(CRec));
     bkt_close(&pb[bi], sizeof(PRec));
     bkt_close(&cb[bi], sizeof(CRec));
   }
@@ -1528,6 +1529,7 @@ int main(void) {
   cb = xcalloc((size_t)NT * NQART, sizeof(Bkt));
   if (STAGE) pst = hcalloc((size_t)NT * NQART * ST * sizeof(PRec));
   if (STAGE) kst = hcalloc((size_t)NT * NPART * ST * sizeof(KRec));
+  if (STAGE) cst = hcalloc((size_t)NT * NQART * ST * sizeof(CRec));
   PH("map");
   run_par(nchunks, parse_task, NULL);
   run_par(NT, close_task, NULL);
