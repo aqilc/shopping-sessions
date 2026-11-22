@@ -223,6 +223,21 @@ INL int64_t ts_cal(const char *p, unsigned ss, uint64_t bad) {
   return days * 86400000LL + (int64_t)(hh * 3600 + mi * 60 + ss) * 1000;
 }
 
+// ingest_ts is always valid F1 (rules.md), so it needs no checks: "YYYY-MM-DDTHH:MM:SSZ" -> epoch seconds.
+INL int64_t ingest_s(const char *p) {
+  uint64_t q0 = ts_pairs(ld8(p) ^ 0x2D30302D30303030ULL), q1 = ts_pairs(ld8(p + 8) ^ 0x30303A3030543030ULL);
+  unsigned y = LANE(q0, 0) * 100 + LANE(q0, 2), mo = LANE(q0, 5);
+  unsigned da = LANE(q1, 0), hh = LANE(q1, 3), mi = LANE(q1, 6);
+  unsigned ss = (unsigned)(p[17] - '0') * 10 + (unsigned)(p[18] - '0');
+  unsigned yi = y - TS_Y0;
+  int64_t days;
+  if (LIKELY(yi < TS_NY)) {
+    unsigned leap = (unsigned)(ts_ystart[yi + 1] - ts_ystart[yi]) - 365;
+    days = ts_ystart[yi] + ts_moff[leap][mo] + (int64_t)da - 1;
+  } else days = days_from_civil(y, mo, da);
+  return days * 86400 + hh * 3600 + mi * 60 + ss;
+}
+
 // Lemire: 8 ASCII digits (first digit in the low byte) -> value. Zero bytes count as '0'.
 INL uint64_t ts_parse8(uint64_t w) {
   w = ((w & 0x0F0F0F0F0F0F0F0FULL) * 2561) >> 8;
@@ -449,6 +464,50 @@ static Bkt *pb; // [NT][NQART]
 static Bkt *cb; // [NT][NQART]
 static uint32_t kcap0, pcap0, ccap0;
 
+// x86: records reach their bucket through a staging run per (thread, bucket), so the scattered stores land in a
+// small hot buffer and the bucket gets whole runs as streaming stores (measured faster on the Xeon, slower on arm64).
+// A run starts at a block start or right after a full run, so it never spans blocks, and a record's stage slot is
+// its offset in the block mod the run size. Blocks start at a 64 B-aligned aalloc plus the 16 B Blk header, and a
+// run is a multiple of 16 B, so every run is 16 B-aligned for _mm_stream_si128.
+#if defined(__AVX2__)
+#define STAGE 1
+#else
+#define STAGE 0
+#endif
+#define ST 8 // records per run
+_Static_assert(sizeof(Blk) == 16 && ST * sizeof(PRec) % 16 == 0, "stage runs must stay 16 B-aligned");
+static char *pst; // [NT][NQART] PRec runs
+INL void run_stream(char *d, const char *s, size_t n) {
+#if defined(__AVX2__)
+  for (size_t i = 0; i < n; i += 16) _mm_stream_si128((__m128i *)(d + i), _mm_loadu_si128((const __m128i *)(s + i)));
+#else
+  memcpy(d, s, n);
+#endif
+}
+// Copies the partial run staged at st to the slots it was assigned: the records since the last run boundary.
+static void stage_flush(Bkt *b, const char *st, uint32_t rs) {
+  if (!b->tail) return;
+  size_t k = (size_t)(b->cur - (char *)(b->tail + 1)) % (ST * rs);
+  memcpy(b->cur - k, st, k);
+}
+// Appends the rs-byte record at src to bucket b (stage run st) and returns its final address.
+INL char *rec_put(Arena *a, Bkt *b, char *st, const void *src, uint32_t rs, uint32_t cap0) {
+  if (UNLIKELY(b->cur == b->end)) {
+    if (STAGE) stage_flush(b, st, rs);
+    bkt_grow(a, b, rs, b->tail ? b->tail->cap : cap0);
+  }
+  char *d = b->cur;
+  b->cur += rs;
+  if (!STAGE) {
+    memcpy(d, src, rs);
+    return d;
+  }
+  size_t off = (size_t)(d - (char *)(b->tail + 1)) % (ST * rs);
+  memcpy(st + off, src, rs);
+  if (off + rs == ST * rs) run_stream(b->cur - ST * rs, st, ST * rs);
+  return d;
+}
+
 // ---------- chunks ----------
 typedef struct { const char *base; size_t start, end, fsize; int kind; } Chunk;
 static Chunk *chunks; static long nchunks, chcap;
@@ -541,11 +600,10 @@ typedef struct { EPend e[RING]; CPend c[RING]; uint32_t ne, nc; char pad[56]; } 
 static Pend *pend; // [NT]
 INL void ev_emit(int tid, const EPend *p) {
   uint64_t pk = person_of(p->uh);
-  Bkt *b = &pb[(size_t)tid * NQART + qpart(pk)];
-  if (UNLIKELY(b->cur == b->end)) bkt_grow(&arenas[tid], b, sizeof(PRec), b->tail ? b->tail->cap : pcap0);
-  PRec *r = (PRec *)b->cur; b->cur += sizeof(PRec);
-  r->pkey = pk; r->uref = p->uref; r->ts = p->ts; r->x = p->x;
-  p->k->loc = (uint32_t)(((char *)r - arenas[tid].base) >> 3);
+  size_t bi = (size_t)tid * NQART + qpart(pk);
+  PRec r = {pk, p->uref, p->ts, p->x};
+  char *d = rec_put(&arenas[tid], &pb[bi], pst + bi * (ST * sizeof(PRec)), &r, sizeof(PRec), pcap0);
+  p->k->loc = (uint32_t)((d - arenas[tid].base) >> 3);
 }
 INL void cl_emit(int tid, const CPend *p) {
   uint64_t pk = person_of(p->uh);
@@ -575,7 +633,7 @@ static inline void ev_line(int tid, const char *ls, const char *const *sep, int 
     uh = hstr(f[1], fl[1]);
     if (have_links) __builtin_prefetch(&ltab[uh & lmask_b]);
   }
-  int64_t ing = parse_ts(f[3], fl[3]);
+  int64_t ing = LIKELY(fl[3] == 20) ? ingest_s(f[3]) * 1000 : parse_ts(f[3], fl[3]);
   int64_t ts = parse_ts(f[2], fl[2]);
   uint32_t x = 0;
   int ok = fl[1] > 0 && ts != BADTS && ts >= WS && ts < WE && fl[5] > 0;
@@ -635,6 +693,9 @@ static void parse_task(int tid, long t, void *ctx) {
   if (c->kind == 0) { TOKENIZE(c, EVL); }
   else { TOKENIZE(c, CLL); }
   pend_flush(tid);
+#if defined(__AVX2__)
+  _mm_sfence(); // streamed runs are visible once the tasks are joined
+#endif
 }
 
 // ---------- links ----------
@@ -816,11 +877,9 @@ static void dedup_task(int tid, long q, void *ctx) {
   if (!cnt) return;
   size_t cap = 64; while (cap < cnt * 2) cap <<= 1;
   Arena *s = &scratch[tid]; s->cur = s->base;
-  // Not cleared: every key of partition q has q in its top PB bits, so a slot holding another
-  // partition's key (left by this thread's earlier tasks) or the mmap's zero is empty here.
   DSlot *tab = aalloc(s, cap * sizeof(DSlot));
+  memset(tab, 0, cap * sizeof(DSlot));
   uint64_t mask = cap - 1;
-  int sh = 64 - (int)PB;
   for (int t = 0; t < NT; t++) {
     for (Blk *k = kb[(size_t)t * NPART + q].head; k; k = k->next) {
       KRec *r = (KRec *)(k + 1);
@@ -830,7 +889,7 @@ static void dedup_task(int tid, long q, void *ctx) {
         uint64_t i = h & mask;
         for (;;) {
           DSlot *d = &tab[i];
-          if ((d->h >> sh) != (uint64_t)q || !d->h) { d->h = h; d->ingest = r[j].ingest; d->loc = tl; break; }
+          if (!d->h) { d->h = h; d->ingest = r[j].ingest; d->loc = tl; break; }
           if (d->h == h) {
             if (r[j].ingest < d->ingest) { kill_loc(d->loc); d->ingest = r[j].ingest; d->loc = tl; }
             else kill_loc(tl);
@@ -1392,7 +1451,12 @@ static int cmp_q(const void *a, const void *b) {
 static void close_task(int tid, long t, void *ctx) {
   (void)tid; (void)ctx;
   for (uint32_t i = 0; i < NPART; i++) bkt_close(&kb[(size_t)t * NPART + i], sizeof(KRec));
-  for (uint32_t i = 0; i < NQART; i++) { bkt_close(&pb[(size_t)t * NQART + i], sizeof(PRec)); bkt_close(&cb[(size_t)t * NQART + i], sizeof(CRec)); }
+  for (uint32_t i = 0; i < NQART; i++) {
+    size_t bi = (size_t)t * NQART + i;
+    if (STAGE) stage_flush(&pb[bi], pst + bi * (ST * sizeof(PRec)), sizeof(PRec));
+    bkt_close(&pb[bi], sizeof(PRec));
+    bkt_close(&cb[bi], sizeof(CRec));
+  }
 }
 
 // Drop pages in parallel (madvise takes the mmap lock shared) so exit has little left to tear down serially.
@@ -1453,6 +1517,7 @@ int main(void) {
   kb = xcalloc((size_t)NT * NPART, sizeof(Bkt));
   pb = xcalloc((size_t)NT * NQART, sizeof(Bkt));
   cb = xcalloc((size_t)NT * NQART, sizeof(Bkt));
+  if (STAGE) pst = hcalloc((size_t)NT * NQART * ST * sizeof(PRec));
   PH("map");
   run_par(nchunks, parse_task, NULL);
   run_par(NT, close_task, NULL);

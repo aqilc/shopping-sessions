@@ -1,16 +1,13 @@
 FROM debian:bookworm-slim AS build
 RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev && rm -rf /var/lib/apt/lists/*
-COPY main.c dmain.c c1.c c2.c c2x.c diag.c /src/
+COPY main.c c2x.c st1.c st2.c st3.c st4.c diag.c /src/
 RUN mkdir /v && F="-O3 -static -pthread -march=x86-64-v3" && \
     gcc $F -o /v/base /src/main.c && \
-    gcc $F -DSTAGE=0 -o /v/s0 /src/dmain.c && \
-    gcc $F -DSTAGE=4 -o /v/s4 /src/dmain.c && \
-    gcc $F -DSTAGE=5 -o /v/s5 /src/dmain.c && \
-    gcc $F -DSTAGE=6 -o /v/s6 /src/dmain.c && \
-    gcc $F -DFORCEPB=8 -o /v/pb8 /src/dmain.c && \
-    gcc $F -o /v/c1 /src/c1.c && \
-    gcc $F -o /v/c2 /src/c2.c && \
     gcc $F -o /v/c2x /src/c2x.c && \
+    gcc $F -o /v/st1 /src/st1.c && \
+    gcc $F -o /v/st2 /src/st2.c && \
+    gcc $F -o /v/st3 /src/st3.c && \
+    gcc $F -o /v/st4 /src/st4.c && \
     gcc -O2 -static -o /diag /src/diag.c
 
 FROM scratch

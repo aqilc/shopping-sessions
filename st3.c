@@ -223,6 +223,21 @@ INL int64_t ts_cal(const char *p, unsigned ss, uint64_t bad) {
   return days * 86400000LL + (int64_t)(hh * 3600 + mi * 60 + ss) * 1000;
 }
 
+// ingest_ts is always valid F1 (rules.md), so it needs no checks: "YYYY-MM-DDTHH:MM:SSZ" -> epoch seconds.
+INL int64_t ingest_s(const char *p) {
+  uint64_t q0 = ts_pairs(ld8(p) ^ 0x2D30302D30303030ULL), q1 = ts_pairs(ld8(p + 8) ^ 0x30303A3030543030ULL);
+  unsigned y = LANE(q0, 0) * 100 + LANE(q0, 2), mo = LANE(q0, 5);
+  unsigned da = LANE(q1, 0), hh = LANE(q1, 3), mi = LANE(q1, 6);
+  unsigned ss = (unsigned)(p[17] - '0') * 10 + (unsigned)(p[18] - '0');
+  unsigned yi = y - TS_Y0;
+  int64_t days;
+  if (LIKELY(yi < TS_NY)) {
+    unsigned leap = (unsigned)(ts_ystart[yi + 1] - ts_ystart[yi]) - 365;
+    days = ts_ystart[yi] + ts_moff[leap][mo] + (int64_t)da - 1;
+  } else days = days_from_civil(y, mo, da);
+  return days * 86400 + hh * 3600 + mi * 60 + ss;
+}
+
 // Lemire: 8 ASCII digits (first digit in the low byte) -> value. Zero bytes count as '0'.
 INL uint64_t ts_parse8(uint64_t w) {
   w = ((w & 0x0F0F0F0F0F0F0F0FULL) * 2561) >> 8;
@@ -448,12 +463,51 @@ static Bkt *kb; // [NT][NPART]
 static Bkt *pb; // [NT][NQART]
 static Bkt *cb; // [NT][NQART]
 static uint32_t kcap0, pcap0, ccap0;
-// PRecs reach their bucket through a staging run per (thread, partition), copied out PST at a time,
-// so the scattered stores land in a small hot buffer and the bucket sees whole runs.
-#define PST 8
-typedef struct { PRec r[PST]; } PStage;
-static PStage *pst; // [NT][NQART]
-static uint8_t *pstn; // [NT][NQART] staged count
+
+// x86: records reach their bucket through a staging run per (thread, bucket), so the scattered stores land in a
+// small hot buffer and the bucket gets whole runs as streaming stores (measured faster on the Xeon, slower on arm64).
+// A run starts at a block start or right after a full run, so it never spans blocks, and a record's stage slot is
+// its offset in the block mod the run size. Blocks start at a 64 B-aligned aalloc plus the 16 B Blk header, and a
+// run is a multiple of 16 B, so every run is 16 B-aligned for _mm_stream_si128.
+#if defined(__AVX2__)
+#define STAGE 1
+#else
+#define STAGE 0
+#endif
+#define ST 8 // records per run
+_Static_assert(sizeof(Blk) == 16 && ST * sizeof(PRec) % 16 == 0 && ST * sizeof(KRec) % 16 == 0, "stage runs must stay 16 B-aligned");
+static char *pst; // [NT][NQART] PRec runs
+static char *kst; // [NT][NPART] KRec runs
+INL void run_stream(char *d, const char *s, size_t n) {
+#if defined(__AVX2__)
+  for (size_t i = 0; i < n; i += 16) _mm_stream_si128((__m128i *)(d + i), _mm_loadu_si128((const __m128i *)(s + i)));
+#else
+  memcpy(d, s, n);
+#endif
+}
+// Copies the partial run staged at st to the slots it was assigned: the records since the last run boundary.
+static void stage_flush(Bkt *b, const char *st, uint32_t rs) {
+  if (!b->tail) return;
+  size_t k = (size_t)(b->cur - (char *)(b->tail + 1)) % (ST * rs);
+  memcpy(b->cur - k, st, k);
+}
+// Appends the rs-byte record at src to bucket b (stage run st) and returns its final address.
+INL char *rec_put(Arena *a, Bkt *b, char *st, const void *src, uint32_t rs, uint32_t cap0) {
+  if (UNLIKELY(b->cur == b->end)) {
+    if (STAGE) stage_flush(b, st, rs);
+    bkt_grow(a, b, rs, b->tail ? b->tail->cap : cap0);
+  }
+  char *d = b->cur;
+  b->cur += rs;
+  if (!STAGE) {
+    memcpy(d, src, rs);
+    return d;
+  }
+  size_t off = (size_t)(d - (char *)(b->tail + 1)) % (ST * rs);
+  memcpy(st + off, src, rs);
+  if (off + rs == ST * rs) run_stream(b->cur - ST * rs, st, ST * rs);
+  return d;
+}
 
 // ---------- chunks ----------
 typedef struct { const char *base; size_t start, end, fsize; int kind; } Chunk;
@@ -541,34 +595,18 @@ INL int field(const char *ls, const char *const *sep, int k, const char **fp, ui
 
 // Delay line: person lookups miss cache, so each is resolved RING lines after its prefetch.
 #define RING 32
-typedef struct { uint64_t uh, uref; uint32_t ts, x; KRec *k; } EPend;
+typedef struct { uint64_t uh, uref, eh; uint32_t ts, x, ingest; } EPend;
 typedef struct { uint64_t uh, cref; uint32_t ts, camp; } CPend;
 typedef struct { EPend e[RING]; CPend c[RING]; uint32_t ne, nc; char pad[56]; } Pend;
 static Pend *pend; // [NT]
-// Copies the staged run to the bucket slots it was assigned: the n records before b->cur.
-INL void pst_flush(size_t bi) {
-  uint32_t n = pstn[bi];
-  if (!n) return;
-  memcpy(pb[bi].cur - (size_t)n * sizeof(PRec), pst[bi].r, (size_t)n * sizeof(PRec));
-  pstn[bi] = 0;
-}
 INL void ev_emit(int tid, const EPend *p) {
   uint64_t pk = person_of(p->uh);
   size_t bi = (size_t)tid * NQART + qpart(pk);
-  Bkt *b = &pb[bi];
-  if (UNLIKELY(b->cur == b->end)) {
-    pst_flush(bi);
-    bkt_grow(&arenas[tid], b, sizeof(PRec), b->tail ? b->tail->cap : pcap0);
-  }
-  uint32_t n = pstn[bi];
-  PRec *r = &pst[bi].r[n];
-  r->pkey = pk; r->uref = p->uref; r->ts = p->ts; r->x = p->x;
-  p->k->loc = (uint32_t)((b->cur - arenas[tid].base) >> 3);
-  b->cur += sizeof(PRec);
-  if (n + 1 == PST) {
-    memcpy(b->cur - sizeof(PStage), pst[bi].r, sizeof(PStage));
-    pstn[bi] = 0;
-  } else pstn[bi] = (uint8_t)(n + 1);
+  PRec r = {pk, p->uref, p->ts, p->x};
+  char *d = rec_put(&arenas[tid], &pb[bi], pst + bi * (ST * sizeof(PRec)), &r, sizeof(PRec), pcap0);
+  KRec k = {p->eh, p->ingest, (uint32_t)((d - arenas[tid].base) >> 3)};
+  size_t ki = (size_t)tid * NPART + (p->eh >> (64 - PB));
+  rec_put(&arenas[tid], &kb[ki], kst + ki * (ST * sizeof(KRec)), &k, sizeof(KRec), kcap0);
 }
 INL void cl_emit(int tid, const CPend *p) {
   uint64_t pk = person_of(p->uh);
@@ -598,7 +636,7 @@ static inline void ev_line(int tid, const char *ls, const char *const *sep, int 
     uh = hstr(f[1], fl[1]);
     if (have_links) __builtin_prefetch(&ltab[uh & lmask_b]);
   }
-  int64_t ing = parse_ts(f[3], fl[3]);
+  int64_t ing = LIKELY(fl[3] == 20) ? ingest_s(f[3]) * 1000 : parse_ts(f[3], fl[3]);
   int64_t ts = parse_ts(f[2], fl[2]);
   uint32_t x = 0;
   int ok = fl[1] > 0 && ts != BADTS && ts >= WS && ts < WE && fl[5] > 0;
@@ -618,17 +656,19 @@ static inline void ev_line(int tid, const char *ls, const char *const *sep, int 
   int64_t is = ing == BADTS ? 0xFFFFFFFFll : ing / 1000;
   if (is < 0) is = 0;
   if (is > 0xFFFFFFFFll) is = 0xFFFFFFFFll;
-  Bkt *b = &kb[(size_t)tid * NPART + (eh >> (64 - PB))];
-  if (UNLIKELY(b->cur == b->end)) bkt_grow(&arenas[tid], b, sizeof(KRec), b->tail ? b->tail->cap : kcap0);
-  KRec *k = (KRec *)b->cur; b->cur += sizeof(KRec);
-  k->h = eh; k->ingest = (uint32_t)is; k->loc = LOC_NONE;
-  if (ok) {
-    Pend *P = &pend[tid];
-    EPend *e = &P->e[P->ne % RING];
-    if (P->ne >= RING) ev_emit(tid, e);
-    e->uh = uh; e->uref = mkref(f[1], fl[1]); e->ts = (uint32_t)(ts - CWS); e->x = x; e->k = k;
-    P->ne++;
+  // A valid event's KRec is written by ev_emit once its payload loc is known; dedup does not depend on KRec order
+  // (it keeps the smallest ingest, and copies with equal ingest_ts are identical).
+  if (!ok) {
+    size_t ki = (size_t)tid * NPART + (eh >> (64 - PB));
+    KRec k = {eh, (uint32_t)is, LOC_NONE};
+    rec_put(&arenas[tid], &kb[ki], kst + ki * (ST * sizeof(KRec)), &k, sizeof(KRec), kcap0);
+    return;
   }
+  Pend *P = &pend[tid];
+  EPend *e = &P->e[P->ne % RING];
+  if (P->ne >= RING) ev_emit(tid, e);
+  e->uh = uh; e->uref = mkref(f[1], fl[1]); e->eh = eh; e->ts = (uint32_t)(ts - CWS); e->x = x; e->ingest = (uint32_t)is;
+  P->ne++;
 }
 
 static inline void cl_line(int tid, const char *ls, const char *const *sep, int ns, uint32_t nq) {
@@ -658,6 +698,9 @@ static void parse_task(int tid, long t, void *ctx) {
   if (c->kind == 0) { TOKENIZE(c, EVL); }
   else { TOKENIZE(c, CLL); }
   pend_flush(tid);
+#if defined(__AVX2__)
+  _mm_sfence(); // streamed runs are visible once the tasks are joined
+#endif
 }
 
 // ---------- links ----------
@@ -1412,8 +1455,17 @@ static int cmp_q(const void *a, const void *b) {
 
 static void close_task(int tid, long t, void *ctx) {
   (void)tid; (void)ctx;
-  for (uint32_t i = 0; i < NPART; i++) bkt_close(&kb[(size_t)t * NPART + i], sizeof(KRec));
-  for (uint32_t i = 0; i < NQART; i++) { pst_flush((size_t)t * NQART + i); bkt_close(&pb[(size_t)t * NQART + i], sizeof(PRec)); bkt_close(&cb[(size_t)t * NQART + i], sizeof(CRec)); }
+  for (uint32_t i = 0; i < NPART; i++) {
+    size_t bi = (size_t)t * NPART + i;
+    if (STAGE) stage_flush(&kb[bi], kst + bi * (ST * sizeof(KRec)), sizeof(KRec));
+    bkt_close(&kb[bi], sizeof(KRec));
+  }
+  for (uint32_t i = 0; i < NQART; i++) {
+    size_t bi = (size_t)t * NQART + i;
+    if (STAGE) stage_flush(&pb[bi], pst + bi * (ST * sizeof(PRec)), sizeof(PRec));
+    bkt_close(&pb[bi], sizeof(PRec));
+    bkt_close(&cb[bi], sizeof(CRec));
+  }
 }
 
 // Drop pages in parallel (madvise takes the mmap lock shared) so exit has little left to tear down serially.
@@ -1474,8 +1526,8 @@ int main(void) {
   kb = xcalloc((size_t)NT * NPART, sizeof(Bkt));
   pb = xcalloc((size_t)NT * NQART, sizeof(Bkt));
   cb = xcalloc((size_t)NT * NQART, sizeof(Bkt));
-  pst = hcalloc((size_t)NT * NQART * sizeof(PStage));
-  pstn = xcalloc((size_t)NT * NQART, 1);
+  if (STAGE) pst = hcalloc((size_t)NT * NQART * ST * sizeof(PRec));
+  if (STAGE) kst = hcalloc((size_t)NT * NPART * ST * sizeof(KRec));
   PH("map");
   run_par(nchunks, parse_task, NULL);
   run_par(NT, close_task, NULL);

@@ -50,7 +50,8 @@ static R run(const char *bin, const char *data, const char *ncpu) {
   if (f) fclose(f);
   return r;
 }
-static double med3(double a, double b, double c) { return a > b ? (b > c ? b : (a > c ? c : a)) : (a > c ? a : (b > c ? c : b)); }
+static int dcmp(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return (x > y) - (x < y); }
+static double med(double *v, int n) { double t[16]; memcpy(t, v, n * sizeof *t); qsort(t, n, sizeof *t, dcmp); return t[n / 2]; }
 
 // Copy every CSV in src/sub to dst/sub K times, prefixing the first two fields with a
 // per-copy tag (inside the quote if the field is quoted) so ids stay distinct per copy.
@@ -124,16 +125,18 @@ int main(void) {
   rep(dd, big, "events", K, 2); rep(dd, big, "clicks", K, 2); rep(dd, big, "links", K, 2);
   cp(dd, big, "products.csv"); cp(dd, big, "campaigns.csv"); cp(dd, big, "manifest.json");
   SUMF("replica x%d %.0f ms\n", K, (now() - t) * 1e3);
-  static const char *V[] = {"base", "s0", "s4", "s5", "s6", "pb8", "c1", "c2", "c2x"};
-  enum { NV = 9, NR = 3 };
+  static const char *V[] = {"base", "c2x", "st1", "st2", "st3", "st4"};
+  enum { NV = 6, NR = 5 };
   static R res[NV][NR];
   run("/v/base", big, nc); // warm-up, discarded
   for (int r = 0; r < NR; r++)
     for (int v = 0; v < NV; v++) { char b[64]; snprintf(b, sizeof b, "/v/%s", V[v]); res[v][r] = run(b, big, nc); }
   for (int v = 0; v < NV; v++) {
-    R *x = res[v];
-    SUMF("%s w%.0f(%.0f/%.0f/%.0f) x%d", V[v], med3(x[0].w, x[1].w, x[2].w), x[0].w, x[1].w, x[2].w, x[0].x | x[1].x | x[2].x);
-    for (int i = 0; i < 7; i++) SUMF(" %.2s%.0f", PHN[i], med3(x[0].ph[i], x[1].ph[i], x[2].ph[i]));
+    R *x = res[v]; double w[NR], ph[NR], mn = 1e9;
+    for (int r = 0; r < NR; r++) { w[r] = x[r].w; if (w[r] < mn) mn = w[r]; }
+    int xx = 0; for (int r = 0; r < NR; r++) xx |= x[r].x;
+    SUMF("%s w%.0f min%.0f x%d", V[v], med(w, NR), mn, xx);
+    for (int i = 0; i < 7; i++) { for (int r = 0; r < NR; r++) ph[r] = x[r].ph[i]; SUMF(" %.2s%.0f", PHN[i], med(ph, NR)); }
     SUMF("\n");
   }
   // A real answer for the dev check too, then fail on purpose so logs are shown.
