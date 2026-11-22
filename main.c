@@ -159,56 +159,114 @@ static inline int64_t days_from_civil(int64_t y, unsigned m, unsigned d) {
   return era * 146097 + (int64_t)doe - 719468;
 }
 INL int isdig(char c) { return (unsigned)(c - '0') <= 9; }
-INL int dd(const char *p, int *v) {
-  unsigned a = (unsigned)(p[0] - '0'), b = (unsigned)(p[1] - '0');
-  if (a > 9 || b > 9) return 0;
-  *v = (int)(a * 10 + b);
-  return 1;
-}
-static const int mdays[13] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
 
-// Calendar part "YYYY-MM-DDTHH:MM:SS" -> ms, or BADTS.
-INL int64_t parse_cal(const char *p) {
-  if (p[4] != '-' || p[7] != '-' || p[10] != 'T' || p[13] != ':' || p[16] != ':') return BADTS;
-  int y1, y2, mo, da, hh, mi, ss;
-  if (!dd(p, &y1) || !dd(p + 2, &y2) || !dd(p + 5, &mo) || !dd(p + 8, &da) || !dd(p + 11, &hh) ||
-      !dd(p + 14, &mi) || !dd(p + 17, &ss))
-    return BADTS;
-  int y = y1 * 100 + y2;
-  if (mo < 1 || mo > 12 || da < 1 || hh > 23 || mi > 59 || ss > 59) return BADTS;
-  int dim = mdays[mo];
-  if (mo == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0)) dim = 29;
-  if (da > dim) return BADTS;
-  int64_t days = days_from_civil(y, (unsigned)mo, (unsigned)da);
+// Days since the epoch at Jan 1 of 1900..2300 (one past the range gives the last year's length).
+#define TS_Y0 1900
+#define TS_NY 400
+static int32_t ts_ystart[TS_NY + 1];
+// Days before month m (1..12) in a common / leap year; month 0 and 13..15 are padding.
+static const int16_t ts_moff[2][16] = {{0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334},
+                                       {0, 0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335}};
+static const uint8_t ts_mdays[2][16] = {{0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31},
+                                        {0, 31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31}};
+__attribute__((constructor)) static void ts_init(void) {
+  for (int i = 0; i <= TS_NY; i++) ts_ystart[i] = (int32_t)days_from_civil(TS_Y0 + i, 1, 1);
+}
+
+#define ONES 0x0101010101010101ULL
+// Bytes of x (each 0..255) on lanes in m that are not 0..9.
+INL uint64_t ts_nondig(uint64_t x, uint64_t m) { return ((x + 0x76 * ONES) | x) & m & (0x80 * ONES); }
+// Per-lane 10*x[i] + x[i+1], for x holding digit values 0..9 (no lane overflows).
+INL uint64_t ts_pairs(uint64_t x) { return x * 10 + (x >> 8); }
+#define LANE(w, i) ((unsigned)((w) >> (8 * (i))) & 0xFF)
+
+// "YYYY-MM-DDTHH:MM:SS" (19 bytes at p, ss already validated by the caller and passed in) -> ms, or BADTS.
+// Reads only p[0..15].
+INL int64_t ts_cal(const char *p, unsigned ss, uint64_t bad) {
+  // Expected bytes with '0' on digit lanes: "0000-00-" and "00T00:00".
+  const uint64_t e0 = 0x2D30302D30303030ULL, e1 = 0x30303A3030543030ULL;
+  const uint64_t d0 = 0x00FFFF00FFFFFFFFULL, d1 = 0xFFFF00FFFF00FFFFULL;
+  uint64_t x0 = ld8(p) ^ e0, x1 = ld8(p + 8) ^ e1;
+  bad |= (x0 & ~d0) | (x1 & ~d1) | ts_nondig(x0, d0) | ts_nondig(x1, d1);
+  if (UNLIKELY(bad)) return BADTS;
+  uint64_t q0 = ts_pairs(x0), q1 = ts_pairs(x1);
+  unsigned y = LANE(q0, 0) * 100 + LANE(q0, 2), mo = LANE(q0, 5);
+  unsigned da = LANE(q1, 0), hh = LANE(q1, 3), mi = LANE(q1, 6);
+  if (UNLIKELY((mo - 1 > 11) | (da == 0) | (hh > 23) | (mi > 59))) return BADTS;
+  unsigned yi = y - TS_Y0;
+  int64_t days;
+  unsigned leap;
+  if (LIKELY(yi < TS_NY)) {
+    leap = (unsigned)(ts_ystart[yi + 1] - ts_ystart[yi]) - 365;
+    days = ts_ystart[yi] + ts_moff[leap][mo] + (int64_t)da - 1;
+  } else {
+    leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    days = days_from_civil(y, mo, da);
+  }
+  if (UNLIKELY(da > ts_mdays[leap][mo])) return BADTS;
   return days * 86400000LL + (int64_t)(hh * 3600 + mi * 60 + ss) * 1000;
 }
 
+// Lemire: 8 ASCII digits (first digit in the low byte) -> value. Zero bytes count as '0'.
+INL uint64_t ts_parse8(uint64_t w) {
+  w = ((w & 0x0F0F0F0F0F0F0F0FULL) * 2561) >> 8;
+  w = ((w & 0x00FF00FF00FF00FFULL) * 6553601) >> 16;
+  return ((w & 0x0000FFFF0000FFFFULL) * 42949672960001ULL) >> 32;
+}
+// The 8 bytes ending rem bytes into p (n >= 8), with bytes before p as zeros.
+INL uint64_t ts_chunk(const char *p, uint32_t rem) {
+  return rem >= 8 ? ld8(p + rem - 8) : ld8(p) << (8 * (8 - rem));
+}
+
+// Reads only p[0..n-1].
 static int64_t parse_ts(const char *p, uint32_t n) {
   if (n == 20) {
-    if (p[19] != 'Z') return BADTS;
-    return parse_cal(p);
+    // ":SSZ"
+    uint32_t t;
+    memcpy(&t, p + 16, 4);
+    uint32_t x = t ^ 0x5A30303AU;
+    unsigned ss = ((x >> 8) & 0xFF) * 10 + ((x >> 16) & 0xFF);
+    uint64_t bad = (x & 0xFF0000FFU) | ts_nondig(x, 0x00FFFF00U) | (ss > 59);
+    return ts_cal(p, ss, bad);
   }
   if (n == 25) {
-    char sg = p[19];
-    if ((sg != '+' && sg != '-') || p[22] != ':') return BADTS;
-    int oh, om;
-    if (!dd(p + 20, &oh) || !dd(p + 23, &om)) return BADTS;
-    if (oh > 23 || om > 59) return BADTS;
-    int64_t c = parse_cal(p);
+    // "SS+HH:MM" at 17; the sign lane is accepted as '+' (x = 0) or '-' (x = 6).
+    uint64_t x = ld8(p + 17) ^ 0x30303A30302B3030ULL;
+    const uint64_t dm = 0xFFFF00FFFF00FFFFULL;
+    unsigned sx = LANE(x, 2);
+    uint64_t bad = (x & 0x0000FF0000000000ULL) | ts_nondig(x, dm) | (sx != 0 && sx != 6) | (p[16] != ':');
+    uint64_t q = ts_pairs(x & dm);
+    unsigned ss = LANE(q, 0), oh = LANE(q, 3), om = LANE(q, 6);
+    bad |= (ss > 59) | (oh > 23) | (om > 59);
+    int64_t c = ts_cal(p, ss, bad);
     if (c == BADTS) return BADTS;
     int64_t off = (int64_t)(oh * 60 + om) * 60000;
-    return sg == '-' ? c + off : c - off;
+    return sx ? c + off : c - off;
   }
   if (n == 0) return BADTS;
-  uint32_t i = 0;
-  while (i < n && isdig(p[i])) i++;
-  if (i != n) return BADTS;
-  uint32_t j = 0;
-  while (j < n && p[j] == '0') j++;
-  if (n - j > 18) return INT64_MAX; // valid form, far outside any window
-  int64_t v = 0;
-  for (; j < n; j++) v = v * 10 + (p[j] - '0');
-  return v;
+  if (n < 8) {
+    int64_t v = 0;
+    for (uint32_t i = 0; i < n; i++) {
+      if (!isdig(p[i])) return BADTS;
+      v = v * 10 + (p[i] - '0');
+    }
+    return v;
+  }
+  uint64_t bad = 0;
+  for (uint32_t i = 0; i + 8 < n; i += 8) bad |= ts_nondig(ld8(p + i) ^ 0x30 * ONES, ~0ULL);
+  bad |= ts_nondig(ld8(p + n - 8) ^ 0x30 * ONES, ~0ULL);
+  if (bad) return BADTS;
+  uint32_t m = n;
+  if (UNLIKELY(n > 18)) {
+    uint32_t j = 0;
+    while (j < n && p[j] == '0') j++;
+    m = n - j;
+    if (m > 18) return INT64_MAX; // valid form, far outside any window
+  }
+  uint64_t v = ts_parse8(ld8(p + n - 8));
+  if (m > 8) v += ts_parse8(ts_chunk(p, n - 8)) * 100000000ULL;
+  if (m > 16) v += ts_parse8(ts_chunk(p, n - 16)) * 10000000000000000ULL;
+  return (int64_t)v;
 }
 
 // price: digits only, 1..10,000,000; returns 0 if bad
