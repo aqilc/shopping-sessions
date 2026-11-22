@@ -947,11 +947,12 @@ typedef struct { int64_t sessions, purch, revenue, assisted; } CAgg;
 static CAgg *cagg; // [NT][(ncamp+1)*NDAYS]
 static uint32_t **stamp; static uint32_t *stampv;
 
-static void sort_u64(uint64_t *a, uint64_t *tmp, uint32_t n) {
-  if (n < 2) return;
+// Sorts n keys by their high 32 bits, using tmp as the other buffer; returns whichever of a and tmp holds the result.
+static uint64_t *sort_u64(uint64_t *a, uint64_t *tmp, uint32_t n) {
+  if (n < 2) return a;
   if (n <= 48) {
     for (uint32_t i = 1; i < n; i++) { uint64_t x = a[i]; uint32_t j = i; while (j && a[j - 1] > x) { a[j] = a[j - 1]; j--; } a[j] = x; }
-    return;
+    return a;
   }
   if (n <= 8192) { // 4 passes of 8 bits over ts
     uint32_t c[4][256];
@@ -965,8 +966,7 @@ static void sort_u64(uint64_t *a, uint64_t *tmp, uint32_t n) {
       for (uint32_t i = 0; i < n; i++) { uint32_t k = (uint32_t)(src[i] >> sh) & 255; dst[c[p][k]++] = src[i]; }
       uint64_t *t = src; src = dst; dst = t;
     }
-    if (src != a) memcpy(a, src, (size_t)n * 8);
-    return;
+    return src;
   }
   // LSD radix on bits 32..63 (ts), 3 passes of 11 bits
   uint32_t c[3][2048];
@@ -980,7 +980,7 @@ static void sort_u64(uint64_t *a, uint64_t *tmp, uint32_t n) {
     for (uint32_t i = 0; i < n; i++) { uint32_t k = (uint32_t)(src[i] >> sh) & 2047; dst[c[p][k]++] = src[i]; }
     uint64_t *t = src; src = dst; dst = t;
   }
-  if (src != a) memcpy(a, src, (size_t)n * 8);
+  return src;
 }
 static void flush_row(UVec *ur, URow *row, int64_t *catsum, uint32_t touched) {
   int best = -1; int64_t bv = 0;
@@ -1056,10 +1056,10 @@ static void sess_task(int tid, long q, void *ctx) {
   uint64_t *ev = aalloc(S, nalive * 8 + 8);
   uint64_t *tmp = aalloc(S, (nalive > nc ? nalive : nc) * 8 + 8);
   // sort the partition by ts once; the stable scatter by person leaves each run sorted
-  sort_u64(tx, tmp, (uint32_t)nalive);
+  const uint64_t *esorted = sort_u64(tx, tmp, (uint32_t)nalive);
   for (size_t i = 0; i < nalive; i++) {
-    uint64_t v = px[(uint32_t)tx[i]];
-    ev[pos[v >> 32]++] = (tx[i] & 0xFFFFFFFF00000000ull) | (uint32_t)v;
+    uint64_t v = px[(uint32_t)esorted[i]];
+    ev[pos[v >> 32]++] = (esorted[i] & 0xFFFFFFFF00000000ull) | (uint32_t)v;
   }
   SP_ADD(tid, SP_SORT, t0);
   // clicks: per person runs of (ts << 32 | click slot); ts ties are settled by click_id at credit time
@@ -1088,8 +1088,8 @@ static void sess_task(int tid, long q, void *ctx) {
   for (uint32_t i = 0; i < np; i++) coff[i + 1] += coff[i];
   memcpy(pos, coff, ((size_t)np + 1) * 4);
   uint64_t *cl = aalloc(S, (nlive + 1) * 8);
-  sort_u64(ctx_, tmp, (uint32_t)nlive);
-  for (size_t i = 0; i < nlive; i++) cl[pos[cpid[(uint32_t)ctx_[i]]]++] = ctx_[i];
+  const uint64_t *csorted = sort_u64(ctx_, tmp, (uint32_t)nlive);
+  for (size_t i = 0; i < nlive; i++) cl[pos[cpid[(uint32_t)csorted[i]]]++] = csorted[i];
   SP_ADD(tid, SP_CLICKS, t0);
   uint64_t tassist = 0;
   UVec *ur = &urows[tid];
