@@ -980,6 +980,9 @@ static void init_task(int tid, long t, void *ctx) {
   (void)tid; (void)ctx;
   uint64_t lo = (uint64_t)t * LSPAN, hi = lo + LSPAN; if (hi > lcap) hi = lcap;
   for (uint64_t i = lo; i < hi; i++) { atomic_store_explicit(&lpar[i], (uint32_t)i, memory_order_relaxed); atomic_store_explicit(&lbest[i], UINT32_MAX, memory_order_relaxed); }
+  // A span of ltab is 1 MB, so this writes every 2 MB page first: lt_insert's first touch is a load, which maps the
+  // huge zero page, and the store after it splits that into 4 KB pages (a fault per page, a TLB miss per lookup).
+  atomic_store_explicit(&ltab[lo].key, 0, memory_order_relaxed);
 }
 static void best_task(int tid, long t, void *ctx) {
   (void)tid; (void)ctx;
