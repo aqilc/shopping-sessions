@@ -1286,7 +1286,7 @@ static void load_links(const char *dd) {
 }
 
 // ---------- dedup ----------
-#define DSUB 1024 // most entries per dedup sub-table, so its 2^11-2^12 slots (16-32 KB) stay in L1 (Mac: 1024 beat 512, 2048, 4096)
+#define DPF 8 // records ahead whose table slot is prefetched
 INL void kill_loc(uint32_t tl) {
   uint32_t l = tl & 0x0FFFFFFFu;
   if (l == LOC_NONE) return;
@@ -1302,52 +1302,40 @@ static void dedup_task(int tid, long q, void *ctx) {
   uint64_t t0 = PROF ? ticks() : 0;
   // 8-byte entry: 32 hash bits as a fingerprint << 32 | the record's ref (thread << 28 | arena offset / 16, never 0
   // since a block header comes first); a fingerprint match is confirmed on the records.
-  // The entries go to sub-tables by low hash bits first, each small enough to probe in L1.
-  uint32_t nsub = 1;
-  while (cnt / nsub > DSUB) nsub <<= 1;
-  uint64_t *ent = aalloc(s, (size_t)nsub * cnt * 8); // sub-table i fills from ent + i * cnt
-  uint32_t *fill = aalloc(s, (size_t)nsub * 4); memset(fill, 0, (size_t)nsub * 4);
+  // One table per partition, probed straight off the records: it sits in L2, and the slot of the record DPF ahead
+  // is prefetched, so no split pass copies the keys first.
+  uint32_t cap = 64; while (cap < cnt * 2) cap <<= 1;
+  uint32_t mask = cap - 1;
+  uint64_t *tab = aalloc(s, (size_t)cap * 8);
+  memset(tab, 0, (size_t)cap * 8);
+  SP_ADD(tid, SP_DSPLIT, t0);
   for (int t = 0; t < NT; t++) {
     const char *ab = arenas[t].base;
     for (Blk *k = kb[(size_t)t * NPART + q].head; k; k = k->next) {
       KRec *r = (KRec *)(k + 1);
+      if (k->next) __builtin_prefetch(k->next);
       uint64_t ref0 = ((uint64_t)t << 28) | (uint64_t)(((const char *)r - ab) >> 4);
-      for (uint32_t j = 0; j < k->n; j++) {
+      uint32_t n = k->n;
+      for (uint32_t j = 0; j < n; j++) {
+        if (j + DPF < n) __builtin_prefetch(&tab[(uint32_t)(r[j + DPF].h >> 24) & mask], 1);
         uint64_t h = r[j].h;
-        uint32_t b = (uint32_t)(h >> 1) & (nsub - 1); // hstr sets bit 0
-        ent[(size_t)b * cnt + fill[b]++] = ((h >> 24) << 32) | (ref0 + j);
-      }
-    }
-  }
-  uint32_t most = 0;
-  for (uint32_t b = 0; b < nsub; b++) most = fill[b] > most ? fill[b] : most;
-  uint32_t cap = 64; while (cap < most * 2) cap <<= 1;
-  uint64_t *tab = aalloc(s, (size_t)cap * 8);
-  SP_ADD(tid, SP_DSPLIT, t0);
-  for (uint32_t b = 0; b < nsub; b++) {
-    const uint64_t *e = ent + (size_t)b * cnt;
-    uint32_t n = fill[b];
-    cap = 64; while (cap < n * 2) cap <<= 1;
-    uint32_t mask = cap - 1;
-    memset(tab, 0, (size_t)cap * 8);
-    for (uint32_t j = 0; j < n; j++) {
-      uint64_t v = e[j];
-      uint64_t fp = v & 0xFFFFFFFF00000000ull;
-      uint32_t i = (uint32_t)(v >> 32) & mask;
-      for (;;) {
-        uint64_t d = tab[i];
-        if (!d) { tab[i] = v; break; }
-        if ((d & 0xFFFFFFFF00000000ull) == fp) {
-          uint32_t dr = (uint32_t)d, vr = (uint32_t)v;
-          KRec *o = (KRec *)(arenas[dr >> 28].base + ((size_t)(dr & 0x0FFFFFFFu) << 4));
-          KRec *r = (KRec *)(arenas[vr >> 28].base + ((size_t)(vr & 0x0FFFFFFFu) << 4));
-          if (o->h == r->h) {
-            if (r->ingest < o->ingest) { kill_loc((dr & 0xF0000000u) | o->loc); tab[i] = v; }
-            else kill_loc((vr & 0xF0000000u) | r->loc);
-            break;
+        uint64_t v = ((h >> 24) << 32) | (ref0 + j);
+        uint64_t fp = v & 0xFFFFFFFF00000000ull;
+        uint32_t i = (uint32_t)(h >> 24) & mask;
+        for (;;) {
+          uint64_t d = tab[i];
+          if (!d) { tab[i] = v; break; }
+          if ((d & 0xFFFFFFFF00000000ull) == fp) {
+            uint32_t dr = (uint32_t)d;
+            KRec *o = (KRec *)(arenas[dr >> 28].base + ((size_t)(dr & 0x0FFFFFFFu) << 4));
+            if (o->h == h) {
+              if (r[j].ingest < o->ingest) { kill_loc((dr & 0xF0000000u) | o->loc); tab[i] = v; }
+              else kill_loc(((uint32_t)t << 28) | r[j].loc);
+              break;
+            }
           }
+          i = (i + 1) & mask;
         }
-        i = (i + 1) & mask;
       }
     }
   }
