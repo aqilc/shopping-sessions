@@ -3,6 +3,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev &
 COPY main.c dmain.c c1.c c2.c c2x.c diag.c /src/
 RUN mkdir /v && F="-O3 -static -pthread -march=x86-64-v3" && \
     gcc $F -o /v/base /src/main.c && \
+    gcc $F -DSTAGE=0 -o /v/s0 /src/dmain.c && \
     gcc $F -DSTAGE=4 -o /v/s4 /src/dmain.c && \
     gcc $F -DSTAGE=5 -o /v/s5 /src/dmain.c && \
     gcc $F -DSTAGE=6 -o /v/s6 /src/dmain.c && \

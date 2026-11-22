@@ -579,7 +579,7 @@ static void pend_flush(int tid) {
 static uint64_t SINK[64 * 8];
 static inline void ev_line(int tid, const char *ls, const char *const *sep, int ns, uint32_t nq) {
   if (ns != 7) return;
-  if (STAGE == 1) { SINK[tid * 8] += (uint64_t)(uintptr_t)sep[6] ^ nq; return; }
+  if (STAGE <= 1) { SINK[tid * 8] += (uint64_t)(uintptr_t)sep[6] ^ nq; return; }
   const char *f[7]; uint32_t fl[7]; uint32_t nqf = 0;
   for (int k = 0; k < 7; k++) if (!field(ls, sep, k, &f[k], &fl[k], &nqf, nq)) return;
   if (nqf != nq) return;
@@ -629,6 +629,7 @@ static inline void ev_line(int tid, const char *ls, const char *const *sep, int 
 
 static inline void cl_line(int tid, const char *ls, const char *const *sep, int ns, uint32_t nq) {
   if (ns != 4) return;
+  if (STAGE == 0) { SINK[tid * 8] += (uint64_t)(uintptr_t)sep[3] ^ nq; return; }
   const char *f[4]; uint32_t fl[4]; uint32_t nqf = 0;
   for (int k = 0; k < 4; k++) if (!field(ls, sep, k, &f[k], &fl[k], &nqf, nq)) return;
   if (nqf != nq) return;
