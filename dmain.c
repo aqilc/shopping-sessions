@@ -429,6 +429,9 @@ static int have_links;
 INL uint32_t qpart(uint64_t pkey) { return (uint32_t)((pkey >> 40) & (NQART - 1)); }
 
 INL uint64_t person_of(uint64_t uh) {
+#if defined(STAGE) && STAGE == 6
+  return uh & ~LINKED;
+#endif
   if (have_links) {
     uint64_t i = uh & lmask_b;
     for (;;) {
@@ -606,6 +609,7 @@ static inline void ev_line(int tid, const char *ls, const char *const *sep, int 
     } else ok = 0;
   }
   if (ok && ing != BADTS && ing - ts > 86400000LL) ok = 0;
+  if (STAGE == 4) { SINK[tid * 8] += eh ^ uh ^ (uint64_t)ing ^ (uint64_t)ts ^ x ^ (uint64_t)ok; return; }
   int64_t is = ing == BADTS ? 0xFFFFFFFFll : ing / 1000;
   if (is < 0) is = 0;
   if (is > 0xFFFFFFFFll) is = 0xFFFFFFFFll;
@@ -613,6 +617,7 @@ static inline void ev_line(int tid, const char *ls, const char *const *sep, int 
   if (UNLIKELY(b->cur == b->end)) bkt_grow(&arenas[tid], b, sizeof(KRec), b->tail ? b->tail->cap : kcap0);
   KRec *k = (KRec *)b->cur; b->cur += sizeof(KRec);
   k->h = eh; k->ingest = (uint32_t)is; k->loc = LOC_NONE;
+  if (STAGE == 5) { SINK[tid * 8] += uh ^ (uint64_t)ts ^ x ^ (uint64_t)ok; return; }
   if (ok) {
     Pend *P = &pend[tid];
     EPend *e = &P->e[P->ne % RING];
@@ -1454,6 +1459,9 @@ int main(void) {
   // ~30K events per partition: fewer write streams at parse (2^10 at 20M), tables still in L2
   PB = 6; while (PB < 14 && (eest >> PB) > 30000) PB++;
   QB = 6; while (QB < 13 && (eest >> QB) > 30000) QB++;
+#ifdef FORCEPB
+  PB = QB = FORCEPB;
+#endif
   NPART = 1u << PB; NQART = 1u << QB;
   uint64_t per_t = eest / NT;
   kcap0 = (uint32_t)(per_t / NPART); kcap0 = kcap0 + kcap0 / 4 + 32;
