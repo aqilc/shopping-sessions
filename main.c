@@ -2276,9 +2276,11 @@ int main(void) {
   uint64_t per_t = eest / NT;
   // Blocks of an eighth of a bucket's expected share: a bucket's last block is the only unused memory (and the
   // kernel zeroes all of it), so this wastes ~6% where one block of the whole share wasted ~75% (eest runs high).
+  // Clicks take a quarter: an eighth of their share is under 2 KB, and sess reads a partition's clicks as that many
+  // cold streams, each start a run of cache misses (gen20: 4x the block cut s.clicks by a quarter for +7 MB).
   kcap0 = (uint32_t)(per_t / NPART / 8 + 32);
   pcap0 = (uint32_t)(per_t / NQART / 8 + 32);
-  ccap0 = (uint32_t)(cest / NT / NQART / 16 + 32);
+  ccap0 = (uint32_t)(cest / NT / NQART / 4 + 32);
   arenas = xcalloc(NT, sizeof(Arena)); scratch = xcalloc(NT, sizeof(Arena));
   for (int t = 0; t < NT; t++) { arena_init(&arenas[t], ARENA_SZ); arena_init(&scratch[t], 1ull << 30); }
   strs = xcalloc(NT, sizeof(Arena)); rbufs = xcalloc(NT, sizeof(RBuf));
