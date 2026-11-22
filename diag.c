@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/wait.h>
+#include <sys/resource.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -28,8 +29,12 @@ static void cat(const char *p, const char *grep, int maxl) {
 }
 
 static int RUNI;
-typedef struct { double w, ph[16]; int x; } R;
-static const char *PHN[] = {"links", "map", "parse", "dedup", "sess", "write", "release"};
+// Per run: wall from fork to reap, phase deltas between the main stamps only (sub-timer lines are skipped,
+// so a phase's time is never hidden behind its own sub-stamps), start (fork -> main's T0), exit (last stamp -> reap),
+// user/sys cpu, max rss, minor faults.
+enum { NPH = 8 };
+typedef struct { double w, ph[NPH], st, ex, ut, sy, rss, flt; int x; } R;
+static const char *PHN[NPH] = {"small", "links", "map", "parse", "dedup", "sess", "write", "release"};
 static R run(const char *bin, const char *data, const char *ncpu) {
   char e1[512], e2[512], e3[64], lf[600], out[600];
   const char *sc = getenv("SCRATCH_DIR"); if (!sc) sc = "/scratch";
@@ -40,15 +45,19 @@ static R run(const char *bin, const char *data, const char *ncpu) {
   char *env[] = {e1, e2, e3, "SESS_PROF=1", NULL}, *argv[] = {(char *)bin, NULL};
   double t = now(); pid_t p = fork();
   if (p == 0) { int fd = open(lf, O_WRONLY | O_CREAT | O_TRUNC, 0666); dup2(fd, 2); execve(bin, argv, env); _exit(127); }
-  int st; waitpid(p, &st, 0);
+  int st; struct rusage ru; wait4(p, &st, 0, &ru);
   R r = {0}; r.w = (now() - t) * 1e3; r.x = WIFEXITED(st) ? WEXITSTATUS(st) : -WTERMSIG(st);
-  FILE *f = fopen(lf, "r"); char l[256], nm[64]; double v, prev = 0;
-  while (f && fgets(l, sizeof l, f))
-    if (sscanf(l, " %63s %lf ms", nm, &v) == 2) {
-      for (int i = 0; i < 7; i++) if (!strcmp(nm, PHN[i])) r.ph[i] = v - prev;
-      prev = v;
-    }
+  r.ut = ru.ru_utime.tv_sec * 1e3 + ru.ru_utime.tv_usec * 1e-3; r.sy = ru.ru_stime.tv_sec * 1e3 + ru.ru_stime.tv_usec * 1e-3;
+  r.rss = ru.ru_maxrss / 1024.0; r.flt = ru.ru_minflt / 1000.0;
+  FILE *f = fopen(lf, "r"); char l[256], nm[64]; double v, prev = 0, last = 0;
+  while (f && fgets(l, sizeof l, f)) {
+    if (l[0] == ' ') continue; // sub-timer
+    if (sscanf(l, "%63s %lf ms", nm, &v) != 2) continue;
+    if (!strcmp(nm, "t0abs")) { r.st = v - t * 1e3; continue; }
+    for (int i = 0; i < NPH; i++) if (!strcmp(nm, PHN[i])) { r.ph[i] = v - prev; prev = last = v; }
+  }
   if (f) fclose(f);
+  r.ex = r.w - r.st - last;
   return r;
 }
 static int dcmp(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return (x > y) - (x < y); }
@@ -107,20 +116,12 @@ static void cp(const char *src, const char *dst, const char *name) {
 int main(void) {
   cpu_set_t cs; sched_getaffinity(0, sizeof cs, &cs);
   SUMF("aff %d onln %ld NCPU %s\n", CPU_COUNT(&cs), sysconf(_SC_NPROCESSORS_ONLN), getenv("NCPU"));
-  cat("/proc/cpuinfo", "model name", 1); cat("/proc/cpuinfo", "cache size", 1);
-  { FILE *f = fopen("/proc/cpuinfo", "r"); char l[8192]; int a5 = -1, bw = 0;
-    while (f && fgets(l, sizeof l, f)) if (!strncmp(l, "flags", 5)) { a5 = strstr(l, " avx512f") != 0; bw = strstr(l, " avx512bw") != 0; break; }
-    if (f) fclose(f); SUMF("avx512f %d avx512bw %d\n", a5, bw); }
-  cat("/proc/meminfo", "MemTotal", 1);
-  cat("/sys/kernel/mm/transparent_hugepage/enabled", NULL, 2);
-  cat("/sys/kernel/mm/transparent_hugepage/defrag", NULL, 2);
-  cat("/sys/fs/cgroup/cpu.max", NULL, 2); cat("/sys/fs/cgroup/memory.max", NULL, 1); cat("/sys/fs/cgroup/cpuset.cpus.effective", NULL, 2);
-  cat("/proc/mounts", " /data ", 1); cat("/proc/mounts", " /scratch ", 1); cat("/proc/mounts", " /output ", 1);
+  cat("/sys/fs/cgroup/memory.max", NULL, 1);
   const char *dd = getenv("DATA_DIR"); if (!dd) dd = "/data";
   const char *sc = getenv("SCRATCH_DIR"); if (!sc) sc = "/scratch";
   const char *nc = getenv("NCPU"); if (!nc) nc = "8";
   char big[512]; snprintf(big, sizeof big, "%s/big", sc);
-  R d = run("/v/base", dd, nc); SUMF("dev base w%.0f x%d parse%.0f sess%.0f\n", d.w, d.x, d.ph[2], d.ph[4]);
+  R d = run("/v/base", dd, nc); SUMF("dev base w%.0f x%d st%.1f ex%.1f pa%.0f\n", d.w, d.x, d.st, d.ex, d.ph[3]);
   int K = getenv("DIAG_K") ? atoi(getenv("DIAG_K")) : 60;
   { // cap K so the replica fits in 80% of /scratch free space
     long long src = 0; const char *subs[] = {"events", "clicks", "links"};
@@ -136,18 +137,20 @@ int main(void) {
   rep(dd, big, "events", K, 2); rep(dd, big, "clicks", K, 2); rep(dd, big, "links", K, 2);
   cp(dd, big, "products.csv"); cp(dd, big, "campaigns.csv"); cp(dd, big, "manifest.json");
   SUMF("replica x%d %.0f ms\n", K, (now() - t) * 1e3);
-  static const char *V[] = {"base", "pb10", "pb11", "pb13", "v6c", "fuse2", "ss"};
-  enum { NV = 7, NR = 3 };
+  static const char *V[] = {"base", "v7", "lk0", "norel", "wr0"};
+  enum { NV = 5, NR = 3 };
   static R res[NV][NR];
   run("/v/base", big, nc); // warm-up, discarded
   for (int r = 0; r < NR; r++)
     for (int v = 0; v < NV; v++) { char b[64]; snprintf(b, sizeof b, "/v/%s", V[v]); res[v][r] = run(b, big, nc); }
   for (int v = 0; v < NV; v++) {
-    R *x = res[v]; double w[NR], ph[NR], mn = 1e9;
+    R *x = res[v]; double w[NR], q[NR], mn = 1e9;
     for (int r = 0; r < NR; r++) { w[r] = x[r].w; if (w[r] < mn) mn = w[r]; }
     int xx = 0; for (int r = 0; r < NR; r++) xx |= x[r].x;
     SUMF("%s w%.0f min%.0f x%d", V[v], med(w, NR), mn, xx);
-    for (int i = 0; i < 7; i++) { for (int r = 0; r < NR; r++) ph[r] = x[r].ph[i]; SUMF(" %.2s%.0f", PHN[i], med(ph, NR)); }
+#define MF(fld, fmt, lab) do { for (int r = 0; r < NR; r++) q[r] = x[r].fld; SUMF(" " lab fmt, med(q, NR)); } while (0)
+    for (int i = 0; i < NPH; i++) { for (int r = 0; r < NR; r++) q[r] = x[r].ph[i]; SUMF(" %.2s%.0f", PHN[i], med(q, NR)); }
+    MF(st, "%.1f", "st"); MF(ex, "%.1f", "ex"); MF(ut, "%.0f", "u"); MF(sy, "%.0f", "s"); MF(rss, "%.0f", "M"); MF(flt, "%.0f", "f");
     SUMF("\n");
   }
   // A real answer for the dev check too, then fail on purpose so logs are shown.
