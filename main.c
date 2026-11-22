@@ -1073,11 +1073,13 @@ static void dedup_task(int tid, long q, void *ctx) {
 typedef struct { uint64_t name; int32_t day; uint32_t sessions, events; int32_t top; int64_t revenue; } URow;
 typedef struct { URow *a; size_t n, cap; } UVec;
 static UVec *urows; // [NT]
-// Per thread and (campaign, day), randomly hit per session and per click, so kept small for L2: a count of
+// Per thread and (campaign, day), randomly hit per session and per click, so the cells hit by every session and
+// click are 8 B and the purchase totals (~15% of sessions) live apart, keeping the hot table in L2: a count of
 // sessions or (session, campaign) pairs on one day is at most that day's sessions, so 32 bits hold it.
-typedef struct { uint32_t sessions, purch; int64_t revenue; } CAgg;
-static CAgg *cagg; // [NT][(ncamp+1)*NDAYS]
-static uint32_t *cassist; // [NT][(ncamp+1)*NDAYS] assisted sessions
+typedef struct { uint32_t sessions, assisted; } CHot;
+typedef struct { uint32_t purch; int64_t revenue; } CBuy;
+static CHot *chot; // [NT][(ncamp+1)*NDAYS]
+static CBuy *cbuy; // [NT][(ncamp+1)*NDAYS]
 static uint32_t **stamp; static uint32_t *stampv;
 
 typedef uint32_t Hist[3][2048]; // 11-bit digit counts of the high 32 bits
@@ -1259,8 +1261,8 @@ static void sess_task(int tid, long q, void *ctx) {
   for (size_t i = 0; i < nlive; i++) cl[pos[cpid[(uint32_t)csorted[i]]]++] = csorted[i];
   SP_ADD(tid, SP_CLICKS, t0);
   UVec *ur = &urows[tid];
-  CAgg *ca = &cagg[(size_t)tid * (ncamp + 1) * NDAYS];
-  uint32_t *cas = &cassist[(size_t)tid * (ncamp + 1) * NDAYS];
+  CHot *hot = &chot[(size_t)tid * (ncamp + 1) * NDAYS];
+  CBuy *cy = &cbuy[(size_t)tid * (ncamp + 1) * NDAYS];
   uint32_t *st = stamp[tid];
   // event ts are offsets from CWS; buckets count from the event window start
   uint32_t ebase = (uint32_t)(WS - CWS);
@@ -1353,8 +1355,9 @@ static void sess_task(int tid, long q, void *ctx) {
         }
         credited = ccamp[best];
       }
-      CAgg *a = &ca[(size_t)credited * NDAYS + di];
-      a->sessions++; a->purch += srev[so + z] > 0; a->revenue += srev[so + z];
+      size_t ci = (size_t)credited * NDAYS + di;
+      hot[ci].sessions++;
+      if (srev[so + z]) { cy[ci].purch++; cy[ci].revenue += srev[so + z]; }
     }
     flush_row(ur, &row, catd + (size_t)sdi[ns - 1] * 32, dmask[sdi[ns - 1]]);
     dmask[sdi[ns - 1]] = 0;
@@ -1387,7 +1390,7 @@ static void sess_task(int tid, long q, void *ctx) {
       jprev[cc] = jp;
       while (from < jp) {
         uint32_t to = drun[from] < jp ? drun[from] : jp;
-        cas[(size_t)cc * NDAYS + sdi[from]] += to - from;
+        hot[(size_t)cc * NDAYS + sdi[from]].assisted += to - from;
         from = to;
       }
     }
@@ -1604,10 +1607,10 @@ static void write_campaign(void) {
       int64_t sessions = 0, purch = 0, revenue = 0, assisted = 0;
       for (int t = 0; t < NT; t++) {
         size_t i = (size_t)t * stride + (size_t)c * NDAYS + d;
-        sessions += cagg[i].sessions;
-        purch += cagg[i].purch;
-        revenue += cagg[i].revenue;
-        assisted += cassist[i];
+        sessions += chot[i].sessions;
+        assisted += chot[i].assisted;
+        purch += cbuy[i].purch;
+        revenue += cbuy[i].revenue;
       }
       if (!sessions && !assisted) continue;
       const char *id = c == ncamp ? "organic" : camp_id[c];
@@ -1829,8 +1832,8 @@ int main(void) {
   run_par(NPART, dedup_task, NULL);
   PH("dedup");
   urows = xcalloc(NT, sizeof(UVec));
-  cagg = xcalloc((size_t)NT * (ncamp + 1) * NDAYS, sizeof(CAgg));
-  cassist = xcalloc((size_t)NT * (ncamp + 1) * NDAYS, sizeof(uint32_t));
+  chot = xcalloc((size_t)NT * (ncamp + 1) * NDAYS, sizeof(CHot));
+  cbuy = xcalloc((size_t)NT * (ncamp + 1) * NDAYS, sizeof(CBuy));
   stamp = xmalloc(sizeof(uint32_t *) * NT);
   stampv = xcalloc(NT, sizeof(uint32_t));
   for (int t = 0; t < NT; t++) stamp[t] = xcalloc(ncamp + 1, sizeof(uint32_t));
