@@ -1678,7 +1678,7 @@ static void sess_task(int tid, long q, long nq) {
   uint64_t *bits = aalloc(S, 64 * 8); memset(bits, 0, 64 * 8);
   int64_t *catd = aalloc(S, (size_t)NDAYS * 32 * 8); memset(catd, 0, (size_t)NDAYS * 32 * 8);
   uint32_t *dmask = aalloc(S, (size_t)NDAYS * 4); memset(dmask, 0, (size_t)NDAYS * 4);
-  uint64_t *pur = aalloc(S, nalive * 8); // the person's purchases, ts << 32 | x
+  uint64_t *pur = aalloc(S, nalive * 8 + 8); // the person's purchases, ts << 32 | x
   // sessions, person after person from soff[p]: start ts, day index, events, revenue
   uint32_t *soff = aalloc(S, ((size_t)np + 1) * 4);
   uint32_t *sst0 = aalloc(S, nalive * 4);
@@ -1716,6 +1716,7 @@ static void sess_task(int tid, long q, long nq) {
       B->mn = t < B->mn ? t : B->mn;
       B->mx = t > B->mx ? t : B->mx;
       B->cnt++;
+      // branch-free: whether an event is a purchase is not predictable
       if (x & X_PURCH) { B->rev += x & 0xFFFFFF; pur[npur++] = e[i]; }
     }
     // The non-empty buckets go to a bitmap here, not per event: an event's update of a bitmap word waits for the
@@ -1728,7 +1729,10 @@ static void sess_task(int tid, long q, long nq) {
     }
     // buckets in ts order -> sessions. One loop over the nbk set bits, the next word picked by selects: a loop
     // per word leaves it after 1 or 2 buckets, a mispredicted exit for about every session.
-    uint32_t ns = 0, last = 0, w = 0;
+    // A session break is a coin flip per bucket, so the session's start, day and sums are carried in selects and
+    // stored for every bucket.
+    uint32_t ns = 0, last = 0, w = 0, scur = 0, dcur = 0, ccur = 0;
+    int64_t rcur = 0;
     uint64_t bw = 0;
     for (uint32_t k = nbk; k; k--) {
       uint32_t wn = (uint32_t)__builtin_ctzll(wmask | 1ull << 63);
@@ -1740,17 +1744,20 @@ static void sess_task(int tid, long q, long nq) {
       bits[w] = 0;
       TBkt *B = &tb[w * 64 + (uint32_t)__builtin_ctzll(bw)];
       bw &= bw - 1;
-      if (!ns || B->mn - last > 1800000u) {
-        sst[ns] = B->mn;
-        sdi[ns] = (uint32_t)((CWS + (int64_t)B->mn) / 86400000LL - DAY0);
-        scnt[so + ns] = 0;
-        srev[so + ns] = 0;
-        ns++;
-      }
+      uint32_t mn = B->mn;
+      int brk = !ns | (mn - last > 1800000u);
+      uint32_t dnew = (uint32_t)((CWS + (int64_t)mn) / 86400000LL - DAY0);
+      scur = brk ? mn : scur;
+      dcur = brk ? dnew : dcur;
+      ccur = (brk ? 0 : ccur) + B->cnt;
+      rcur = (brk ? 0 : rcur) + (int64_t)B->rev;
+      ns += (uint32_t)brk;
       last = B->mx;
-      scnt[so + ns - 1] += B->cnt;
-      srev[so + ns - 1] += (int64_t)B->rev;
-      B->day = sdi[ns - 1];
+      sst[ns - 1] = scur;
+      sdi[ns - 1] = dcur;
+      scnt[so + ns - 1] = ccur;
+      srev[so + ns - 1] = rcur;
+      B->day = dcur;
       B->mn = UINT32_MAX; B->mx = 0; B->cnt = 0; B->rev = 0;
     }
     // purchases count for the category of their session's day
@@ -1767,20 +1774,16 @@ static void sess_task(int tid, long q, long nq) {
     int64_t rrev = 0;
     for (uint32_t z = 0; z < ns; z++) {
       uint32_t s0 = sst[z], di = sdi[z];
-      if (z && di != sdi[z - 1]) {
-        uint32_t pd = sdi[z - 1];
-        orow[nr] = row_word(pd, rses, catd + (size_t)pd * 32, dmask[pd]);
-        oev[nr] = revs;
-        orev[nr] = rrev;
-        nr++;
-        dmask[pd] = 0;
-        rses = 0;
-        revs = 0;
-        rrev = 0;
-      }
-      rses++;
-      revs += scnt[so + z];
-      rrev += srev[so + z];
+      // A day change is a coin flip per session: the row's sums are carried in selects and stored for every
+      // session; the top category is filled in per row below.
+      int chg = (z != 0) & (di != sdi[z - (z != 0)]);
+      nr += (size_t)chg;
+      rses = (chg ? 0 : rses) + 1;
+      revs = (chg ? 0 : revs) + scnt[so + z];
+      rrev = (chg ? 0 : rrev) + srev[so + z];
+      orow[nr] = di | rses << 16;
+      oev[nr] = revs;
+      orev[nr] = rrev;
       while (hi < m && (uint32_t)(c[hi] >> 32) <= s0) hi++;
       // latest ts wins; among equal ts the smallest click_id. Branch-free but for ties: whether a session has a
       // qualifying click is a coin flip. c[0] is readable even for m == 0 (the click run is allocated one longer).
@@ -1799,12 +1802,12 @@ static void sess_task(int tid, long q, long nq) {
       hot[ci].sessions++;
       if (srev[so + z]) { cy[ci].purch++; cy[ci].revenue += srev[so + z]; }
     }
-    uint32_t ld = sdi[ns - 1];
-    orow[nr] = row_word(ld, rses, catd + (size_t)ld * 32, dmask[ld]);
-    oev[nr] = revs;
-    orev[nr] = rrev;
     nr++;
-    dmask[ld] = 0;
+    for (size_t r = rows0; r < nr; r++) {
+      uint32_t d = orow[r] & 0xFFFF;
+      orow[r] = row_word(d, orow[r] >> 16, catd + (size_t)d * 32, dmask[d]);
+      dmask[d] = 0;
+    }
     bvar(&U->uidx, (uint64_t)(nr - rows0) << 1);
     bu32(&U->uidx, U->np++);
     so += ns;
